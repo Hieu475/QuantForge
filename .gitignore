@@ -1,0 +1,33 @@
+# QuantForge .gitignore
+
+# Build
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/settings.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.pt
+
+# LLVM/MLIR generated
+*.inc
+*.cpp.inc
+*.h.inc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Profiling
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+#md
+nhiem_vu.md
