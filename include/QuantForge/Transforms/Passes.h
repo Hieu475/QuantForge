@@ -13,7 +13,14 @@ namespace mlir
     {
 
         // === Phase 2 Passes ===
-        // std::unique_ptr<Pass> createConvertToQuantForgePass();
+
+        /// Create the ConvertLinalgToQuantForge pass.
+        /// Rewrites linalg.matmul with INT8-packed weights into
+        /// qf.unpack + qf.dequant + linalg.matmul(FP16).
+        std::unique_ptr<Pass> createConvertLinalgToQuantForgePass();
+
+        /// Register the ConvertLinalgToQuantForge pass for mlir-opt style tools.
+        void registerConvertLinalgToQuantForgePass();
 
         // === Phase 3 Passes ===
         // std::unique_ptr<Pass> createTilingPass();
@@ -22,6 +29,12 @@ namespace mlir
         // === Phase 4 Passes ===
         // std::unique_ptr<Pass> createGPUMappingPass();
         // std::unique_ptr<Pass> createLowerToNVVMPass();
+
+        /// Register all QuantForge passes.
+        inline void registerQuantForgePasses()
+        {
+            registerConvertLinalgToQuantForgePass();
+        }
 
     } // namespace quantforge
 } // namespace mlir

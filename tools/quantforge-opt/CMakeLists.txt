@@ -5,6 +5,7 @@ set(LIBS
   ${dialect_libs}
   ${conversion_libs}
   QuantForgeDialect
+  QuantForgeTransforms
   MLIROptLib
   MLIRIR
   MLIRParser
