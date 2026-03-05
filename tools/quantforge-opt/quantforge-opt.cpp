@@ -15,6 +15,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "QuantForge/Dialect/QuantForge/QuantForgeDialect.h"
+#include "QuantForge/Transforms/Passes.h"
 
 int main(int argc, char **argv)
 {
@@ -31,8 +32,8 @@ int main(int argc, char **argv)
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();
 
-    // TODO: Register QuantForge passes here
-    // mlir::quantforge::registerQuantForgePasses();
+    // Register QuantForge passes
+    mlir::quantforge::registerQuantForgePasses();
 
     return mlir::asMainReturnCode(
         mlir::MlirOptMain(argc, argv, "QuantForge optimizer driver\n", registry));
