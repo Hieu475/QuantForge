@@ -97,8 +97,6 @@ func.func @matmul_int8_both(%act: tensor<1x256xi8>,
 // =====================================================================
 // Test 5a: attributes on weight constant are used for scale/zero_point
 // =====================================================================
-// RUN: quantforge-opt --convert-linalg-to-quantforge %s \
-// RUN:   | FileCheck --check-prefix=ATTR %s
 // CHECK-LABEL: func.func @matmul_with_attrs
 // CHECK:         %[[SCALE:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
 // CHECK:         %[[ZP:.*]]    = arith.constant dense<5> : tensor<i8>
@@ -106,7 +104,6 @@ func.func @matmul_int8_both(%act: tensor<1x256xi8>,
 // CHECK:         qf.dequant %{{.*}}, %[[SCALE]], %[[ZP]]
 func.func @matmul_with_attrs(%act: tensor<1x2xf16>)
                               -> tensor<1x4xf16> {
-  // weight tensor carries quantization metadata as attributes on its defining op
   %weight = arith.constant {qf.scale = dense<2.000000e+00> : tensor<f16>, qf.zp = dense<5> : tensor<i8>} dense<0> : tensor<2x4xi8>
   %cst = arith.constant 0.0 : f16
   %init = tensor.empty() : tensor<1x4xf16>
@@ -119,8 +116,6 @@ func.func @matmul_with_attrs(%act: tensor<1x2xf16>)
 // =====================================================================
 // Test 5b: attributes on the matmul op itself
 // =====================================================================
-// RUN: quantforge-opt --convert-linalg-to-quantforge %s \
-// RUN:   | FileCheck --check-prefix=ATTR2 %s
 // CHECK-LABEL: func.func @matmul_with_matmul_attrs
 // CHECK:         %[[SCALE2:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
 // CHECK:         %[[ZP2:.*]]    = arith.constant dense<5> : tensor<i8>
@@ -143,9 +138,9 @@ func.func @matmul_with_matmul_attrs(%act: tensor<1x2xf16>)
 // Test 6: verify --qf-bitwidth=4 still converts i8-packed INT4 data
 // =====================================================================
 // RUN: quantforge-opt -pass-pipeline='builtin.module(func.func(convert-linalg-to-quantforge{qf-bitwidth=4}))' %s | FileCheck --check-prefix=BW4 %s
-// CHECK-LABEL: func.func @matmul_bitwidth4
-// CHECK:         qf.unpack %{{.*}} : tensor<8x8xi8> -> tensor<8x8xi8>
-// CHECK:         qf.dequant
+// BW4-LABEL: func.func @matmul_bitwidth4
+// BW4:         qf.unpack %{{.*}} : tensor<8x8xi8> -> tensor<8x8xi8>
+// BW4:         qf.dequant
 func.func @matmul_bitwidth4(%act: tensor<2x8xf16>,
                              %weight: tensor<8x8xi8>)
                              -> tensor<2x8xf16> {
@@ -156,4 +151,3 @@ func.func @matmul_bitwidth4(%act: tensor<2x8xf16>,
                           outs(%filled : tensor<2x8xf16>) -> tensor<2x8xf16>
   return %result : tensor<2x8xf16>
 }
-

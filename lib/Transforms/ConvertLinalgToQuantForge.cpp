@@ -53,7 +53,7 @@ static bool isIntOfWidth(Type ty, unsigned width)
 /// Matches `linalg.matmul` whose RHS operand is a rank-2 INT8 tensor.
 ///
 /// The rewrite inserts:
-///   1. qf.unpack  – marks the tensor for INT4 unpacking (same shape)
+///   1. qf.unpack  – semantic marker for INT4 unpacking (same shape)
 ///   2. qf.dequant – converts i8 → f16 with scale & zero_point
 ///   3. A new linalg.matmul operating entirely in FP16
 ///
