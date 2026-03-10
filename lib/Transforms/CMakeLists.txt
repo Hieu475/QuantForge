@@ -2,6 +2,9 @@
 
 add_mlir_library(QuantForgeTransforms
   ConvertLinalgToQuantForge.cpp
+  LowerUnpackToArith.cpp
+  LowerDequantToArith.cpp
+  FuseUnpackDequant.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
