@@ -16,6 +16,8 @@
 // so the greedy rewrite preserves SSA types.
 //===----------------------------------------------------------------------===//
 
+#define DEBUG_TYPE "convert-linalg-to-quantforge"
+
 #include "QuantForge/Transforms/Passes.h"
 #include "QuantForge/Dialect/QuantForge/QuantForgeOps.h"
 
@@ -44,15 +46,6 @@ static bool isIntOfWidth(Type ty, unsigned width)
     return false;
 }
 
-/// Return true if the tensor element type is i8 (INT8/INT4-packed weights).
-static bool isInt8PackedWeight(Value weight)
-{
-    auto tensorTy = dyn_cast<RankedTensorType>(weight.getType());
-    if (!tensorTy)
-        return false;
-    return isIntOfWidth(tensorTy.getElementType(), 8);
-}
-
 //===----------------------------------------------------------------------===//
 // ConvertMatmulToUnpackPattern
 //===----------------------------------------------------------------------===//
@@ -70,7 +63,11 @@ static bool isInt8PackedWeight(Value weight)
 struct ConvertMatmulToUnpackPattern
     : public OpRewritePattern<linalg::MatmulOp>
 {
-    using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+    /// target bitwidth for the packed weight (4 or 8)
+    unsigned targetBitWidth;
+
+    ConvertMatmulToUnpackPattern(MLIRContext *ctx, unsigned bw)
+        : OpRewritePattern<linalg::MatmulOp>(ctx), targetBitWidth(bw) {}
 
     LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
                                   PatternRewriter &rewriter) const override
@@ -79,12 +76,24 @@ struct ConvertMatmulToUnpackPattern
         Value lhs = matmulOp.getDpsInputOperand(0)->get();    // activation
         Value weight = matmulOp.getDpsInputOperand(1)->get(); // weight (RHS)
 
-        // --- Step 1: Check if weight is INT8-packed ----------------------------
-        if (!isInt8PackedWeight(weight))
-            return rewriter.notifyMatchFailure(matmulOp,
-                                               "RHS weight is not INT8-packed");
+        // --- Step 1: Check if weight has the desired bitwidth ---------------
+        auto weightTy = dyn_cast<RankedTensorType>(weight.getType());
+        if (!weightTy)
+            return rewriter.notifyMatchFailure(
+                matmulOp, "RHS weight is not a ranked tensor");
 
-        auto weightTy = cast<RankedTensorType>(weight.getType());
+        // The element type may be the same as the target bitwidth (e.g. i8
+        // for 8‑bit weights).  In the common INT4‑packed case the tensor is
+        // still `i8` even though each element contains two 4‑bit values, so we
+        // treat i8 as acceptable when the requested bitwidth is 4.  Later
+        // phases will perform actual unpacking from the byte.
+        if (!isIntOfWidth(weightTy.getElementType(), targetBitWidth) &&
+            !(targetBitWidth == 4 && isIntOfWidth(weightTy.getElementType(), 8)))
+        {
+            return rewriter.notifyMatchFailure(
+                matmulOp, "RHS weight does not have target bitwidth");
+        }
+
         if (weightTy.getRank() != 2)
             return rewriter.notifyMatchFailure(matmulOp,
                                                "expected rank-2 weight tensor");
@@ -94,35 +103,68 @@ struct ConvertMatmulToUnpackPattern
         // --- Step 2: Types & shapes --------------------------------------------
         // linalg.matmul:  A[M,K] x B[K,N] -> C[M,N]
         // Weight shape: B = [K, N] i8
-        int64_t dimK = weightTy.getDimSize(0);
-        int64_t dimN = weightTy.getDimSize(1);
+        ArrayRef<int64_t> weightShape = weightTy.getShape();
 
         auto i8Ty = rewriter.getIntegerType(8);
         auto f16Ty = rewriter.getF16Type();
 
         // Unpack & dequant keep the same spatial shape [K, N]
         RankedTensorType unpackedI8Ty =
-            RankedTensorType::get({dimK, dimN}, i8Ty);
+            RankedTensorType::get(weightShape, i8Ty);
         RankedTensorType dequantFP16Ty =
-            RankedTensorType::get({dimK, dimN}, f16Ty);
+            RankedTensorType::get(weightShape, f16Ty);
 
         // --- Step 3: Insert qf.unpack ------------------------------------------
-        // Marks the i8 data for on-the-fly INT4 bit-extraction at lower levels.
         auto unpackOp = rewriter.create<UnpackOp>(loc, unpackedI8Ty, weight);
 
-        // --- Step 4: Create default scale (1.0) and zero_point (0) constants ---
+        // --- Step 4: Create scale and zero_point constants ----------------------
+        // The pass looks for optional attributes on the matmul op; if none are
+        // found it falls back to the old default values.
         auto scaleTy = RankedTensorType::get({}, f16Ty);
         auto zpTy = RankedTensorType::get({}, i8Ty);
 
-        auto scaleAttr = DenseElementsAttr::get(
-            scaleTy,
-            APFloat(APFloat::IEEEhalf(), APInt(16, 0x3C00)));    // 1.0 in FP16
-        auto zpAttr = DenseElementsAttr::get(zpTy, APInt(8, 0)); // zero_point = 0
+        DenseElementsAttr scaleAttr;
+        DenseElementsAttr zpAttr;
+        // First try to find metadata attached directly to the matmul op.
+        if (auto attr = matmulOp->getAttrOfType<DenseElementsAttr>("qf.scale"))
+            scaleAttr = attr;
+        if (auto attr = matmulOp->getAttrOfType<DenseElementsAttr>("qf.zp"))
+            zpAttr = attr;
+        // If the op didn't carry them, attributes may be attached to the
+        // weight value itself (e.g. on the defining operation).
+        if (!scaleAttr || !zpAttr)
+        {
+            if (auto defOp = weight.getDefiningOp())
+            {
+                // If the weight originates from an operation (e.g. a constant),
+                // try to harvest any attached attributes for scale/zero-point.
+                if (!scaleAttr)
+                {
+                    if (auto attr = defOp->getAttrOfType<DenseElementsAttr>("qf.scale"))
+                        scaleAttr = attr;
+                }
+                if (!zpAttr)
+                {
+                    if (auto attr = defOp->getAttrOfType<DenseElementsAttr>("qf.zp"))
+                        zpAttr = attr;
+                }
+            }
+        }
+
+        if (!scaleAttr)
+        {
+            scaleAttr = DenseElementsAttr::get(
+                scaleTy,
+                APFloat(APFloat::IEEEhalf(), APInt(16, 0x3C00))); // 1.0
+        }
+        if (!zpAttr)
+        {
+            zpAttr = DenseElementsAttr::get(zpTy, APInt(8, 0));
+        }
 
         auto scaleConst =
             rewriter.create<arith::ConstantOp>(loc, scaleTy, scaleAttr);
-        auto zpConst =
-            rewriter.create<arith::ConstantOp>(loc, zpTy, zpAttr);
+        auto zpConst = rewriter.create<arith::ConstantOp>(loc, zpTy, zpAttr);
 
         // --- Step 5: Insert qf.dequant -----------------------------------------
         auto dequantOp = rewriter.create<DequantOp>(
@@ -131,11 +173,13 @@ struct ConvertMatmulToUnpackPattern
 
         // --- Step 6: Cast LHS to FP16 if necessary -----------------------------
         Value lhsFP16 = lhs;
-        auto lhsTy = cast<RankedTensorType>(lhs.getType());
-        if (lhsTy.getElementType() != f16Ty)
+        if (auto lhsTy = dyn_cast<RankedTensorType>(lhs.getType()))
         {
-            auto lhsFP16Ty = RankedTensorType::get(lhsTy.getShape(), f16Ty);
-            lhsFP16 = rewriter.create<arith::SIToFPOp>(loc, lhsFP16Ty, lhs);
+            if (lhsTy.getElementType() != f16Ty)
+            {
+                auto lhsFP16Ty = RankedTensorType::get(lhsTy.getShape(), f16Ty);
+                lhsFP16 = rewriter.create<arith::SIToFPOp>(loc, lhsFP16Ty, lhs);
+            }
         }
 
         // --- Step 7: Create new FP16 output init (same shape as original) ------
@@ -176,6 +220,23 @@ namespace
     {
         MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertLinalgToQuantForgePass)
 
+        Option<unsigned> targetBitwidth{*this, "qf-bitwidth",
+                                        llvm::cl::desc("Target integer bitwidth for packed weights"),
+                                        llvm::cl::init(8)};
+
+        ConvertLinalgToQuantForgePass() = default;
+
+        // Required so that the pass is copy-constructible.  `Option` itself is
+        // non-copyable, so we initialise the field with the value stored in
+        // the source object.  This constructor is used by the pass machinery
+        // when cloning pipelines.
+        ConvertLinalgToQuantForgePass(const ConvertLinalgToQuantForgePass &other)
+            : PassWrapper<ConvertLinalgToQuantForgePass,
+                          OperationPass<func::FuncOp>>(other)
+        {
+            targetBitwidth.setValue(other.targetBitwidth.getValue());
+        }
+
         StringRef getArgument() const final
         {
             return "convert-linalg-to-quantforge";
@@ -183,7 +244,7 @@ namespace
 
         StringRef getDescription() const final
         {
-            return "Convert linalg.matmul with INT8-packed weights to "
+            return "Convert linalg.matmul with INT*-packed weights to "
                    "qf.unpack + qf.dequant + linalg.matmul(FP16)";
         }
 
@@ -198,7 +259,8 @@ namespace
         void runOnOperation() override
         {
             RewritePatternSet patterns(&getContext());
-            patterns.add<ConvertMatmulToUnpackPattern>(&getContext());
+            patterns.add<ConvertMatmulToUnpackPattern>(&getContext(),
+                                                       targetBitwidth);
 
             if (failed(
                     applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
