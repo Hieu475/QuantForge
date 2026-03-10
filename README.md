@@ -12,7 +12,7 @@
 
 ---
 
-## 🎯 Overview
+## Overview
 
 QuantForge is a specialized compiler built on MLIR/LLVM infrastructure, designed to **maximize effective memory bandwidth** of GEMV operations by fusing INT4 unpacking directly into GPU register files.
 
@@ -41,7 +41,7 @@ Benefits:
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 Input Graph (TOSA/Linalg)
@@ -77,7 +77,7 @@ Input Graph (TOSA/Linalg)
 
 ---
 
-## 📦 QuantForge Dialect
+## QuantForge Dialect
 
 ### `qf.unpack` - Unpack INT4 Weights
 
@@ -145,7 +145,7 @@ setting it this way will currently result in an "unknown argument" error.)
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -176,7 +176,7 @@ python python/quantforge/baseline.py
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 QuantForge/
@@ -193,7 +193,7 @@ QuantForge/
 
 ---
 
-## 🎯 Performance Targets
+## Performance Targets
 
 | Metric | Target |
 |--------|--------|
@@ -205,7 +205,7 @@ QuantForge/
 
 ---
 
-## 📚 W4A16 Quantization
+## W4A16 Quantization
 
 ```python
 # Pack: 2 INT4 → 1 INT8
@@ -221,7 +221,7 @@ fp16 = (int4 - zero_point) * scale
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Component | Technology |
 |-----------|------------|
@@ -233,7 +233,7 @@ fp16 = (int4 - zero_point) * scale
 
 ---
 
-## 📖 References
+## References
 
 - [MLIR Documentation](https://mlir.llvm.org/)
 - [CUDA PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
@@ -241,6 +241,6 @@ fp16 = (int4 - zero_point) * scale
 
 ---
 
-## 📄 License
+## License
 
 MIT License
