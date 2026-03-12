@@ -73,7 +73,41 @@ namespace mlir
 
         void registerLowerUnpackToNVVMPass();
 
-        // === Phase 3 Passes — GPU Mapping & Tensor Core Fusion ===
+        // === Phase 3 Passes — GPU Optimization ===
+
+        /// Create the LowerUnpackToPRMT pass.
+        /// Lowers qf.unpack to SCF loops using prmt.b32 inline assembly
+        /// for 2-instruction nibble extraction (Ampere/Hopper sm_80+).
+        /// Reduces ALU pressure from ~16 to ~10 instructions per i32 chunk.
+        std::unique_ptr<Pass> createLowerUnpackToPRMTPass();
+
+        void registerLowerUnpackToPRMTPass();
+
+        /// Create the SwizzledUnpackIndexing pass.
+        /// Rewrites tensor.extract column indices in unpack SCF loops with
+        /// XOR swizzling (col ^= k%8) to prevent shared memory bank conflicts.
+        std::unique_ptr<Pass> createSwizzledUnpackIndexingPass();
+
+        void registerSwizzledUnpackIndexingPass();
+
+        /// Create the RegisterLayoutAwareUnpack pass.
+        /// Rewrites unpack output indices to match mma.sync fragment layout,
+        /// eliminating shfl.sync warp shuffles. Requires "mma_consumer"
+        /// attribute. Currently supports m16n8k16.
+        std::unique_ptr<Pass> createRegisterLayoutAwareUnpackPass();
+
+        void registerRegisterLayoutAwareUnpackPass();
+
+        // === Canonicalization / Optimization Passes ===
+
+        /// Create the CanonicalizeDequantZeroPoint pass.
+        /// Eliminates arith.sitofp + arith.subf when zero_point == 0
+        /// (symmetric quantization fast-path).
+        std::unique_ptr<Pass> createCanonicalizeDequantZeroPointPass();
+
+        void registerCanonicalizeDequantZeroPointPass();
+
+        // === Phase 4 Passes — Future ===
         // std::unique_ptr<Pass> createGPUMappingPass();
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
@@ -87,6 +121,11 @@ namespace mlir
             registerLowerUnpackBranchFreePass();
             registerFuseUnpackDequantBranchFreePass();
             registerLowerUnpackToNVVMPass();
+            // Phase 3 optimization passes
+            registerLowerUnpackToPRMTPass();
+            registerSwizzledUnpackIndexingPass();
+            registerRegisterLayoutAwareUnpackPass();
+            registerCanonicalizeDequantZeroPointPass();
         }
 
     } // namespace quantforge
