@@ -27,7 +27,7 @@ int main(int argc, char **argv)
         mlir::func::FuncDialect,
         mlir::linalg::LinalgDialect,
         mlir::tensor::TensorDialect,
-        mlir::scf::SCFDialect>();
+        mlir::scf::SCFDialect>(); // SCF needed by Phase 2 --lower-unpack-to-nvvm
 
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();

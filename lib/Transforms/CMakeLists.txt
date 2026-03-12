@@ -5,6 +5,8 @@ add_mlir_library(QuantForgeTransforms
   LowerUnpackToArith.cpp
   LowerDequantToArith.cpp
   FuseUnpackDequant.cpp
+  LowerUnpackBranchFree.cpp   # Phase 1: branch-free vectorized unpacking
+  LowerUnpackToNVVM.cpp       # Phase 2: PTX-ready i32-chunk SCF lowering
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
@@ -23,4 +25,5 @@ add_mlir_library(QuantForgeTransforms
   MLIRArithDialect
   MLIRTensorDialect
   MLIRFuncDialect
+  MLIRSCFDialect   # Phase 2: scf.for loops
 )

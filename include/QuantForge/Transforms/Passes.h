@@ -47,13 +47,35 @@ namespace mlir
         /// Register the FuseUnpackDequant pass for mlir-opt style tools.
         void registerFuseUnpackDequantPass();
 
-        // === Phase 3 Passes ===
-        // std::unique_ptr<Pass> createTilingPass();
-        // std::unique_ptr<Pass> createVectorizationPass();
+        // === Phase 1 Passes — Vectorized (Branch-Free) Unpacking ===
 
-        // === Phase 4 Passes ===
+        /// Create the LowerUnpackBranchFree pass.
+        /// Lowers qf.unpack to two branch-free linalg.generics + stride-2
+        /// tensor.insert_slice, eliminating linalg.index and arith.select.
+        std::unique_ptr<Pass> createLowerUnpackBranchFreePass();
+
+        void registerLowerUnpackBranchFreePass();
+
+        /// Create the FuseUnpackDequantBranchFree pass.
+        /// Branch-free fused lowering: two pointwise linalg.generics
+        /// (nibble-extract + dequant) + stride-2 tensor.insert_slice.
+        std::unique_ptr<Pass> createFuseUnpackDequantBranchFreePass();
+
+        void registerFuseUnpackDequantBranchFreePass();
+
+        // === Phase 2 Passes — PTX / NVVM-Ready Lowering ===
+
+        /// Create the LowerUnpackToNVVM pass.
+        /// Lowers qf.unpack to SCF loops that process one i32 chunk
+        /// (4 packed bytes = 8 INT4 nibbles) per inner iteration using
+        /// constant-shift extractions — PTX-ready IR.
+        std::unique_ptr<Pass> createLowerUnpackToNVVMPass();
+
+        void registerLowerUnpackToNVVMPass();
+
+        // === Phase 3 Passes — GPU Mapping & Tensor Core Fusion ===
         // std::unique_ptr<Pass> createGPUMappingPass();
-        // std::unique_ptr<Pass> createLowerToNVVMPass();
+        // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
         inline void registerQuantForgePasses()
@@ -62,6 +84,9 @@ namespace mlir
             registerLowerUnpackToArithPass();
             registerLowerDequantToArithPass();
             registerFuseUnpackDequantPass();
+            registerLowerUnpackBranchFreePass();
+            registerFuseUnpackDequantBranchFreePass();
+            registerLowerUnpackToNVVMPass();
         }
 
     } // namespace quantforge
