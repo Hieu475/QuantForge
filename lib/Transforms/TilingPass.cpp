@@ -6,16 +6,26 @@
 //
 // Strategy:
 //   • Walk the FuncOp to collect all linalg.LinalgOp instances.
-//   • For each, call scf::tileUsingSCFForOp with tile sizes [M, N, K].
-//   • Default tile sizes: M=128, N=128, K=64  (configurable via options).
-//   • Tile size 0 means "do not tile that dimension" (used to skip K for
-//     purely parallel generic ops that lack a reduction dimension).
+//   • For each, apply a 4-level hierarchy:
+//       1) Block grid        : scf.forall [blockM, blockN, 0]
+//       2) Block reduction K : scf.for    [0, 0, blockK]
+//       3) Warp distribution : scf.for    [warpM, warpN, 0]
+//       4) MMA instruction   : scf.for    [threadM, threadN, threadK]
+//   • Tile size 0 means "do not tile that dimension".
 //
 // Output IR structure (matmul example):
-//   scf.for %m = 0 to 4096 step 128 {          // M tiles
-//     scf.for %n = 0 to 4096 step 128 {        // N tiles
-//       scf.for %k = 0 to 4096 step 64 {       // K reduction tiles
-//         linalg.matmul on 128×64 × 64×128 slices
+//   scf.forall (%m_blk, %n_blk) in (...) {     // Block grid tiles
+//     scf.for %k_blk = 0 to 4096 step 64 {     // Cooperative K chunks
+//       scf.for %m_warp = ... {
+//         scf.for %n_warp = ... {               // Warp distribution
+//         scf.for %k = 0 to 64 step 16 {       // MMA K tile
+//           scf.for %m = 0 to 64 step 16 {
+//             scf.for %n = 0 to 64 step 8 {
+//               linalg.matmul on MMA-sized slices
+//             }
+//           }
+//         }
+//         }
 //       }
 //     }
 //   }
@@ -46,160 +56,188 @@ using namespace mlir::quantforge;
 namespace
 {
 
-//===----------------------------------------------------------------------===//
-// TilingPass
-//===----------------------------------------------------------------------===//
+    //===----------------------------------------------------------------------===//
+    // TilingPass
+    //===----------------------------------------------------------------------===//
 
-struct TilingPass
-    : public PassWrapper<TilingPass, OperationPass<func::FuncOp>>
-{
-    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TilingPass)
-
-    //------------------------------------------------------------------
-    // Constructors
-    //------------------------------------------------------------------
-    TilingPass() = default;
-
-    /// Required explicit copy constructor because Option<> is non-copyable.
-    /// The MLIR pass infrastructure calls this when cloning a pipeline.
-    TilingPass(const TilingPass &other)
-        : PassWrapper<TilingPass, OperationPass<func::FuncOp>>(other)
+    struct TilingPass
+        : public PassWrapper<TilingPass, OperationPass<func::FuncOp>>
     {
-        blockTileM.setValue(other.blockTileM.getValue());
-        blockTileN.setValue(other.blockTileN.getValue());
-        
-        warpTileM.setValue(other.warpTileM.getValue());
-        warpTileN.setValue(other.warpTileN.getValue());
-        
-        threadTileM.setValue(other.threadTileM.getValue());
-        threadTileN.setValue(other.threadTileN.getValue());
-        threadTileK.setValue(other.threadTileK.getValue());
-    }
+        MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TilingPass)
 
-    //------------------------------------------------------------------
-    // Pass metadata
-    //------------------------------------------------------------------
-    StringRef getArgument() const override { return "quantforge-tiling"; }
+        //------------------------------------------------------------------
+        // Constructors
+        //------------------------------------------------------------------
+        TilingPass() = default;
 
-    StringRef getDescription() const override
-    {
-        return "Tile linalg.matmul / linalg.generic operations into "
-               "128×128 (×64) tiles using scf.for loops for GPU "
-               "shared-memory blocking (Task 2.2).";
-    }
-
-    //------------------------------------------------------------------
-    // Configurable tile sizes (command-line options)
-    //------------------------------------------------------------------
-
-    Option<int64_t> blockTileM{*this, "block-tile-m", llvm::cl::desc("Block tile size M"), llvm::cl::init(128)};
-    Option<int64_t> blockTileN{*this, "block-tile-n", llvm::cl::desc("Block tile size N"), llvm::cl::init(128)};
-    
-    Option<int64_t> warpTileM{*this, "warp-tile-m", llvm::cl::desc("Warp tile size M"), llvm::cl::init(64)};
-    Option<int64_t> warpTileN{*this, "warp-tile-n", llvm::cl::desc("Warp tile size N"), llvm::cl::init(64)};
-    
-    Option<int64_t> threadTileM{*this, "thread-tile-m", llvm::cl::desc("Thread tile size M"), llvm::cl::init(16)};
-    Option<int64_t> threadTileN{*this, "thread-tile-n", llvm::cl::desc("Thread tile size N"), llvm::cl::init(8)};
-    Option<int64_t> threadTileK{*this, "thread-tile-k", llvm::cl::desc("Reduction tile size K"), llvm::cl::init(64)};
-
-    //------------------------------------------------------------------
-    // Dependent dialects
-    //------------------------------------------------------------------
-    void getDependentDialects(DialectRegistry &registry) const override
-    {
-        registry.insert<scf::SCFDialect, linalg::LinalgDialect,
-                        func::FuncDialect>();
-        linalg::registerTilingInterfaceExternalModels(registry);
-    }
-
-    // Helper to create OpFoldResult from integer sizes
-    SmallVector<OpFoldResult> getAsFoldResult(OpBuilder &b, ArrayRef<int64_t> sizes, unsigned rank)
-    {
-        SmallVector<OpFoldResult> res;
-        for (unsigned i = 0; i < std::min<unsigned>(rank, sizes.size()); ++i)
+        /// Required explicit copy constructor because Option<> is non-copyable.
+        /// The MLIR pass infrastructure calls this when cloning a pipeline.
+        TilingPass(const TilingPass &other)
+            : PassWrapper<TilingPass, OperationPass<func::FuncOp>>(other)
         {
-            res.push_back(b.getIndexAttr(sizes[i]));
+            blockTileM.setValue(other.blockTileM.getValue());
+            blockTileN.setValue(other.blockTileN.getValue());
+            blockTileK.setValue(other.blockTileK.getValue());
+
+            warpTileM.setValue(other.warpTileM.getValue());
+            warpTileN.setValue(other.warpTileN.getValue());
+
+            threadTileM.setValue(other.threadTileM.getValue());
+            threadTileN.setValue(other.threadTileN.getValue());
+            threadTileK.setValue(other.threadTileK.getValue());
         }
-        return res;
-    }
 
-    //------------------------------------------------------------------
-    // runOnOperation
-    //------------------------------------------------------------------
-    void runOnOperation() override
-    {
-        func::FuncOp funcOp = getOperation();
-        MLIRContext *ctx     = &getContext();
+        //------------------------------------------------------------------
+        // Pass metadata
+        //------------------------------------------------------------------
+        StringRef getArgument() const override { return "quantforge-tiling"; }
 
-        // ── Collect ops to tile ────────────────────────────────────────
-        SmallVector<linalg::LinalgOp> worklist;
-        funcOp.walk([&](linalg::LinalgOp op)
+        StringRef getDescription() const override
         {
+            return "Tile linalg.matmul / linalg.generic operations into "
+                   "a 4-level hardware-aware hierarchy (block/"
+                   "reduction/warp/mma) using scf.forall + scf.for loops "
+                   "for GPU shared-memory + Tensor Core lowering (Task 2.2).";
+        }
+
+        //------------------------------------------------------------------
+        // Configurable tile sizes (command-line options)
+        //------------------------------------------------------------------
+
+        Option<int64_t> blockTileM{*this, "block-tile-m", llvm::cl::desc("Block tile size M"), llvm::cl::init(128)};
+        Option<int64_t> blockTileN{*this, "block-tile-n", llvm::cl::desc("Block tile size N"), llvm::cl::init(128)};
+        Option<int64_t> blockTileK{*this, "block-tile-k", llvm::cl::desc("Block reduction size K (SRAM load size)"), llvm::cl::init(64)};
+
+        Option<int64_t> warpTileM{*this, "warp-tile-m", llvm::cl::desc("Warp tile size M"), llvm::cl::init(64)};
+        Option<int64_t> warpTileN{*this, "warp-tile-n", llvm::cl::desc("Warp tile size N"), llvm::cl::init(64)};
+
+        Option<int64_t> threadTileM{*this, "thread-tile-m", llvm::cl::desc("Thread tile size M"), llvm::cl::init(16)};
+        Option<int64_t> threadTileN{*this, "thread-tile-n", llvm::cl::desc("Thread tile size N"), llvm::cl::init(8)};
+        Option<int64_t> threadTileK{*this, "thread-tile-k", llvm::cl::desc("Tensor Core mma.sync size K"), llvm::cl::init(16)};
+
+        //------------------------------------------------------------------
+        // Dependent dialects
+        //------------------------------------------------------------------
+        void getDependentDialects(DialectRegistry &registry) const override
+        {
+            registry.insert<scf::SCFDialect, linalg::LinalgDialect,
+                            func::FuncDialect>();
+            linalg::registerTilingInterfaceExternalModels(registry);
+        }
+
+        // Helper to create OpFoldResult from integer sizes
+        SmallVector<OpFoldResult> getAsFoldResult(OpBuilder &b, ArrayRef<int64_t> sizes, unsigned rank)
+        {
+            SmallVector<OpFoldResult> res;
+            for (unsigned i = 0; i < std::min<unsigned>(rank, sizes.size()); ++i)
+            {
+                res.push_back(b.getIndexAttr(sizes[i]));
+            }
+            return res;
+        }
+
+        //------------------------------------------------------------------
+        // runOnOperation
+        //------------------------------------------------------------------
+        void runOnOperation() override
+        {
+            func::FuncOp funcOp = getOperation();
+            MLIRContext *ctx = &getContext();
+
+            // ── Collect ops to tile ────────────────────────────────────────
+            SmallVector<linalg::LinalgOp> worklist;
+            funcOp.walk([&](linalg::LinalgOp op)
+                        {
             // Only tile ops that implement TilingInterface
             if (isa<TilingInterface>(op.getOperation()))
-                worklist.push_back(op);
-        });
+                worklist.push_back(op); });
 
-        if (worklist.empty())
-        {
-            LLVM_DEBUG(llvm::dbgs() << "[TilingPass] no linalg ops found.\n");
-            return;
+            if (worklist.empty())
+            {
+                LLVM_DEBUG(llvm::dbgs() << "[TilingPass] no linalg ops found.\n");
+                return;
+            }
+
+            IRRewriter rewriter(ctx);
+
+            for (linalg::LinalgOp linalgOp : worklist)
+            {
+                unsigned iterRank = linalgOp.getNumLoops();
+
+                rewriter.setInsertionPoint(linalgOp);
+                auto tilingIface = cast<TilingInterface>(linalgOp.getOperation());
+
+                // ── Level 1: Block Level (Grid, scf.forall) ────────────────
+                scf::SCFTilingOptions blockOpts;
+                blockOpts.setTileSizes(getAsFoldResult(rewriter, {blockTileM, blockTileN, 0}, iterRank));
+
+                FailureOr<scf::SCFTilingResult> blockResult =
+                    scf::tileUsingSCFForallOp(rewriter, tilingIface, blockOpts);
+
+                if (failed(blockResult))
+                {
+                    linalgOp.emitWarning("Block level scf.forall tiling failed");
+                    continue;
+                }
+
+                // ── Level 2: Block Reduction (K loop, scf.for) ─────────────
+                auto l2Op = cast<TilingInterface>(blockResult->tiledOps.front());
+                FailureOr<scf::SCFTilingResult> reductionResult;
+                TilingInterface l3Op = l2Op;
+
+                // Only apply explicit reduction tiling if a K-loop exists.
+                if (iterRank >= 3)
+                {
+                    scf::SCFTilingOptions reductionOpts;
+                    reductionOpts.setTileSizes(getAsFoldResult(rewriter, {0, 0, blockTileK}, iterRank));
+
+                    reductionResult = scf::tileUsingSCFForOp(rewriter, l2Op, reductionOpts);
+
+                    if (failed(reductionResult))
+                    {
+                        l2Op.emitWarning("Block reduction scf.for tiling failed");
+                        continue;
+                    }
+
+                    l3Op = cast<TilingInterface>(reductionResult->tiledOps.front());
+                }
+
+                // ── Level 3: Warp Level (scf.for) ──────────────────────────
+                scf::SCFTilingOptions warpOpts;
+                warpOpts.setTileSizes(getAsFoldResult(rewriter, {warpTileM, warpTileN, 0}, iterRank));
+
+                FailureOr<scf::SCFTilingResult> warpResult =
+                    scf::tileUsingSCFForOp(rewriter, l3Op, warpOpts);
+
+                if (failed(warpResult))
+                {
+                    l3Op.emitWarning("Warp level scf.for tiling failed");
+                    continue;
+                }
+
+                // ── Level 4: Instruction Level (scf.for) ───────────────────
+                auto l4Op = cast<TilingInterface>(warpResult->tiledOps.front());
+                scf::SCFTilingOptions threadOpts;
+                threadOpts.setTileSizes(getAsFoldResult(rewriter, {threadTileM, threadTileN, threadTileK}, iterRank));
+
+                FailureOr<scf::SCFTilingResult> threadResult =
+                    scf::tileUsingSCFForOp(rewriter, l4Op, threadOpts);
+
+                if (failed(threadResult))
+                {
+                    l4Op.emitWarning("Instruction level scf.for tiling failed");
+                    continue;
+                }
+
+                // ── Replacements (Innermost out to outermost) ──────────────
+                rewriter.replaceOp(l4Op, threadResult->replacements);
+                rewriter.replaceOp(l3Op, warpResult->replacements);
+                if (iterRank >= 3)
+                    rewriter.replaceOp(l2Op, reductionResult->replacements);
+                rewriter.replaceOp(linalgOp, blockResult->replacements);
+            }
         }
-
-        IRRewriter rewriter(ctx);
-
-        for (linalg::LinalgOp linalgOp : worklist)
-        {
-            unsigned iterRank = linalgOp.getNumLoops();
-
-            rewriter.setInsertionPoint(linalgOp);
-            auto tilingIface = cast<TilingInterface>(linalgOp.getOperation());
-
-            // ── Level 1: Block Level (scf.forall) ──────────────────────
-            scf::SCFTilingOptions blockOpts;
-            blockOpts.setTileSizes(getAsFoldResult(rewriter, {blockTileM, blockTileN, 0}, iterRank));
-            
-            FailureOr<scf::SCFTilingResult> blockResult = 
-                scf::tileUsingSCFForallOp(rewriter, tilingIface, blockOpts);
-                
-            if (failed(blockResult)) {
-                linalgOp.emitWarning("Block level scf.forall tiling failed");
-                continue;
-            }
-            
-            // ── Level 2: Warp Level (scf.for) ───────────────────────
-            auto blockTiledOp = cast<TilingInterface>(blockResult->tiledOps.back());
-            scf::SCFTilingOptions warpOpts;
-            warpOpts.setTileSizes(getAsFoldResult(rewriter, {warpTileM, warpTileN, 0}, iterRank));
-            
-            FailureOr<scf::SCFTilingResult> warpResult = 
-                scf::tileUsingSCFForOp(rewriter, blockTiledOp, warpOpts);
-                
-            if (failed(warpResult)) {
-                blockTiledOp.emitWarning("Warp level scf.for tiling failed");
-                continue;
-            }
-
-            // ── Level 3: Thread Level & K Reduction (scf.for) ──────────
-            auto warpTiledOp = cast<TilingInterface>(warpResult->tiledOps.back());
-            scf::SCFTilingOptions threadOpts;
-            threadOpts.setTileSizes(getAsFoldResult(rewriter, {threadTileM, threadTileN, threadTileK}, iterRank));
-            
-            FailureOr<scf::SCFTilingResult> threadResult = 
-                scf::tileUsingSCFForOp(rewriter, warpTiledOp, threadOpts);
-                
-            if (failed(threadResult)) {
-                warpTiledOp.emitWarning("Thread level scf.for tiling failed");
-                continue;
-            }
-
-            // ── Replacements (Innermost out to outermost) ──────────────
-            rewriter.replaceOp(warpTiledOp, threadResult->replacements);
-            rewriter.replaceOp(blockTiledOp, warpResult->replacements);
-            rewriter.replaceOp(linalgOp, blockResult->replacements);
-        }
-    }
-};
+    };
 
 } // namespace
 
