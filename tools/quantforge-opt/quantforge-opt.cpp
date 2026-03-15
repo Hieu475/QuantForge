@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include "QuantForge/Dialect/QuantForge/QuantForgeDialect.h"
 #include "QuantForge/Transforms/Passes.h"
@@ -27,7 +28,8 @@ int main(int argc, char **argv)
         mlir::func::FuncDialect,
         mlir::linalg::LinalgDialect,
         mlir::tensor::TensorDialect,
-        mlir::scf::SCFDialect>(); // SCF needed by Phase 2 --lower-unpack-to-nvvm
+        mlir::scf::SCFDialect,
+        mlir::vector::VectorDialect>(); // Vector needed by Task 2.3.1 --quantforge-vectorization
 
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();

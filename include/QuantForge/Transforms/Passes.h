@@ -117,6 +117,16 @@ namespace mlir
 
         void registerTilingPass();
 
+        // === Task 2.3.1: Vectorization Pass ===
+
+        /// Create the VectorizationPass.
+        /// Vectorizes innermost linalg.matmul / linalg.generic operations
+        /// into vector dialect ops (vector.contract, vector.transfer_*, SIMD
+        /// arithmetic), preparing IR for Tensor Core / ldmatrix lowering.
+        std::unique_ptr<Pass> createVectorizationPass();
+
+        void registerVectorizationPass();
+
         // === Phase 4 Passes — Future ===
         // std::unique_ptr<Pass> createGPUMappingPass();
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
@@ -138,6 +148,8 @@ namespace mlir
             registerCanonicalizeDequantZeroPointPass();
             // Task 2.2: Tiling pass
             registerTilingPass();
+            // Task 2.3.1: Vectorization pass
+            registerVectorizationPass();
         }
 
     } // namespace quantforge
