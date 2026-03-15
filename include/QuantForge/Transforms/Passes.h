@@ -107,6 +107,16 @@ namespace mlir
 
         void registerCanonicalizeDequantZeroPointPass();
 
+        // === Task 2.2: Tiling Pass ===
+
+        /// Create the TilingPass.
+        /// Tiles linalg.matmul / linalg.generic operations into 128×128 (×64)
+        /// tiles using scf.for loops for GPU shared-memory blocking.
+        /// Configurable via --tile-m, --tile-n, --tile-k options.
+        std::unique_ptr<Pass> createTilingPass();
+
+        void registerTilingPass();
+
         // === Phase 4 Passes — Future ===
         // std::unique_ptr<Pass> createGPUMappingPass();
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
@@ -126,6 +136,8 @@ namespace mlir
             registerSwizzledUnpackIndexingPass();
             registerRegisterLayoutAwareUnpackPass();
             registerCanonicalizeDequantZeroPointPass();
+            // Task 2.2: Tiling pass
+            registerTilingPass();
         }
 
     } // namespace quantforge
