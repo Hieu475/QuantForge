@@ -5,28 +5,30 @@
 // Task 2.2 — Tiling Pass
 //
 // Verifies that --quantforge-tiling:
-//   1. Wraps linalg.matmul on 4096×4096 with 3 levels of nested loops
+//   1. Wraps linalg.matmul on 4096×4096 with 4-level nested tiling
 //   2. Block level uses scf.forall (M=128, N=128)
-//   3. Warp level uses scf.for (M=64, N=64)
-//   4. Thread level uses scf.for (M=16, N=8, K=64)
+//   3. Block reduction uses scf.for (K=64)
+//   4. Warp level uses scf.for (M=64, N=64)
+//   5. Instruction level uses scf.for (M=16, N=8, K=16)
 // =====================================================================
 
 // -----------------------------------------------------------------
 // Test 1: Basic 4096×4096 matmul 
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @matmul_4096x4096
-// Outer Block tile scf.forall
+// 1) Outer Block tile scf.forall
 // CHECK:     scf.forall
-// Inner Warp tile scf.for (M, N)
+// 2) Block reduction K-loop
 // CHECK:       scf.for
-// CHECK:         scf.for
-// Thread tile scf.for (M, N)
+// 3) Warp distribution 2 loops
 // CHECK:           scf.for
 // CHECK:             scf.for
-// Thread reduction scf.for (K)
+// 4) Instruction-level 3 loops
 // CHECK:               scf.for
+// CHECK:                 scf.for
+// CHECK:                   scf.for
 // Tiled matmul
-// CHECK:                 linalg.matmul
+// CHECK:                     linalg.matmul
 // No un-tiled matmul remains
 // CHECK-NOT:     linalg.matmul ins(%A, %B
 func.func @matmul_4096x4096(
@@ -47,10 +49,11 @@ func.func @matmul_4096x4096(
 // CHECK-LABEL: func.func @matmul_256x256
 // CHECK:     scf.forall
 // CHECK:       scf.for
-// CHECK:         scf.for
 // CHECK:           scf.for
 // CHECK:             scf.for
 // CHECK:               scf.for
+// CHECK:                 scf.for
+// CHECK:                   scf.for
 // CHECK:                 linalg.matmul
 func.func @matmul_256x256(
     %A   : tensor<256x256xf32>,
@@ -66,12 +69,15 @@ func.func @matmul_256x256(
 
 // -----------------------------------------------------------------
 // Test 3: 2-D linalg.generic (parallel only, no K dimension)
-//   Only M and N loops are generated (iterRank=2 → 2 tile dims)
+//   No block-reduction K loop is inserted (iterRank=2)
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @generic_2d_parallel
-// CHECK:     scf.for
-// CHECK:       scf.for
-// CHECK:         linalg.generic
+// CHECK:     scf.forall
+// CHECK:         scf.for
+// CHECK:           scf.for
+// CHECK:             scf.for
+// CHECK:               scf.for
+// CHECK:                 linalg.generic
 func.func @generic_2d_parallel(
     %in  : tensor<4096x4096xf16>,
     %out : tensor<4096x4096xf16>) -> tensor<4096x4096xf16>
