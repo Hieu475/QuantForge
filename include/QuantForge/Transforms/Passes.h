@@ -127,8 +127,15 @@ namespace mlir
 
         void registerVectorizationPass();
 
-        // === Phase 4 Passes — Future ===
-        // std::unique_ptr<Pass> createGPUMappingPass();
+        // === Phase 4 Passes — GPU Hardware Mapping ===
+
+        /// Create the GPUMappingPass.
+        /// Maps tiled scf.forall ops to GPU hardware: block grid → gpu.block_id,
+        /// warp distribution → gpu.thread_id, inserts gpu.barrier for SRAM sync.
+        std::unique_ptr<Pass> createGPUMappingPass();
+
+        void registerGPUMappingPass();
+
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
@@ -150,6 +157,8 @@ namespace mlir
             registerTilingPass();
             // Task 2.3.1: Vectorization pass
             registerVectorizationPass();
+            // Phase 4: GPU hardware mapping
+            registerGPUMappingPass();
         }
 
     } // namespace quantforge
