@@ -66,195 +66,188 @@ using namespace mlir;
 // Helper: check if an scf.for loop nest looks like an unpack loop
 //===----------------------------------------------------------------------===//
 
-/// Returns true if `forOp` is the outer (K-dimension) loop of an unpack
-/// SCF nest: it must contain an inner scf.for, and the inner loop body
-/// must contain at least one tensor.extract (reading the packed weights).
-static bool isUnpackOuterLoop(scf::ForOp forOp)
-{
-    // Must not already be swizzled
-    if (forOp->hasAttr("swizzled"))
-        return false;
+/// Returns the direct inner loop in the outer unpack loop body.
+static scf::ForOp getDirectInnerLoop(scf::ForOp outerFor) {
+  for (Operation &op : outerFor.getBody()->without_terminator()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(op))
+      return innerFor;
+  }
+  return {};
+}
 
-    // Walk body looking for an inner scf.for with tensor.extract
-    bool foundInner = false;
-    forOp.getBody()->walk([&](scf::ForOp innerFor)
-    {
-        innerFor.getBody()->walk([&](tensor::ExtractOp ex)
-        {
-            if (ex.getIndices().size() == 2)
-                foundInner = true;
-        });
-    });
-    return foundInner;
+/// Returns true if the loop body contains a 2D tensor.extract that reads the
+/// packed tensor payload.
+static bool has2DTensorExtract(scf::ForOp loop) {
+  bool found = false;
+  loop.getBody()->walk([&](tensor::ExtractOp ex) {
+    if (ex.getIndices().size() == 2)
+      found = true;
+  });
+  return found;
+}
+
+/// Returns true if `forOp` is the outer (K-dimension) loop of an unpack SCF
+/// nest: not swizzled, has a direct inner loop, and the inner loop reads from
+/// a 2D packed tensor.
+static bool isUnpackOuterLoop(scf::ForOp forOp) {
+  if (forOp->hasAttr("swizzled"))
+    return false;
+
+  scf::ForOp innerFor = getDirectInnerLoop(forOp);
+  if (!innerFor)
+    return false;
+
+  return has2DTensorExtract(innerFor);
 }
 
 //===----------------------------------------------------------------------===//
 // SwizzleUnpackPattern
 //===----------------------------------------------------------------------===//
 
-namespace
-{
+namespace {
 
-    /// Rewrites tensor.extract column indices inside the inner SCF for-loop of
-    /// an unpack nest to use XOR swizzling:
-    ///
-    ///   Before: col_idx = base + offset        (linear)
-    ///   After:  col_idx = (base + offset) XOR (k % 8)
-    ///
-    /// Also marks the outer loop with "swizzled" attribute to prevent
-    /// repeated application.
-    struct SwizzleUnpackPattern : public OpRewritePattern<scf::ForOp>
+/// Rewrites tensor.extract column indices inside the inner SCF for-loop of
+/// an unpack nest to use XOR swizzling:
+///
+///   Before: col_idx = base + offset        (linear)
+///   After:  col_idx = (base + offset) XOR (k % 8)
+///
+/// Also marks the outer loop with "swizzled" attribute to prevent
+/// repeated application.
+struct SwizzleUnpackPattern : public OpRewritePattern<scf::ForOp> {
+  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
+
+  SwizzleUnpackPattern(MLIRContext *ctx, int64_t minN)
+      : OpRewritePattern<scf::ForOp>(ctx), minNThreshold(minN) {}
+
+  LogicalResult matchAndRewrite(scf::ForOp outerFor,
+                                PatternRewriter &rewriter) const override {
+    // ── Guard: must look like an unpack outer loop ─────────────────
+    if (!isUnpackOuterLoop(outerFor))
+      return rewriter.notifyMatchFailure(
+          outerFor, "not an unpack outer loop or already swizzled");
+
+    // ── Guard: N must be large enough for swizzle to be worthwhile
+    // We infer N from the inner loop upper bound (should be N/4).
+    // Check if we can find the inner loop bound >= minNThreshold / 4.
+    scf::ForOp innerFor = getDirectInnerLoop(outerFor);
+    if (!innerFor)
+      return rewriter.notifyMatchFailure(outerFor, "no inner for found");
+
+    // Try to get static upper bound of inner loop
+    if (auto ubOp =
+            innerFor.getUpperBound().getDefiningOp<arith::ConstantIndexOp>()) {
+      int64_t n4 = ubOp.value();
+      if (n4 * 4 < minNThreshold)
+        return rewriter.notifyMatchFailure(outerFor,
+                                           "N too small for swizzling");
+    }
+
+    Location loc = outerFor.getLoc();
+
+    // ── Compute k % 8 at the OUTER loop body level ────────────────
+    // k_mod8 must dominate all uses in the inner loop body.
+    // Set insertion point to the start of the outer loop body.
+    Value k = outerFor.getInductionVar();
     {
-        using OpRewritePattern<scf::ForOp>::OpRewritePattern;
+      OpBuilder::InsertionGuard outerGuard(rewriter);
+      rewriter.setInsertionPointToStart(outerFor.getBody());
 
-        SwizzleUnpackPattern(MLIRContext *ctx, int64_t minN)
-            : OpRewritePattern<scf::ForOp>(ctx), minNThreshold(minN) {}
+      Value c8 = rewriter.create<arith::ConstantIndexOp>(loc, 8);
+      Value k_mod8 = rewriter.create<arith::RemUIOp>(loc, k, c8);
 
-        LogicalResult matchAndRewrite(scf::ForOp outerFor,
-                                      PatternRewriter &rewriter) const override
-        {
-            // ── Guard: must look like an unpack outer loop ─────────────────
-            if (!isUnpackOuterLoop(outerFor))
-                return rewriter.notifyMatchFailure(
-                    outerFor, "not an unpack outer loop or already swizzled");
+      // ── Rewrite each tensor.extract in the inner loop body ────────
+      // Collect extracts first (walk, not mutate during walk)
+      SmallVector<tensor::ExtractOp> extractOps;
+      innerFor.getBody()->walk([&](tensor::ExtractOp ex) {
+        if (ex.getIndices().size() == 2)
+          extractOps.push_back(ex);
+      });
 
-            // ── Guard: N must be large enough for swizzle to be worthwhile
-            // We infer N from the inner loop upper bound (should be N/4).
-            // Check if we can find the inner loop bound >= minNThreshold / 4.
-            scf::ForOp innerFor;
-            outerFor.getBody()->walk([&](scf::ForOp f)
-            {
-                if (!innerFor)
-                    innerFor = f;
-            });
-            if (!innerFor)
-                return rewriter.notifyMatchFailure(outerFor, "no inner for found");
+      if (extractOps.empty())
+        return rewriter.notifyMatchFailure(outerFor,
+                                           "no tensor.extract with 2 indices");
 
-            // Try to get static upper bound of inner loop
-            if (auto ubOp =
-                    innerFor.getUpperBound().getDefiningOp<arith::ConstantIndexOp>())
-            {
-                int64_t n4 = ubOp.value();
-                if (n4 * 4 < minNThreshold)
-                    return rewriter.notifyMatchFailure(
-                        outerFor, "N too small for swizzling");
-            }
+      for (tensor::ExtractOp ex : extractOps) {
+        // Index layout from LowerUnpackToNVVM:
+        //   indices[0] = %k  (row — do NOT swizzle)
+        //   indices[1] = base + byte_offset  (column — SWIZZLE THIS)
+        Value oldColIdx = ex.getIndices()[1];
 
-            Location loc = outerFor.getLoc();
+        // Insert the XOR immediately before the extract op
+        OpBuilder::InsertionGuard innerGuard(rewriter);
+        rewriter.setInsertionPoint(ex);
 
-            // ── Compute k % 8 at the OUTER loop body level ────────────────
-            // k_mod8 must dominate all uses in the inner loop body.
-            // Set insertion point to the start of the outer loop body.
-            Value k = outerFor.getInductionVar();
-            {
-                OpBuilder::InsertionGuard outerGuard(rewriter);
-                rewriter.setInsertionPointToStart(outerFor.getBody());
+        // swizzled_col = old_col XOR k_mod8
+        Value newColIdx =
+            rewriter.create<arith::XOrIOp>(ex.getLoc(), oldColIdx, k_mod8);
 
-                Value c8     = rewriter.create<arith::ConstantIndexOp>(loc, 8);
-                Value k_mod8 = rewriter.create<arith::RemUIOp>(loc, k, c8);
+        // Mutate the extract's column index operand
+        ex.getIndicesMutable()[1].assign(newColIdx);
 
-                // ── Rewrite each tensor.extract in the inner loop body ────────
-                // Collect extracts first (walk, not mutate during walk)
-                SmallVector<tensor::ExtractOp> extractOps;
-                innerFor.getBody()->walk([&](tensor::ExtractOp ex)
-                {
-                    if (ex.getIndices().size() == 2)
-                        extractOps.push_back(ex);
-                });
+        LLVM_DEBUG(llvm::dbgs()
+                   << "SwizzledUnpackIndexing: swizzled column index of " << ex
+                   << "\n");
+      }
+    }
 
-                if (extractOps.empty())
-                    return rewriter.notifyMatchFailure(outerFor,
-                                                       "no tensor.extract with 2 indices");
+    // ── Mark the outer loop as swizzled (idempotency) ─────────────
+    outerFor->setAttr("swizzled", rewriter.getUnitAttr());
 
-                for (tensor::ExtractOp ex : extractOps)
-                {
-                    // Index layout from LowerUnpackToNVVM:
-                    //   indices[0] = %k  (row — do NOT swizzle)
-                    //   indices[1] = base + byte_offset  (column — SWIZZLE THIS)
-                    Value oldColIdx = ex.getIndices()[1];
+    return success();
+  }
 
-                    // Insert the XOR immediately before the extract op
-                    OpBuilder::InsertionGuard innerGuard(rewriter);
-                    rewriter.setInsertionPoint(ex);
+private:
+  int64_t minNThreshold; // Minimum N to justify swizzle (default: 32)
+};
 
-                    // swizzled_col = old_col XOR k_mod8
-                    Value newColIdx = rewriter.create<arith::XOrIOp>(
-                        ex.getLoc(), oldColIdx, k_mod8);
+//===----------------------------------------------------------------------===//
+// SwizzledUnpackIndexingPass
+//===----------------------------------------------------------------------===//
 
-                    // Mutate the extract's column index operand
-                    ex.getIndicesMutable()[1].assign(newColIdx);
+struct SwizzledUnpackIndexingPass
+    : public PassWrapper<SwizzledUnpackIndexingPass,
+                         OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SwizzledUnpackIndexingPass)
 
-                    LLVM_DEBUG(llvm::dbgs()
-                               << "SwizzledUnpackIndexing: swizzled column index of "
-                               << ex << "\n");
-                }
-            }
+  // Minimum N (packed last dim) threshold to apply swizzling.
+  // Passes with options cannot use the default clonePass because
+  // mlir::Pass::Option is non-copyable; we override clonePass explicitly.
+  int64_t minNValue = 32;
 
-            // ── Mark the outer loop as swizzled (idempotency) ─────────────
-            outerFor->setAttr("swizzled", rewriter.getUnitAttr());
+  SwizzledUnpackIndexingPass() = default;
+  explicit SwizzledUnpackIndexingPass(int64_t minN) : minNValue(minN) {}
 
-            return success();
-        }
+  // Required because we have a custom constructor:
+  std::unique_ptr<Pass> clonePass() const override {
+    return std::make_unique<SwizzledUnpackIndexingPass>(minNValue);
+  }
 
-    private:
-        int64_t minNThreshold; // Minimum N to justify swizzle (default: 32)
-    };
+  StringRef getArgument() const override { return "swizzled-unpack-indexing"; }
+  StringRef getDescription() const override {
+    return "Rewrite tensor.extract column indices in unpack SCF loops "
+           "with XOR swizzling (col ^= k%8) to prevent shared memory "
+           "bank conflicts on Ampere/Hopper GPUs.";
+  }
 
-    //===----------------------------------------------------------------------===//
-    // SwizzledUnpackIndexingPass
-    //===----------------------------------------------------------------------===//
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry
+        .insert<arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
+  }
 
-    struct SwizzledUnpackIndexingPass
-        : public PassWrapper<SwizzledUnpackIndexingPass,
-                             OperationPass<func::FuncOp>>
-    {
-        MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SwizzledUnpackIndexingPass)
+  void runOnOperation() override {
+    func::FuncOp funcOp = getOperation();
+    MLIRContext *ctx = &getContext();
 
-        // Minimum N (packed last dim) threshold to apply swizzling.
-        // Passes with options cannot use the default clonePass because
-        // mlir::Pass::Option is non-copyable; we override clonePass explicitly.
-        int64_t minNValue = 32;
+    RewritePatternSet patterns(ctx);
+    patterns.add<SwizzleUnpackPattern>(ctx, minNValue);
 
-        SwizzledUnpackIndexingPass() = default;
-        explicit SwizzledUnpackIndexingPass(int64_t minN) : minNValue(minN) {}
-
-        // Required because we have a custom constructor:
-        std::unique_ptr<Pass> clonePass() const override
-        {
-            return std::make_unique<SwizzledUnpackIndexingPass>(minNValue);
-        }
-
-        StringRef getArgument() const override
-        {
-            return "swizzled-unpack-indexing";
-        }
-        StringRef getDescription() const override
-        {
-            return "Rewrite tensor.extract column indices in unpack SCF loops "
-                   "with XOR swizzling (col ^= k%8) to prevent shared memory "
-                   "bank conflicts on Ampere/Hopper GPUs.";
-        }
-
-        void getDependentDialects(DialectRegistry &registry) const override
-        {
-            registry.insert<arith::ArithDialect, scf::SCFDialect,
-                            tensor::TensorDialect>();
-        }
-
-        void runOnOperation() override
-        {
-            func::FuncOp funcOp = getOperation();
-            MLIRContext  *ctx   = &getContext();
-
-            RewritePatternSet patterns(ctx);
-            patterns.add<SwizzleUnpackPattern>(ctx, minNValue);
-
-            // Use greedy driver with a single-round walk to avoid infinite
-            // reapplication (SwizzleUnpackPattern is already idempotent via attr).
-            if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns))))
-                signalPassFailure();
-        }
-    };
+    // Use greedy driver with a single-round walk to avoid infinite
+    // reapplication (SwizzleUnpackPattern is already idempotent via attr).
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns))))
+      signalPassFailure();
+  }
+};
 
 } // namespace
 
@@ -262,17 +255,14 @@ namespace
 // Registration
 //===----------------------------------------------------------------------===//
 
-namespace mlir::quantforge
-{
+namespace mlir::quantforge {
 
-    std::unique_ptr<Pass> createSwizzledUnpackIndexingPass()
-    {
-        return std::make_unique<SwizzledUnpackIndexingPass>();
-    }
+std::unique_ptr<Pass> createSwizzledUnpackIndexingPass() {
+  return std::make_unique<SwizzledUnpackIndexingPass>();
+}
 
-    void registerSwizzledUnpackIndexingPass()
-    {
-        PassRegistration<SwizzledUnpackIndexingPass>();
-    }
+void registerSwizzledUnpackIndexingPass() {
+  PassRegistration<SwizzledUnpackIndexingPass>();
+}
 
 } // namespace mlir::quantforge

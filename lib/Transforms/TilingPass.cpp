@@ -249,7 +249,7 @@ struct TilingPass
     }
 
     // Semantic tags for downstream synchronization pass:
-    // - quantforge.sram_load: operations contributing to SRAM load phase
+    // - quantforge.sram_load: operations in the HBM->SRAM load phase
     // - quantforge.compute: first compute loop in each K-loop body
     funcOp.walk([&](scf::ForallOp blockForall) {
       if (blockForall->getParentOfType<scf::ForallOp>())
@@ -260,16 +260,43 @@ struct TilingPass
         if (!kLoop)
           continue;
 
+        bool seenCompute = false;
+        bool taggedAnyLoad = false;
+        Operation *lastPreCompute = nullptr;
         bool computeTagged = false;
         for (Operation &bodyOp : kLoop.getBody()->without_terminator()) {
+          if (!seenCompute)
+            lastPreCompute = &bodyOp;
+
           if (isa<tensor::ExtractSliceOp>(bodyOp)) {
             bodyOp.setAttr("quantforge.sram_load", UnitAttr::get(ctx));
+            taggedAnyLoad = true;
             continue;
           }
 
           if (!computeTagged && isa<scf::ForOp>(bodyOp)) {
             bodyOp.setAttr("quantforge.compute", UnitAttr::get(ctx));
             computeTagged = true;
+            seenCompute = true;
+            continue;
+          }
+
+          seenCompute = seenCompute || computeTagged;
+        }
+
+        // Keep synchronization semantics robust even when canonicalization
+        // changes the exact load ops in the K-loop body.
+        if (!taggedAnyLoad && computeTagged && lastPreCompute)
+          lastPreCompute->setAttr("quantforge.sram_load", UnitAttr::get(ctx));
+
+        // Last-resort fallback for unusual loop shapes: still mark first loop
+        // as compute so GPUMapping can place the boundary barrier.
+        if (!computeTagged) {
+          for (Operation &bodyOp : kLoop.getBody()->without_terminator()) {
+            if (isa<scf::ForOp>(bodyOp)) {
+              bodyOp.setAttr("quantforge.compute", UnitAttr::get(ctx));
+              break;
+            }
           }
         }
       }
