@@ -220,7 +220,8 @@ PTX compiler (`ptxas`) có thể tiếp tục thay thế `shr.u32 + and.b32` b�
 
 ## Phase 3: Late Dequantization & Tensor Core Fusion (Định hướng tương lai)
 
-> **Trạng thái**: Chưa triển khai. Đây là endgame kiến trúc của QuantForge.
+> **Trạng thái**: Chưa triển khai đầy đủ. Một số passes chuẩn bị sẵn trong Phase 3.
+> Xem chi tiết: [docs/gpu-optimizations.md](gpu-optimizations.md)
 
 ### Vấn đề với kiến trúc hiện tại
 
@@ -267,13 +268,23 @@ HBM (INT4-packed) → Shared Mem → Registers
 ## Tóm tắt Kiến trúc Pass
 
 ```
-qf.unpack  ──┬── --lower-unpack-to-arith        (baseline, có branch)
-             ├── --lower-unpack-branch-free      (Phase 1: branch-free, 2 generics)
-             └── --lower-unpack-to-nvvm          (Phase 2: SCF + i32-chunk)
+qf.unpack
+  ├── --lower-unpack-to-arith               (baseline, có branch)
+  ├── --lower-unpack-branch-free            (Phase 1: branch-free, 2 generics)
+  ├── --lower-unpack-to-nvvm                (Phase 2: SCF + i32-chunk, ~16 ALU ops)
+  └── --lower-unpack-to-prmt             ★  (Phase 3: SCF + prmt.b32, ~10 ALU ops)
 
-qf.unpack + qf.dequant  ──┬── --fuse-unpack-dequant              (baseline)
-                           └── --fuse-unpack-dequant-branch-free  (Phase 1: branch-free)
+qf.unpack + qf.dequant
+  ├── --fuse-unpack-dequant                 (baseline)
+  └── --fuse-unpack-dequant-branch-free     (Phase 1: branch-free)
+
+Optimization passes (Phase 3, chạy sau lowering): ★
+  ├── --swizzled-unpack-indexing            (bank conflict prevention)
+  ├── --register-layout-aware-unpack        (mma.sync fragment layout, skeleton)
+  └── --canonicalize-dequant-zp             (symmetric quant fast-path)
 ```
+
+★ Xem chi tiết Phase 3: [docs/gpu-optimizations.md](gpu-optimizations.md)
 
 ## Pipelines Đề Xuất
 
@@ -285,10 +296,18 @@ quantforge-opt --convert-linalg-to-quantforge --fuse-unpack-dequant input.mlir
 quantforge-opt --convert-linalg-to-quantforge \
                --fuse-unpack-dequant-branch-free input.mlir
 
-# Phase 2 — PTX-ready SCF (cho 2D static weight, N%4==0)
+# Phase 2 — PTX-ready SCF (cho 2D static weight, N%4==0, pre-Ampere)
 quantforge-opt --convert-linalg-to-quantforge \
                --lower-unpack-to-nvvm \
                --lower-dequant-to-arith input.mlir
+
+# Phase 3 — Full Ampere/Hopper (sm_80+, khuyên dùng)
+quantforge-opt --convert-linalg-to-quantforge \
+               --lower-unpack-to-prmt \
+               --swizzled-unpack-indexing \
+               --lower-dequant-to-arith \
+               --canonicalize-dequant-zp \
+               input.mlir
 ```
 
 ## Test Files
@@ -299,3 +318,9 @@ quantforge-opt --convert-linalg-to-quantforge \
 | `test/Transforms/fuse_unpack_dequant.mlir` | `--fuse-unpack-dequant` | 4 |
 | `test/Transforms/lower_unpack_branch_free.mlir` | `--lower-unpack-branch-free`, `--fuse-unpack-dequant-branch-free` | 5 |
 | `test/Transforms/lower_unpack_to_nvvm.mlir` | `--lower-unpack-to-nvvm` | 4 |
+| `test/Transforms/lower_unpack_to_prmt.mlir` | `--lower-unpack-to-prmt` ★ | 4 |
+| `test/Transforms/swizzled_unpack_indexing.mlir` | `--swizzled-unpack-indexing` ★ | 2 |
+| `test/Transforms/register_layout_aware_unpack.mlir` | `--register-layout-aware-unpack` ★ | 2 |
+| `test/Transforms/canonicalize_dequant_zp.mlir` | `--canonicalize-dequant-zp` ★ | 4 |
+
+★ Phase 3 — xem [docs/gpu-optimizations.md](gpu-optimizations.md)
