@@ -63,10 +63,8 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -90,35 +88,6 @@ using namespace mlir;
 //   f=2: element at (row1, col0)
 //   f=3: element at (row1, col1)
 //===----------------------------------------------------------------------===//
-
-struct FragmentMapping
-{
-    int mmaM, mmaN, mmaK;
-    int elemsPerLane; // fragments per lane for matrix A
-};
-
-/// Hardcoded fragment layout for m16n8k16, Matrix A operand.
-/// Returns the linear element index (in the 16×16 matrix A tile) that
-/// fragment slot `fragIdx` (0–3) of lane `lane` (0–31) should hold.
-static int64_t getFragmentLinearIndex_m16n8k16(int lane, int fragIdx)
-{
-    // Each lane t holds: rows {t/4, t/4+8}, cols {(t%4)*2, (t%4)*2+1}
-    int row0 = lane / 4;
-    int row1 = lane / 4 + 8;
-    int col0 = (lane % 4) * 2;
-    int col1 = (lane % 4) * 2 + 1;
-
-    // mmaK = 16, so matrix A is (mmaM=16) × (mmaK=16)
-    // Linear index in A[16][16]: row * 16 + col
-    switch (fragIdx)
-    {
-    case 0: return row0 * 16 + col0;
-    case 1: return row0 * 16 + col1;
-    case 2: return row1 * 16 + col0;
-    case 3: return row1 * 16 + col1;
-    default: return -1;
-    }
-}
 
 //===----------------------------------------------------------------------===//
 // RegisterLayoutAwareUnpackPass implementation
@@ -194,10 +163,10 @@ namespace
                            << "RegisterLayoutAwareUnpack: transforming loop at "
                            << loc << " for m16n8k16\n");
 
-                // ── Emit threadIdx.x ─────────────────────────────────────────
-                // Must be inside a gpu.launch; here we emit gpu::ThreadIdOp.
-                // The op is placed at the beginning of the function (hoisted).
-                builder.setInsertionPointToStart(&funcOp.getBody().front());
+                // ── Emit threadIdx.x near the transformed loop ──────────────
+                // Keep gpu.thread_id in a valid scope by inserting it right
+                // before the target loop instead of hoisting to func entry.
+                builder.setInsertionPoint(outerFor);
 
                 Value tidX = builder.create<gpu::ThreadIdOp>(
                     loc, builder.getIndexType(), gpu::Dimension::x);
@@ -224,61 +193,94 @@ namespace
                         insertOps.push_back(ins);
                 });
 
-                if (insertOps.size() != 8)
+                constexpr int64_t kWarpLanes = 32;
+                constexpr int64_t kPackedBitWidth = 4;
+                constexpr int64_t kUnpackedBitWidth = 4;
+
+                // Semantic expectation for INT4 unpacking consumed by one warp
+                // for matrix A tile [mmaM, mmaK]. For m16n8k16 this is 8.
+                int64_t expectedInserts =
+                    (mmaM * mmaK * kPackedBitWidth) /
+                    (kWarpLanes * kUnpackedBitWidth);
+
+                if (static_cast<int64_t>(insertOps.size()) != expectedInserts)
                 {
-                    LLVM_DEBUG(llvm::dbgs()
-                               << "RegisterLayoutAwareUnpack: expected 8 tensor.insert "
-                               << "ops, found " << insertOps.size() << " — skipping\n");
-                    return WalkResult::skip();
+                    llvm::dbgs()
+                        << "[RegisterLayoutAwareUnpack][Warning] insert count "
+                        << insertOps.size() << " does not match expected "
+                        << expectedInserts << " for mma(" << mmaM << "x"
+                        << mmaN << "x" << mmaK << "); skip transform at "
+                        << loc << "\n";
+                    return WalkResult::advance();
                 }
 
                 // ── Rewrite output indices to fragment layout ─────────────────
                 // The 8 nibble inserts (0–7) need to be remapped so that
                 // each thread stores nibbles at the fragment positions it owns.
                 //
-                // For m16n8k16 Matrix A: 4 fragments per lane.
-                // But we have 8 nibbles because we process 2 consecutive columns.
-                // Convention: inserts[0..3] = fragment indices 0..3 for chunk tile 0
-                //             inserts[4..7] = fragment indices 0..3 for chunk tile 1
-                //
-                // Fragment linear index = getFragmentLinearIndex_m16n8k16(lane, frag)
-                // We compute this at runtime using the formula:
-                //   row0 = lane / 4     col0 = (lane % 4) * 2
-                //   row1 = lane/4 + 8   col1 = (lane % 4) * 2 + 1
+                // For m16n8k16 Matrix A, this still maps to 8 inserts/lane.
+                // We compute mapping in IR using the formula:
+                //   row0 = lane / lanesPerHalfRow
+                //   row1 = row0 + mmaM/2
+                //   col0 = (lane % lanesPerHalfRow) * (mmaK / (2*lanesPerHalfRow))
+                //   col1 = col0 + 1
+                //   linear = row * mmaK + col
 
                 // Build per-lane row/col values (index type)
                 builder.setInsertionPointToStart(innerFor.getBody());
 
-                Value c4  = builder.create<arith::ConstantIndexOp>(loc,  4);
-                Value c2  = builder.create<arith::ConstantIndexOp>(loc,  2);
-                Value c8  = builder.create<arith::ConstantIndexOp>(loc,  8);
-                Value c16 = builder.create<arith::ConstantIndexOp>(loc, 16);
+                int64_t halfM = mmaM / 2;
+                int64_t lanesPerHalfRow = kWarpLanes / halfM;
+                int64_t colsPerLaneGroup = mmaK / (2 * lanesPerHalfRow);
+                int64_t tileCount = expectedInserts / 4;
 
-                // row0 = lane / 4
-                Value row0 = builder.create<arith::DivUIOp>(loc, lane, c4);
-                // row1 = row0 + 8
-                Value row1 = builder.create<arith::AddIOp>(loc, row0, c8);
-                // lane_mod4 = lane % 4
-                Value lane_mod4 = builder.create<arith::RemUIOp>(loc, lane, c4);
-                // col0 = lane_mod4 * 2
-                Value col0 = builder.create<arith::MulIOp>(loc, lane_mod4, c2);
+                Value cLanesPerHalfRow =
+                    builder.create<arith::ConstantIndexOp>(loc, lanesPerHalfRow);
+                Value cColsPerLaneGroup =
+                    builder.create<arith::ConstantIndexOp>(loc, colsPerLaneGroup);
+                Value cHalfM = builder.create<arith::ConstantIndexOp>(loc, halfM);
+                Value cMmaK = builder.create<arith::ConstantIndexOp>(loc, mmaK);
+                Value cOne = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+                // row0 = lane / lanesPerHalfRow
+                Value row0 =
+                    builder.create<arith::DivUIOp>(loc, lane, cLanesPerHalfRow);
+                // row1 = row0 + mmaM/2
+                Value row1 = builder.create<arith::AddIOp>(loc, row0, cHalfM);
+                // lane_mod = lane % lanesPerHalfRow
+                Value laneMod =
+                    builder.create<arith::RemUIOp>(loc, lane, cLanesPerHalfRow);
+                // col0 = lane_mod * colsPerLaneGroup
+                Value col0 =
+                    builder.create<arith::MulIOp>(loc, laneMod, cColsPerLaneGroup);
                 // col1 = col0 + 1
-                Value c1impl  = builder.create<arith::ConstantIndexOp>(loc, 1);
-                Value col1 = builder.create<arith::AddIOp>(loc, col0, c1impl);
+                Value col1 = builder.create<arith::AddIOp>(loc, col0, cOne);
 
-                // Fragment → (row, col) pairs
-                Value fragRows[4] = {row0, row0, row1, row1};
-                Value fragCols[4] = {col0, col1, col0, col1};
+                struct FragCoord {
+                    Value row;
+                    Value col;
+                };
+                auto getFragCoord = [&](int fragIdx) -> FragCoord {
+                    switch (fragIdx) {
+                    case 0:
+                        return {row0, col0};
+                    case 1:
+                        return {row0, col1};
+                    case 2:
+                        return {row1, col0};
+                    case 3:
+                        return {row1, col1};
+                    default:
+                        return {row0, col0};
+                    }
+                };
 
-                // Rewrite 8 inserts:
-                //   inserts[f] (f=0..3): linearIdx = fragRows[f] * mmaK + fragCols[f]
-                //   inserts[f+4] (f=0..3): linearIdx = fragRows[f] * mmaK + fragCols[f]
-                //                          + mmaK/2 (shift by half-tile columns)
-                for (int f = 0; f < 4; ++f)
+                // Rewrite inserts in tile-major order with fragment mapping.
+                for (int64_t tile = 0; tile < tileCount; ++tile)
                 {
-                    for (int tile = 0; tile < 2; ++tile)
+                    for (int f = 0; f < 4; ++f)
                     {
-                        int insertIdx = tile * 4 + f;
+                        int64_t insertIdx = tile * 4 + f;
                         if (insertIdx >= static_cast<int>(insertOps.size()))
                             break;
 
@@ -288,21 +290,22 @@ namespace
                         Location insertLoc = ins.getLoc();
 
                         // linearIdx = fragRows[f] * mmaK + fragCols[f]
-                        Value rowIdx = fragRows[f];
-                        Value colIdx = fragCols[f];
+                        FragCoord fragCoord = getFragCoord(f);
+                        Value rowIdx = fragCoord.row;
+                        Value colIdx = fragCoord.col;
 
-                        // For tile 1, offset columns by mmaK/2 = 8
-                        if (tile == 1)
+                        // For tile > 0, offset columns by tile * (mmaK/2).
+                        if (tile > 0)
                         {
                             Value colOffset = builder.create<arith::ConstantIndexOp>(
-                                insertLoc, mmaK / 2);
+                                insertLoc, tile * (mmaK / 2));
                             colIdx = builder.create<arith::AddIOp>(
                                 insertLoc, colIdx, colOffset);
                         }
 
                         Value linearIdx = builder.create<arith::AddIOp>(
                             insertLoc,
-                            builder.create<arith::MulIOp>(insertLoc, rowIdx, c16),
+                            builder.create<arith::MulIOp>(insertLoc, rowIdx, cMmaK),
                             colIdx);
 
                         // Rewrite both indices
