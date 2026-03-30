@@ -45,6 +45,7 @@
 #include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Pass/Pass.h"
 
@@ -246,6 +247,33 @@ struct TilingPass
         rewriter.replaceOp(l2Op, reductionResult->replacements);
       rewriter.replaceOp(linalgOp, blockResult->replacements);
     }
+
+    // Semantic tags for downstream synchronization pass:
+    // - quantforge.sram_load: operations contributing to SRAM load phase
+    // - quantforge.compute: first compute loop in each K-loop body
+    funcOp.walk([&](scf::ForallOp blockForall) {
+      if (blockForall->getParentOfType<scf::ForallOp>())
+        return;
+
+      for (Operation &op : blockForall.getBody()->without_terminator()) {
+        auto kLoop = dyn_cast<scf::ForOp>(op);
+        if (!kLoop)
+          continue;
+
+        bool computeTagged = false;
+        for (Operation &bodyOp : kLoop.getBody()->without_terminator()) {
+          if (isa<tensor::ExtractSliceOp>(bodyOp)) {
+            bodyOp.setAttr("quantforge.sram_load", UnitAttr::get(ctx));
+            continue;
+          }
+
+          if (!computeTagged && isa<scf::ForOp>(bodyOp)) {
+            bodyOp.setAttr("quantforge.compute", UnitAttr::get(ctx));
+            computeTagged = true;
+          }
+        }
+      }
+    });
   }
 };
 
