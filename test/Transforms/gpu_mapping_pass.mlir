@@ -12,7 +12,38 @@
 // =====================================================================
 
 // -----------------------------------------------------------------
-// Test 1: 4096x4096 matmul — full GPU mapping pipeline
+// Test 1: Manual semantic tags drive two barriers in K-loop
+// -----------------------------------------------------------------
+// CHECK-LABEL: func.func @manual_semantic_barrier_tags
+// CHECK:         scf.forall
+// CHECK:           scf.for
+// CHECK:             scf.for {{.*}} {quantforge.sram_load}
+// CHECK:             gpu.barrier
+// CHECK:             scf.for {{.*}} {quantforge.compute}
+// CHECK:             gpu.barrier
+// CHECK:             scf.yield
+func.func @manual_semantic_barrier_tags() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+
+  scf.forall (%m, %n) = (%c0, %c0) to (%c1, %c1) step (%c1, %c1) {
+    scf.for %k = %c0 to %c1 step %c1 {
+      scf.for %load = %c0 to %c1 step %c1 {
+        scf.yield
+      } {quantforge.sram_load}
+      scf.for %compute = %c0 to %c1 step %c1 {
+        scf.yield
+      } {quantforge.compute}
+      scf.yield
+    }
+    scf.forall.in_parallel {
+    }
+  }
+  return
+}
+
+// -----------------------------------------------------------------
+// Test 2: 4096x4096 matmul — full GPU mapping pipeline
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @matmul_gpu_mapped
 //
@@ -56,7 +87,7 @@ func.func @matmul_gpu_mapped(
 }
 
 // -----------------------------------------------------------------
-// Test 2: all top-level foralls must be block-mapped (no first-match)
+// Test 3: all top-level foralls must be block-mapped (no first-match)
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @multi_block_forall_map
 // CHECK:         scf.forall
