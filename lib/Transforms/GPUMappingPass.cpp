@@ -33,7 +33,6 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/Support/Debug.h"
@@ -142,9 +141,8 @@ struct GPUMappingPass
         gpu::GPUBlockMappingAttr::get(ctx, gpu::MappingId::DimX)};
     blockForall.setMappingAttr(ArrayAttr::get(ctx, blockMapping));
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "[GPUMappingPass] annotated block forall with "
-                  "GPUBlockMappingAttr [DimY, DimX]\n");
+    LLVM_DEBUG(llvm::dbgs() << "[GPUMappingPass] annotated block forall with "
+                               "GPUBlockMappingAttr [DimY, DimX]\n");
 
     // ── Step 3: Record hardware config as function attributes ────
     // Downstream passes (e.g. ForallToGPU) can read these.
@@ -170,6 +168,7 @@ struct GPUMappingPass
     // The first scf.for is the K-reduction loop.
     IRRewriter rewriter(ctx);
     bool barrierInserted = false;
+    scf::ForOp mappedKLoop;
 
     blockForall.walk([&](scf::ForOp forOp) {
       // Only process the outermost scf.for in the forall body (the K-loop).
@@ -184,10 +183,21 @@ struct GPUMappingPass
 
       Block &kBody = *forOp.getBody();
 
-      // Barrier 1: at start of K-loop body (after load, before compute)
-      rewriter.setInsertionPointToStart(&kBody);
-      // Skip past the IV block argument — insert after existing ops
-      // that are part of the "load phase". For now, just insert at start.
+      // Barrier 1: after the load phase and right before the first compute loop.
+      // In the current tiled IR, HBM->SRAM preparation is represented by
+      // tensor.extract_slice ops at the start of the K body, followed by the
+      // first nested scf.for compute loop.
+      Operation *firstComputeLoop = nullptr;
+      for (Operation &op : kBody.without_terminator()) {
+        if (isa<scf::ForOp>(op)) {
+          firstComputeLoop = &op;
+          break;
+        }
+      }
+      if (firstComputeLoop)
+        rewriter.setInsertionPoint(firstComputeLoop);
+      else
+        rewriter.setInsertionPoint(kBody.getTerminator());
       rewriter.create<gpu::BarrierOp>(loc);
 
       // Barrier 2: at end of K-loop body (after compute, before yield)
@@ -196,14 +206,83 @@ struct GPUMappingPass
       rewriter.create<gpu::BarrierOp>(loc);
 
       barrierInserted = true;
+      mappedKLoop = forOp;
       LLVM_DEBUG(llvm::dbgs()
                  << "[GPUMappingPass] inserted 2 gpu.barrier ops in K-loop\n");
     });
 
     if (!barrierInserted) {
-      LLVM_DEBUG(
-          llvm::dbgs()
-          << "[GPUMappingPass] warning: no K-loop found for barrier insertion\n");
+      LLVM_DEBUG(llvm::dbgs() << "[GPUMappingPass] warning: no K-loop found "
+                                 "for barrier insertion\n");
+    }
+
+    // ── Step 5: Annotate Warp-level forall (Thread Mapping) ─────────────
+    // Traverse the subtree of blockForall to find Warp distribution loops.
+    bool warpForallAnnotated = false;
+    blockForall.walk([&](scf::ForallOp warpForall) {
+      // Skip blockForall itself (already annotated in Step 2).
+      if (warpForall == blockForall)
+        return WalkResult::advance();
+
+      // warpForall represents the Warp spatial distribution:
+      //   dim0 (%m_warp) → gpu.thread_id.z
+      //   dim1 (%n_warp) → gpu.thread_id.y
+      SmallVector<Attribute> threadMapping = {
+          gpu::GPUThreadMappingAttr::get(ctx, gpu::MappingId::DimZ),
+          gpu::GPUThreadMappingAttr::get(ctx, gpu::MappingId::DimY)};
+
+      warpForall.setMappingAttr(ArrayAttr::get(ctx, threadMapping));
+      warpForallAnnotated = true;
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[GPUMappingPass] annotated warp forall with "
+                    "GPUThreadMappingAttr [DimZ, DimY]\n");
+
+      return WalkResult::advance();
+    });
+
+    // Fallback for current tiling structure: if warp distribution is emitted
+    // as nested scf.for (instead of scf.forall), annotate the two loops with
+    // per-dimension thread mapping attrs so downstream canonicalization/lowering
+    // can recover the intent:
+    //   outer warp loop -> thread_id.z, inner warp loop -> thread_id.y.
+    if (!warpForallAnnotated && mappedKLoop) {
+      Block &kBody = *mappedKLoop.getBody();
+      scf::ForOp warpMFor;
+      scf::ForOp warpNFor;
+
+      for (Operation &op : kBody.without_terminator()) {
+        if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+          warpMFor = forOp;
+          break;
+        }
+      }
+
+      if (warpMFor) {
+        for (Operation &op : warpMFor.getBody()->without_terminator()) {
+          if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+            warpNFor = forOp;
+            break;
+          }
+        }
+      }
+
+      if (warpMFor && warpNFor) {
+        warpMFor->setAttr(
+            "mapping",
+            ArrayAttr::get(
+                ctx,
+                {gpu::GPUThreadMappingAttr::get(ctx, gpu::MappingId::DimZ)}));
+        warpNFor->setAttr(
+            "mapping",
+            ArrayAttr::get(
+                ctx,
+                {gpu::GPUThreadMappingAttr::get(ctx, gpu::MappingId::DimY)}));
+
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[GPUMappingPass] fallback warp mapping on nested scf.for "
+                      "[DimZ, DimY]\n");
+      }
     }
 
     LLVM_DEBUG(llvm::dbgs() << "[GPUMappingPass] annotation complete\n");

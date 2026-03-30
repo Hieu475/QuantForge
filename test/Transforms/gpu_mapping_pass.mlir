@@ -8,6 +8,7 @@
 //   1. Sets block size function attributes
 //   2. Annotates scf.forall ops with GPU mapping attributes
 //   3. Inserts two gpu.barrier ops inside the K-loop
+//   4. Annotates warp distribution loops with GPUThreadMappingAttr
 // =====================================================================
 
 // -----------------------------------------------------------------
@@ -23,7 +24,10 @@
 // 2) K-loop with barriers
 // CHECK:         scf.forall
 // CHECK:           scf.for
-// CHECK-NEXT:        gpu.barrier
+// CHECK:             tensor.extract_slice
+// CHECK:             tensor.extract_slice
+// CHECK:             tensor.extract_slice
+// CHECK:             gpu.barrier
 // CHECK:             scf.for
 // CHECK:               scf.for
 // CHECK:                 scf.for
@@ -34,6 +38,10 @@
 //
 // 3) GPU mapping attribute on block forall
 // CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
+//
+// 4) GPU mapping attribute on warp loops (inside K-loop)
+// CHECK:             scf.for {{.*}} {mapping = [#gpu.thread<z>]}
+// CHECK:               scf.for {{.*}} {mapping = [#gpu.thread<y>]}
 
 func.func @matmul_gpu_mapped(
     %A : tensor<4096x4096xf16>,
