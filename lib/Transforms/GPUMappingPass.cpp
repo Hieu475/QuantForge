@@ -229,12 +229,30 @@ struct GPUMappingPass
           continue;
 
         // Semantic synchronization boundary:
-        //   1) last op of SRAM load phase (quantforge.sram_load /
-        //   extract_slice) 2) first op of compute phase (quantforge.compute /
-        //   scf.for / linalg)
+        //   1) last op of SRAM load phase (quantforge.sram_load)
+        //   2) first op of compute phase (quantforge.compute)
+        // If no tags exist in the loop, fallback to structural heuristics.
         Operation *lastLoadOp = nullptr;
         Operation *firstComputeOp = nullptr;
+        bool hasTaggedLoad = false;
+        bool hasTaggedCompute = false;
         for (Operation &op : kBody.without_terminator()) {
+          hasTaggedLoad =
+              hasTaggedLoad || hasUnitAttr(&op, "quantforge.sram_load");
+          hasTaggedCompute =
+              hasTaggedCompute || hasUnitAttr(&op, "quantforge.compute");
+        }
+
+        const bool useTaggedSemantics = hasTaggedLoad || hasTaggedCompute;
+        for (Operation &op : kBody.without_terminator()) {
+          if (useTaggedSemantics) {
+            if (hasUnitAttr(&op, "quantforge.sram_load"))
+              lastLoadOp = &op;
+            if (!firstComputeOp && hasUnitAttr(&op, "quantforge.compute"))
+              firstComputeOp = &op;
+            continue;
+          }
+
           if (isSemanticSramLoad(&op))
             lastLoadOp = &op;
           if (!firstComputeOp && isSemanticCompute(&op))
