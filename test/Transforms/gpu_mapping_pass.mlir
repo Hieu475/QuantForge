@@ -40,7 +40,7 @@
 // CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
 //
 // 4) GPU mapping attribute on warp loops (inside K-loop)
-// CHECK:             scf.for {{.*}} {mapping = [#gpu.thread<z>]}
+// CHECK:             scf.for {{.*}} {mapping = [#gpu.thread<z>]
 // CHECK:               scf.for {{.*}} {mapping = [#gpu.thread<y>]}
 
 func.func @matmul_gpu_mapped(
@@ -53,4 +53,28 @@ func.func @matmul_gpu_mapped(
     outs(%C    : tensor<4096x4096xf16>)
     -> tensor<4096x4096xf16>
   return %result : tensor<4096x4096xf16>
+}
+
+// -----------------------------------------------------------------
+// Test 2: all top-level foralls must be block-mapped (no first-match)
+// -----------------------------------------------------------------
+// CHECK-LABEL: func.func @multi_block_forall_map
+// CHECK:         scf.forall
+// CHECK-SAME:      mapping = [#gpu.block<y>, #gpu.block<x>]
+// CHECK:         scf.forall
+// CHECK-SAME:      mapping = [#gpu.block<y>, #gpu.block<x>]
+func.func @multi_block_forall_map() {
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c256 = arith.constant 256 : index
+
+  scf.forall (%i, %j) = (%c0, %c0) to (%c256, %c256) step (%c128, %c128) {
+    scf.forall.in_parallel {
+    }
+  }
+  scf.forall (%m, %n) = (%c0, %c0) to (%c256, %c256) step (%c128, %c128) {
+    scf.forall.in_parallel {
+    }
+  }
+  return
 }
