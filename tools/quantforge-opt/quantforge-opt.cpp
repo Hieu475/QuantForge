@@ -14,6 +14,11 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 
 #include "QuantForge/Dialect/QuantForge/QuantForgeDialect.h"
 #include "QuantForge/Transforms/Passes.h"
@@ -29,7 +34,12 @@ int main(int argc, char **argv)
         mlir::linalg::LinalgDialect,
         mlir::tensor::TensorDialect,
         mlir::scf::SCFDialect,
-        mlir::vector::VectorDialect>(); // Vector needed by Task 2.3.1 --quantforge-vectorization
+        mlir::vector::VectorDialect,
+        mlir::gpu::GPUDialect,
+        mlir::LLVM::LLVMDialect,
+        mlir::NVVM::NVVMDialect,
+        mlir::memref::MemRefDialect,
+        mlir::cf::ControlFlowDialect>();
 
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();

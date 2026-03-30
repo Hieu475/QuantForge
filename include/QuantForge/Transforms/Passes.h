@@ -136,6 +136,15 @@ namespace mlir
 
         void registerGPUMappingPass();
 
+        // === Task 3.2: LowerToNVVM Pass — PTX Translation Boundary ===
+
+        /// Create the LowerToNVVMPass.
+        /// Lowers GPU, Arith, Vector, MemRef, SCF ops inside gpu.module
+        /// to LLVM + NVVM dialects (PTX-ready IR).
+        std::unique_ptr<Pass> createLowerToNVVMPass();
+
+        void registerLowerToNVVMPass();
+
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
@@ -159,6 +168,8 @@ namespace mlir
             registerVectorizationPass();
             // Phase 4: GPU hardware mapping
             registerGPUMappingPass();
+            // Task 3.2: PTX translation boundary
+            registerLowerToNVVMPass();
         }
 
     } // namespace quantforge
