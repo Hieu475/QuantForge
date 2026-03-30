@@ -14,6 +14,7 @@ add_mlir_library(QuantForgeTransforms
   TilingPass.cpp                       # Task 2.2: 128×128 tile tiling pass
   VectorizationPass.cpp                # Task 2.3.1: linalg -> vector dialect
   GPUMappingPass.cpp                   # Phase 4: GPU hardware mapping
+  LowerToNVVMPass.cpp                  # Task 3.2: PTX translation boundary
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
@@ -22,7 +23,7 @@ add_mlir_library(QuantForgeTransforms
   QuantForgeDialectIncGen
   QuantForgeOpsIncGen
 
-  LINK_LIBS PUBLIC
+  LINK_LIBS
   QuantForgeDialect
   MLIRIR
   MLIRPass
@@ -40,4 +41,13 @@ add_mlir_library(QuantForgeTransforms
   MLIRTilingInterface  # Task 2.2: TilingInterface used by tiling
   MLIRVectorDialect    # Task 2.3.1: vector.contract / vector.transfer_*
   MLIRVectorTransforms # Task 2.3.1: vector lowering/vectorization patterns
+  # Task 3.2: GPU -> NVVM + LLVM conversion libraries
+  MLIRNVVMDialect
+  MLIRGPUToNVVMTransforms
+  MLIRArithToLLVM
+  MLIRControlFlowToLLVM
+  MLIRFuncToLLVM
+  MLIRMemRefToLLVM
+  MLIRVectorToLLVM
+  MLIRSCFToControlFlow
 )
