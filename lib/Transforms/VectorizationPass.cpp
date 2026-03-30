@@ -21,6 +21,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/Debug.h"
 
 using namespace mlir;
 using namespace mlir::quantforge;
@@ -57,8 +58,31 @@ namespace
             // Vectorize from innermost ops first to maximize success rate.
             funcOp.walk<WalkOrder::PostOrder>([&](linalg::LinalgOp linalgOp)
                                               {
+                // Dynamic shapes often need prior tiling/padding; skip to avoid noisy failures.
+                if (linalgOp.hasDynamicShape()) {
+                    LLVM_DEBUG({
+                        llvm::dbgs() << "[QuantForge-Vectorization] Skipping dynamic-shaped op: ";
+                        linalgOp->print(llvm::dbgs());
+                        llvm::dbgs() << "\n";
+                    });
+                    return;
+                }
+
                 rewriter.setInsertionPoint(linalgOp);
-                (void)linalg::vectorize(rewriter, linalgOp.getOperation()); });
+                if (failed(linalg::vectorize(rewriter, linalgOp.getOperation()))) {
+                    linalgOp->emitWarning(
+                        "Vectorization failed on static-shaped LinalgOp. Kernel will "
+                        "fallback to scalar loops, leading to severe GPU performance "
+                        "degradation.");
+                    LLVM_DEBUG({
+                        llvm::dbgs() << "[QuantForge-Vectorization] Failed to vectorize op: ";
+                        linalgOp->print(llvm::dbgs());
+                        llvm::dbgs() << "\n";
+                    });
+                } else {
+                    LLVM_DEBUG(llvm::dbgs() << "[QuantForge-Vectorization] Successfully vectorized op.\n");
+                }
+            });
 
             RewritePatternSet patterns(ctx);
 
@@ -71,7 +95,6 @@ namespace
                 signalPassFailure();
                 return;
             }
-
         }
     };
 } // namespace
