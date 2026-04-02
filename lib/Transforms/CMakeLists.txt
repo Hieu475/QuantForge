@@ -38,6 +38,7 @@ add_mlir_library(QuantForgeTransforms
   MLIRSCFDialect      # Phase 2: scf.for loops
   MLIRLLVMDialect     # Opt 1: LLVM::InlineAsmOp for prmt.b32
   MLIRGPUDialect      # Opt 2: gpu::ThreadIdOp for register layout
+  MLIRNVGPUDialect    # Task 4.x: nvgpu.device_async_copy/create_group/wait
   MLIRGPUTransformOps  # Phase 4: GPUBlockMappingAttr / GPUThreadMappingAttr
   MLIRLinalgTransforms # Task 2.2: scf::tileUsingSCFForOp
   MLIRTilingInterface  # Task 2.2: TilingInterface used by tiling

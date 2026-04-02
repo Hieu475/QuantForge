@@ -9,8 +9,9 @@
 //   2. Inserts arith.xori %col, %row_mod for swizzled column
 //   3. Replaces original column index in memref.load
 //   4. Also swizzles memref.store to SRAM
-//   5. Marks processed ops with "swizzled" attribute
-//   6. Does NOT swizzle global memory (HBM) access
+//   5. Also swizzles destination index of nvgpu.device_async_copy
+//   6. Marks processed ops with "swizzled" attribute
+//   7. Does NOT swizzle global memory (HBM) access
 //
 // NOTE: Input already has SRAM allocations (post-smem-promotion).
 // =====================================================================
@@ -51,7 +52,28 @@ func.func @swizzle_sram_store(
 }
 
 // -----------------------------------------------------------------
-// Test 3: Global memory load is NOT swizzled
+// Test 3: nvgpu.device_async_copy to SRAM gets swizzled on dst index
+// -----------------------------------------------------------------
+// CHECK-LABEL: func.func @swizzle_async_copy_dst
+// CHECK:         arith.remui
+// CHECK:         arith.xori
+// CHECK:         nvgpu.device_async_copy
+// CHECK-SAME:      {swizzled}
+
+func.func @swizzle_async_copy_dst(
+    %src : memref<128x64xf16>,
+    %dst : memref<128x64xf16, #gpu.address_space<workgroup>>,
+    %row : index, %col : index) {
+  %c8 = arith.constant 8 : index
+  %t = nvgpu.device_async_copy %src[%row, %col], %dst[%row, %col], 8, %c8
+    : memref<128x64xf16> to memref<128x64xf16, #gpu.address_space<workgroup>>
+  %g = nvgpu.device_async_create_group %t
+  nvgpu.device_async_wait %g {numGroups = 0 : i32}
+  return
+}
+
+// -----------------------------------------------------------------
+// Test 4: Global memory load is NOT swizzled
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @no_swizzle_global
 // CHECK-NOT:     arith.xori

@@ -6,18 +6,17 @@
 //
 // Verifies that --quantforge-smem-promotion:
 //   1. Allocates SRAM buffers with #gpu.address_space<workgroup>
-//   2. Generates explicit scf.for copy loops (NOT memref.copy) with
-//      memref.load (HBM) + memref.store (SRAM)
-//   3. Inserts gpu.barrier after copy loops (RAW hazard)
+//   2. Generates explicit scf.for async-copy loops (NOT memref.copy) with
+//      nvgpu.device_async_copy
+//   3. Inserts nvgpu.device_async_create_group + nvgpu.device_async_wait
+//      after copy loops (RAW hazard)
 //   4. Inserts gpu.barrier before yield (WAR hazard)
 //   5. Inserts memref.dealloc for SRAM liveness
 //   6. Replaces downstream uses of HBM subview with SRAM alloc
 //
-// DESIGN NOTE: We explicitly avoid memref.copy because it writes
-// linearly to SRAM. The downstream SwizzleLoadPass needs to see
-// memref.store ops to SRAM so it can XOR-swizzle BOTH the write
-// (store) and read (load) indices. This ensures consistent swizzled
-// layout and prevents DATA CORRUPTION.
+// DESIGN NOTE: We explicitly avoid memref.copy and emit async copy ops.
+// SwizzleLoadPass will swizzle SRAM destination indices on async copy ops,
+// and SRAM read indices on memref.load ops, keeping layout consistent.
 //
 // NOTE: Input is already in memref form (post-bufferization).
 // =====================================================================
@@ -34,8 +33,7 @@
 // CHECK-NOT:     memref.copy
 // CHECK:         scf.for
 // CHECK:           scf.for
-// CHECK:             memref.load {{.*}} : memref<128x64xf16
-// CHECK:             memref.store {{.*}} : memref<128x64xf16, #gpu.address_space<workgroup>>
+// CHECK:             nvgpu.device_async_copy
 
 // Tile B [64x128]: SRAM alloc
 // CHECK:         memref.alloc() : memref<64x128xf16, #gpu.address_space<workgroup>>
@@ -43,11 +41,11 @@
 // Explicit copy loop for Tile B
 // CHECK:         scf.for
 // CHECK:           scf.for
-// CHECK:             memref.load {{.*}} : memref<64x128xf16
-// CHECK:             memref.store {{.*}} : memref<64x128xf16, #gpu.address_space<workgroup>>
+// CHECK:             nvgpu.device_async_copy
 
-// RAW barrier after copy loops
-// CHECK:         gpu.barrier
+// RAW sync after copy loops
+// CHECK:         nvgpu.device_async_create_group
+// CHECK:         nvgpu.device_async_wait
 
 // Compute uses SRAM
 // CHECK:         memref.load {{.*}} #gpu.address_space<workgroup>

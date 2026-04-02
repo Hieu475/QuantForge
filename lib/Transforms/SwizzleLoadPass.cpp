@@ -38,6 +38,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
@@ -65,39 +66,47 @@ static bool isSharedMemorySpace(MemRefType memrefTy) {
   return false;
 }
 
-/// Return the MemRefType of a memref.load or memref.store operand.
+/// Return the MemRefType of an SRAM access-like operation.
 static MemRefType getMemRefType(Operation *op) {
   if (auto load = dyn_cast<memref::LoadOp>(op))
     return load.getMemRefType();
   if (auto store = dyn_cast<memref::StoreOp>(op))
     return store.getMemRefType();
+  if (auto asyncCopy = dyn_cast<nvgpu::DeviceAsyncCopyOp>(op))
+    return cast<MemRefType>(asyncCopy.getDst().getType());
   return {};
 }
 
-/// Return the number of indices for a memref.load or memref.store.
+/// Return the number of destination indices for an SRAM access-like op.
 static unsigned getNumIndices(Operation *op) {
   if (auto load = dyn_cast<memref::LoadOp>(op))
     return load.getIndices().size();
   if (auto store = dyn_cast<memref::StoreOp>(op))
     return store.getIndices().size();
+  if (auto asyncCopy = dyn_cast<nvgpu::DeviceAsyncCopyOp>(op))
+    return asyncCopy.getDstIndices().size();
   return 0;
 }
 
-/// Return the row index (index 0) of a memref.load or memref.store.
+/// Return the row index (index 0) of an SRAM access-like op.
 static Value getRowIndex(Operation *op) {
   if (auto load = dyn_cast<memref::LoadOp>(op))
     return load.getIndices()[0];
   if (auto store = dyn_cast<memref::StoreOp>(op))
     return store.getIndices()[0];
+  if (auto asyncCopy = dyn_cast<nvgpu::DeviceAsyncCopyOp>(op))
+    return asyncCopy.getDstIndices()[0];
   return {};
 }
 
-/// Return the col index (index 1) of a memref.load or memref.store.
+/// Return the col index (index 1) of an SRAM access-like op.
 static Value getColIndex(Operation *op) {
   if (auto load = dyn_cast<memref::LoadOp>(op))
     return load.getIndices()[1];
   if (auto store = dyn_cast<memref::StoreOp>(op))
     return store.getIndices()[1];
+  if (auto asyncCopy = dyn_cast<nvgpu::DeviceAsyncCopyOp>(op))
+    return asyncCopy.getDstIndices()[1];
   return {};
 }
 
@@ -107,7 +116,9 @@ static MutableOperandRange getMutableIndices(Operation *op) {
     return load.getIndicesMutable();
   if (auto store = dyn_cast<memref::StoreOp>(op))
     return store.getIndicesMutable();
-  llvm_unreachable("expected load or store");
+  if (auto asyncCopy = dyn_cast<nvgpu::DeviceAsyncCopyOp>(op))
+    return asyncCopy.getDstIndicesMutable();
+  llvm_unreachable("expected load/store/async copy");
 }
 
 //===----------------------------------------------------------------------===//
@@ -152,7 +163,7 @@ struct SwizzleLoadPass
   //------------------------------------------------------------------
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, memref::MemRefDialect,
-                    gpu::GPUDialect>();
+                    gpu::GPUDialect, nvgpu::NVGPUDialect>();
   }
 
   //------------------------------------------------------------------
@@ -165,10 +176,10 @@ struct SwizzleLoadPass
     IRRewriter rewriter(ctx);
     int64_t swizzledCount = 0;
 
-    // Collect all memref.load and memref.store ops accessing SRAM
+    // Collect all SRAM accesses (memref.load/store and nvgpu async copies).
     SmallVector<Operation *> opsToSwizzle;
     funcOp.walk([&](Operation *op) {
-      if (!isa<memref::LoadOp, memref::StoreOp>(op))
+      if (!isa<memref::LoadOp, memref::StoreOp, nvgpu::DeviceAsyncCopyOp>(op))
         return;
 
       // Skip already-swizzled ops

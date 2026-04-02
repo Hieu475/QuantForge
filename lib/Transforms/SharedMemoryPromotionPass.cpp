@@ -11,8 +11,10 @@
 //   2. Find memref.subview ops that extract tiles matching --tile-m/n/k
 //   3. For each qualifying subview:
 //      a) Allocate SRAM: memref.alloc with memory_space = 3 (workgroup)
-//      b) Copy:          memref.copy from HBM subview → SRAM
-//      c) Barrier:       gpu.barrier after copy (RAW hazard prevention)
+//      b) Copy:          nvgpu.device_async_copy from HBM subview → SRAM
+//                       in vectorized chunks (16-byte path for f16)
+//      c) Sync:          nvgpu.device_async_create_group +
+//                       nvgpu.device_async_wait (RAW hazard prevention)
 //      d) Replace:       all uses of HBM subview → SRAM alloc
 //      e) Barrier:       gpu.barrier before yield (WAR hazard prevention)
 //      f) Dealloc:       memref.dealloc for MLIR liveness analysis
@@ -33,6 +35,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -92,12 +95,6 @@ static bool isTileSizedSubview(memref::SubViewOp subview,
   return false;
 }
 
-/// Check if any gpu.barrier already exists immediately after the given op.
-static bool hasBarrierAfter(Operation *op) {
-  Operation *next = op->getNextNode();
-  return next && isa<gpu::BarrierOp>(next);
-}
-
 /// Check if any gpu.barrier already exists immediately before the given op.
 static bool hasBarrierBefore(Operation *op) {
   Operation *prev = op->getPrevNode();
@@ -138,7 +135,7 @@ struct SharedMemoryPromotionPass
 
   StringRef getDescription() const override {
     return "Promote tile-sized HBM memref.subview reads into Shared Memory "
-           "(SRAM) allocations with gpu.barrier synchronization and "
+           "(SRAM) allocations with nvgpu.device_async_copy synchronization and "
            "memref.dealloc for liveness analysis.";
   }
 
@@ -171,7 +168,8 @@ struct SharedMemoryPromotionPass
   //------------------------------------------------------------------
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<memref::MemRefDialect, gpu::GPUDialect,
-                    scf::SCFDialect, arith::ArithDialect>();
+                    scf::SCFDialect, arith::ArithDialect,
+                    nvgpu::NVGPUDialect>();
   }
 
   //------------------------------------------------------------------
@@ -225,7 +223,7 @@ struct SharedMemoryPromotionPass
 
       // ── Promote each subview ────────────────────────────────────
       SmallVector<Value> sramAllocs;
-      Operation *lastStoreOp = nullptr;
+      Operation *lastCopyLoop = nullptr;
 
       for (memref::SubViewOp subview : subviewsToPromote) {
         MemRefType hbmTy = subview.getResult().getType();
@@ -241,39 +239,39 @@ struct SharedMemoryPromotionPass
         auto sramAlloc = rewriter.create<memref::AllocOp>(loc, sramTy);
         sramAllocs.push_back(sramAlloc.getResult());
 
-        // 3. Explicit copy loop: HBM → SRAM
-        //    CRITICAL: We must NOT use memref.copy here because it writes
-        //    linearly. The downstream SwizzleLoadPass will XOR-swizzle the
-        //    memref.store indices (write to SRAM) AND the memref.load
-        //    indices (read from SRAM), ensuring both sides are consistent.
-        //    If we used memref.copy, the write would be linear but the
-        //    read would be swizzled, causing DATA CORRUPTION.
+        // 3. Explicit async copy loops: HBM -> SRAM.
+        //    For f16 tiles, use 8-element chunks so each async copy issues
+        //    a 16-byte transfer (the cp.async fast path on Ampere).
+        //    Non-f16 or non-divisible shapes fall back to scalar step=1.
         Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-        Value dimM  = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
-        Value dimN  = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
-        Value one  = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        Value dimM = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
+        Value dimN = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
+        Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+        int64_t chunkElems = 1;
+        if (elemTy.isF16() && shape[1] % 8 == 0)
+          chunkElems = 8;
+        Value colStep = rewriter.create<arith::ConstantIndexOp>(loc, chunkElems);
+        auto asyncTokenTy = nvgpu::DeviceAsyncTokenType::get(ctx);
 
         // Outer loop: rows
-        auto outerLoop =
-            rewriter.create<scf::ForOp>(loc, zero, dimM, one);
+        auto outerLoop = rewriter.create<scf::ForOp>(loc, zero, dimM, one);
         rewriter.setInsertionPointToStart(outerLoop.getBody());
         Value rowIV = outerLoop.getInductionVar();
 
-        // Inner loop: columns
-        auto innerLoop =
-            rewriter.create<scf::ForOp>(loc, zero, dimN, one);
+        // Inner loop: columns (vectorized chunk step)
+        auto innerLoop = rewriter.create<scf::ForOp>(loc, zero, dimN, colStep);
         rewriter.setInsertionPointToStart(innerLoop.getBody());
         Value colIV = innerLoop.getInductionVar();
 
-        // Load from HBM subview (linear addressing)
-        Value val = rewriter.create<memref::LoadOp>(
-            loc, subview.getResult(), ValueRange{rowIV, colIV});
-
-        // Store to SRAM (linear here, but SwizzleLoadPass will XOR
-        // the column index of this store op in a later pass)
-        auto storeOp = rewriter.create<memref::StoreOp>(
-            loc, val, sramAlloc.getResult(), ValueRange{rowIV, colIV});
-        lastStoreOp = storeOp;
+        // Issue one async copy token for this [row, col] chunk.
+        auto asyncCopy = rewriter.create<nvgpu::DeviceAsyncCopyOp>(
+          loc, asyncTokenTy,
+          sramAlloc.getResult(), ValueRange{rowIV, colIV},
+          subview.getResult(), ValueRange{rowIV, colIV},
+          rewriter.getIndexAttr(chunkElems), Value(), UnitAttr());
+        (void)asyncCopy;
+        lastCopyLoop = outerLoop;
 
         // Move insertion point after the outer loop for the next subview
         rewriter.setInsertionPointAfter(outerLoop);
@@ -295,14 +293,13 @@ struct SharedMemoryPromotionPass
         ++promotedCount;
       }
 
-      // ── Insert gpu.barrier after all copy loops (RAW hazard) ────
-      if (lastStoreOp) {
-        // Find the outermost scf.for that contains lastStoreOp
-        Operation *outerLoop = lastStoreOp->getParentOp()->getParentOp();
-        if (!hasBarrierAfter(outerLoop)) {
-          rewriter.setInsertionPointAfter(outerLoop);
-          rewriter.create<gpu::BarrierOp>(loc);
-        }
+      // ── Insert async group + wait after all copy loops (RAW hazard) ────
+      if (lastCopyLoop) {
+        rewriter.setInsertionPointAfter(lastCopyLoop);
+        auto asyncGroup = rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(
+        loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
+        rewriter.create<nvgpu::DeviceAsyncWaitOp>(
+            loc, asyncGroup.getAsyncToken(), rewriter.getI32IntegerAttr(0));
       }
 
       // ── Insert gpu.barrier before yield (WAR hazard) ────────────

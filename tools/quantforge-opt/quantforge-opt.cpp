@@ -15,6 +15,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -37,6 +38,7 @@ int main(int argc, char **argv)
         mlir::scf::SCFDialect,
         mlir::vector::VectorDialect,
         mlir::gpu::GPUDialect,
+        mlir::nvgpu::NVGPUDialect,
         mlir::LLVM::LLVMDialect,
         mlir::NVVM::NVVMDialect,
         mlir::memref::MemRefDialect,
