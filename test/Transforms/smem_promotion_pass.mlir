@@ -6,11 +6,18 @@
 //
 // Verifies that --quantforge-smem-promotion:
 //   1. Allocates SRAM buffers with #gpu.address_space<workgroup>
-//   2. Inserts memref.copy from HBM subview to SRAM
-//   3. Inserts gpu.barrier after copies (RAW hazard)
+//   2. Generates explicit scf.for copy loops (NOT memref.copy) with
+//      memref.load (HBM) + memref.store (SRAM)
+//   3. Inserts gpu.barrier after copy loops (RAW hazard)
 //   4. Inserts gpu.barrier before yield (WAR hazard)
 //   5. Inserts memref.dealloc for SRAM liveness
-//   6. Replaces uses of HBM subview with SRAM alloc
+//   6. Replaces downstream uses of HBM subview with SRAM alloc
+//
+// DESIGN NOTE: We explicitly avoid memref.copy because it writes
+// linearly to SRAM. The downstream SwizzleLoadPass needs to see
+// memref.store ops to SRAM so it can XOR-swizzle BOTH the write
+// (store) and read (load) indices. This ensures consistent swizzled
+// layout and prevents DATA CORRUPTION.
 //
 // NOTE: Input is already in memref form (post-bufferization).
 // =====================================================================
@@ -20,17 +27,26 @@
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @smem_promotion_kloop
 
-// Tile A [128x64] promoted
-// CHECK:         memref.subview {{.*}} : memref<4096x4096xf16> to memref<128x64xf16
+// Tile A [128x64]: SRAM alloc
 // CHECK:         memref.alloc() : memref<128x64xf16, #gpu.address_space<workgroup>>
-// CHECK:         memref.copy
 
-// Tile B [64x128] promoted
-// CHECK:         memref.subview {{.*}} : memref<4096x4096xf16> to memref<64x128xf16
+// Explicit copy loop (NOT memref.copy)
+// CHECK-NOT:     memref.copy
+// CHECK:         scf.for
+// CHECK:           scf.for
+// CHECK:             memref.load {{.*}} : memref<128x64xf16
+// CHECK:             memref.store {{.*}} : memref<128x64xf16, #gpu.address_space<workgroup>>
+
+// Tile B [64x128]: SRAM alloc
 // CHECK:         memref.alloc() : memref<64x128xf16, #gpu.address_space<workgroup>>
-// CHECK:         memref.copy
 
-// RAW barrier after copies
+// Explicit copy loop for Tile B
+// CHECK:         scf.for
+// CHECK:           scf.for
+// CHECK:             memref.load {{.*}} : memref<64x128xf16
+// CHECK:             memref.store {{.*}} : memref<64x128xf16, #gpu.address_space<workgroup>>
+
+// RAW barrier after copy loops
 // CHECK:         gpu.barrier
 
 // Compute uses SRAM

@@ -188,7 +188,10 @@ namespace mlir
             registerLowerUnpackToNVVMPass();
             // Phase 3 optimization passes
             registerLowerUnpackToPRMTPass();
-            registerSwizzledUnpackIndexingPass();
+            // DEPRECATED: Swizzle at tensor level is incorrect; bank
+            // conflicts must be resolved at memref level via
+            // SwizzleLoadPass (Task 4.3) after SRAM promotion.
+            // registerSwizzledUnpackIndexingPass();
             registerRegisterLayoutAwareUnpackPass();
             registerCanonicalizeDequantZeroPointPass();
             // Task 2.2: Tiling pass
