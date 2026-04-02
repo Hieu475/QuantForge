@@ -15,6 +15,9 @@ add_mlir_library(QuantForgeTransforms
   VectorizationPass.cpp                # Task 2.3.1: linalg -> vector dialect
   GPUMappingPass.cpp                   # Phase 4: GPU hardware mapping
   LowerToNVVMPass.cpp                  # Task 3.2: PTX translation boundary
+  QuantForgeBufferizePass.cpp          # Task 4.1: One-Shot Bufferize
+  SharedMemoryPromotionPass.cpp        # Task 4.2+4.4: HBM → SRAM promotion
+  SwizzleLoadPass.cpp                  # Task 4.3: XOR bank conflict prevention
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
@@ -50,4 +53,14 @@ add_mlir_library(QuantForgeTransforms
   MLIRMemRefToLLVM
   MLIRVectorToLLVM
   MLIRSCFToControlFlow
+  # Task 4.1: Bufferization infrastructure
+  MLIRBufferizationDialect
+  MLIRBufferizationTransforms
+  MLIRMemRefDialect
+  MLIRMemRefTransforms
+  # Task 4.1: Dialect-specific bufferization interfaces
+  MLIRArithTransforms            # arith::registerBufferizableOpInterface
+  MLIRLinalgTransformOps         # linalg bufferization interface (external models)
+  MLIRSCFTransforms              # scf::registerBufferizableOpInterface
+  MLIRTensorTransforms           # tensor::registerBufferizableOpInterface
 )

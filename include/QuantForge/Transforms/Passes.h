@@ -145,6 +145,35 @@ namespace mlir
 
         void registerLowerToNVVMPass();
 
+        // === Task 4.1: Bufferization Pass ===
+
+        /// Create the QuantForgeBufferizePass.
+        /// One-Shot Bufferize: converts all tensor ops to memref ops
+        /// with in-place analysis and IdentityLayoutMap at function
+        /// boundaries. Runs on ModuleOp.
+        std::unique_ptr<Pass> createQuantForgeBufferizePass();
+
+        void registerQuantForgeBufferizePass();
+
+        // === Task 4.2+4.4: Shared Memory Promotion Pass ===
+
+        /// Create the SharedMemoryPromotionPass.
+        /// Promotes tile-sized HBM memref.subview reads into Shared
+        /// Memory (SRAM, memory_space=3) with gpu.barrier sync and
+        /// memref.dealloc for MLIR liveness analysis.
+        std::unique_ptr<Pass> createSharedMemoryPromotionPass();
+
+        void registerSharedMemoryPromotionPass();
+
+        // === Task 4.3: XOR Swizzle Load Pass ===
+
+        /// Create the SwizzleLoadPass.
+        /// XOR swizzle addressing for SRAM loads/stores to eliminate
+        /// shared memory bank conflicts (col ^ (row % phase)).
+        std::unique_ptr<Pass> createSwizzleLoadPass();
+
+        void registerSwizzleLoadPass();
+
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
@@ -170,6 +199,10 @@ namespace mlir
             registerGPUMappingPass();
             // Task 3.2: PTX translation boundary
             registerLowerToNVVMPass();
+            // Task 4: Bufferization & Shared Memory Management
+            registerQuantForgeBufferizePass();
+            registerSharedMemoryPromotionPass();
+            registerSwizzleLoadPass();
         }
 
     } // namespace quantforge

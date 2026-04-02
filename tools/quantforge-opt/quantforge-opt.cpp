@@ -18,6 +18,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 
 #include "QuantForge/Dialect/QuantForge/QuantForgeDialect.h"
@@ -39,7 +40,8 @@ int main(int argc, char **argv)
         mlir::LLVM::LLVMDialect,
         mlir::NVVM::NVVMDialect,
         mlir::memref::MemRefDialect,
-        mlir::cf::ControlFlowDialect>();
+        mlir::cf::ControlFlowDialect,
+        mlir::bufferization::BufferizationDialect>();
 
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();
