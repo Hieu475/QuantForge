@@ -9,7 +9,6 @@ add_mlir_library(QuantForgeTransforms
   LowerUnpackToNVVM.cpp                # Phase 2: PTX-ready i32-chunk SCF lowering
   CanonicalizeDequantZeroPoint.cpp     # Opt 4: symmetric quant fast-path (zp=0)
   LowerUnpackToPRMT.cpp                # Opt 1: prmt.b32 intrinsic (Ampere/Hopper)
-  SwizzledUnpackIndexing.cpp           # Opt 3: shared memory bank-conflict prevention
   RegisterLayoutAwareUnpack.cpp        # Opt 2: mma.sync fragment layout (skeleton)
   TilingPass.cpp                       # Task 2.2: 128×128 tile tiling pass
   VectorizationPass.cpp                # Task 2.3.1: linalg -> vector dialect
