@@ -225,7 +225,7 @@ struct SharedMemoryPromotionPass
 
       // ── Promote each subview ────────────────────────────────────
       SmallVector<Value> sramAllocs;
-      Operation *lastCopyOp = nullptr;
+      Operation *lastStoreOp = nullptr;
 
       for (memref::SubViewOp subview : subviewsToPromote) {
         MemRefType hbmTy = subview.getResult().getType();
@@ -239,17 +239,55 @@ struct SharedMemoryPromotionPass
         // 2. Allocate SRAM buffer (insert right after the subview)
         rewriter.setInsertionPointAfter(subview);
         auto sramAlloc = rewriter.create<memref::AllocOp>(loc, sramTy);
-
-        // 3. Copy HBM → SRAM
-        auto copyOp = rewriter.create<memref::CopyOp>(loc, subview.getResult(),
-                                                       sramAlloc.getResult());
-        lastCopyOp = copyOp;
         sramAllocs.push_back(sramAlloc.getResult());
 
-        // 4. Replace all uses of HBM subview (except the copy source)
-        //    with the SRAM alloc
-        subview.getResult().replaceAllUsesExcept(sramAlloc.getResult(),
-                                                 copyOp);
+        // 3. Explicit copy loop: HBM → SRAM
+        //    CRITICAL: We must NOT use memref.copy here because it writes
+        //    linearly. The downstream SwizzleLoadPass will XOR-swizzle the
+        //    memref.store indices (write to SRAM) AND the memref.load
+        //    indices (read from SRAM), ensuring both sides are consistent.
+        //    If we used memref.copy, the write would be linear but the
+        //    read would be swizzled, causing DATA CORRUPTION.
+        Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        Value dimM  = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
+        Value dimN  = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
+        Value one  = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+        // Outer loop: rows
+        auto outerLoop =
+            rewriter.create<scf::ForOp>(loc, zero, dimM, one);
+        rewriter.setInsertionPointToStart(outerLoop.getBody());
+        Value rowIV = outerLoop.getInductionVar();
+
+        // Inner loop: columns
+        auto innerLoop =
+            rewriter.create<scf::ForOp>(loc, zero, dimN, one);
+        rewriter.setInsertionPointToStart(innerLoop.getBody());
+        Value colIV = innerLoop.getInductionVar();
+
+        // Load from HBM subview (linear addressing)
+        Value val = rewriter.create<memref::LoadOp>(
+            loc, subview.getResult(), ValueRange{rowIV, colIV});
+
+        // Store to SRAM (linear here, but SwizzleLoadPass will XOR
+        // the column index of this store op in a later pass)
+        auto storeOp = rewriter.create<memref::StoreOp>(
+            loc, val, sramAlloc.getResult(), ValueRange{rowIV, colIV});
+        lastStoreOp = storeOp;
+
+        // Move insertion point after the outer loop for the next subview
+        rewriter.setInsertionPointAfter(outerLoop);
+
+        // 4. Replace all uses of HBM subview with the SRAM alloc
+        //    (the load from HBM inside the copy loop is excluded via
+        //    subview → sramAlloc replacement not affecting the copy loop,
+        //    since the loop uses subview.getResult() directly)
+        subview.getResult().replaceUsesWithIf(
+            sramAlloc.getResult(), [&](OpOperand &use) {
+              // Don't replace uses inside the copy loops we just created
+              Operation *user = use.getOwner();
+              return !outerLoop->isProperAncestor(user);
+            });
 
         LLVM_DEBUG(llvm::dbgs()
                    << "[SmemPromotion] promoted subview "
@@ -257,10 +295,14 @@ struct SharedMemoryPromotionPass
         ++promotedCount;
       }
 
-      // ── Insert gpu.barrier after all copies (RAW hazard) ────────
-      if (lastCopyOp && !hasBarrierAfter(lastCopyOp)) {
-        rewriter.setInsertionPointAfter(lastCopyOp);
-        rewriter.create<gpu::BarrierOp>(loc);
+      // ── Insert gpu.barrier after all copy loops (RAW hazard) ────
+      if (lastStoreOp) {
+        // Find the outermost scf.for that contains lastStoreOp
+        Operation *outerLoop = lastStoreOp->getParentOp()->getParentOp();
+        if (!hasBarrierAfter(outerLoop)) {
+          rewriter.setInsertionPointAfter(outerLoop);
+          rewriter.create<gpu::BarrierOp>(loc);
+        }
       }
 
       // ── Insert gpu.barrier before yield (WAR hazard) ────────────
