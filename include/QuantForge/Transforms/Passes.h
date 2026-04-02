@@ -83,13 +83,6 @@ namespace mlir
 
         void registerLowerUnpackToPRMTPass();
 
-        /// Create the SwizzledUnpackIndexing pass.
-        /// Rewrites tensor.extract column indices in unpack SCF loops with
-        /// XOR swizzling (col ^= k%8) to prevent shared memory bank conflicts.
-        std::unique_ptr<Pass> createSwizzledUnpackIndexingPass();
-
-        void registerSwizzledUnpackIndexingPass();
-
         /// Create the RegisterLayoutAwareUnpack pass.
         /// Rewrites unpack output indices to match mma.sync fragment layout,
         /// eliminating shfl.sync warp shuffles. Requires "mma_consumer"
@@ -188,10 +181,6 @@ namespace mlir
             registerLowerUnpackToNVVMPass();
             // Phase 3 optimization passes
             registerLowerUnpackToPRMTPass();
-            // DEPRECATED: Swizzle at tensor level is incorrect; bank
-            // conflicts must be resolved at memref level via
-            // SwizzleLoadPass (Task 4.3) after SRAM promotion.
-            // registerSwizzledUnpackIndexingPass();
             registerRegisterLayoutAwareUnpackPass();
             registerCanonicalizeDequantZeroPointPass();
             // Task 2.2: Tiling pass

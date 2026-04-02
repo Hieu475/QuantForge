@@ -23,8 +23,8 @@
 //     %row_mod  = arith.remui %row, %phase
 //     %new_col  = arith.xori  %col, %row_mod
 //
-// This approach is consistent with SwizzledUnpackIndexing.cpp which uses
-// the same arith.xori pattern at the tensor level.
+// This pass is the single source of truth for swizzle index rewriting,
+// applied at memref pointer semantics where shared-memory layout is explicit.
 //
 // Pipeline position:
 //   quantforge-smem-promotion → **quantforge-swizzle-load** → lower-to-nvvm
