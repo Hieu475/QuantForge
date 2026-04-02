@@ -217,6 +217,23 @@ struct GPUMappingPass
       for (scf::ForOp kLoop : kLoops) {
         Block &kBody = *kLoop.getBody();
 
+        // Map async-copy loop nests emitted by SharedMemoryPromotionPass.
+        // This prevents each thread from executing the full sequential copy.
+        kLoop.walk([&](scf::ForOp forOp) {
+          if (hasUnitAttr(forOp, "quantforge.sram_copy_outer")) {
+            forOp->setAttr(
+                "mapping",
+                ArrayAttr::get(ctx, {gpu::GPUThreadMappingAttr::get(
+                                        ctx, gpu::MappingId::DimY)}));
+          }
+          if (hasUnitAttr(forOp, "quantforge.sram_copy_inner")) {
+            forOp->setAttr(
+                "mapping",
+                ArrayAttr::get(ctx, {gpu::GPUThreadMappingAttr::get(
+                                        ctx, gpu::MappingId::DimX)}));
+          }
+        });
+
         // Skip if barriers already exist to keep pass idempotent.
         bool hasBarrier = false;
         for (Operation &op : kBody.without_terminator()) {
@@ -242,6 +259,12 @@ struct GPUMappingPass
           hasTaggedCompute =
               hasTaggedCompute || hasUnitAttr(&op, "quantforge.compute");
         }
+
+        // Copy-only tagged regions are synchronized explicitly by
+        // SharedMemoryPromotionPass via device_async_wait + gpu.barrier.
+        // Skip extra barrier insertion here to avoid over-synchronization.
+        if (hasTaggedLoad && !hasTaggedCompute)
+          continue;
 
         const bool useTaggedSemantics = hasTaggedLoad || hasTaggedCompute;
         for (Operation &op : kBody.without_terminator()) {

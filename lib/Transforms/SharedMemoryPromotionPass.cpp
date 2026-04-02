@@ -142,10 +142,14 @@ static Operation *emitAsyncCopyLoopNest(IRRewriter &rewriter, Location loc,
   Value colStep = rewriter.create<arith::ConstantIndexOp>(loc, chunkElems);
 
   auto outer = rewriter.create<scf::ForOp>(loc, zero, dimM, one);
+  outer->setAttr("quantforge.sram_load", rewriter.getUnitAttr());
+  outer->setAttr("quantforge.sram_copy_outer", rewriter.getUnitAttr());
   rewriter.setInsertionPointToStart(outer.getBody());
   Value rowIV = outer.getInductionVar();
 
   auto inner = rewriter.create<scf::ForOp>(loc, zero, dimN, colStep);
+  inner->setAttr("quantforge.sram_load", rewriter.getUnitAttr());
+  inner->setAttr("quantforge.sram_copy_inner", rewriter.getUnitAttr());
   rewriter.setInsertionPointToStart(inner.getBody());
   Value colIV = inner.getInductionVar();
 
@@ -393,6 +397,7 @@ struct SharedMemoryPromotionPass
           loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
       rewriter.create<nvgpu::DeviceAsyncWaitOp>(
           loc, prologGroup.getAsyncToken(), rewriter.getI32IntegerAttr(0));
+        rewriter.create<gpu::BarrierOp>(loc);
 
       // Main-loop wait(1): keep one async group in flight.
       rewriter.setInsertionPoint(kBody.getTerminator());
@@ -400,6 +405,7 @@ struct SharedMemoryPromotionPass
           loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
       rewriter.create<nvgpu::DeviceAsyncWaitOp>(
           loc, mainGroup.getAsyncToken(), rewriter.getI32IntegerAttr(1));
+        rewriter.create<gpu::BarrierOp>(loc);
 
       // Epilog wait(0): drain remaining in-flight copies.
       rewriter.setInsertionPointAfter(kLoop);
