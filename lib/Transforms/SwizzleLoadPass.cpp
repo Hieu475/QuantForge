@@ -162,8 +162,8 @@ struct SwizzleLoadPass
   // Dependent dialects
   //------------------------------------------------------------------
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, memref::MemRefDialect,
-                    gpu::GPUDialect, nvgpu::NVGPUDialect>();
+    registry.insert<arith::ArithDialect, memref::MemRefDialect, gpu::GPUDialect,
+                    nvgpu::NVGPUDialect>();
   }
 
   //------------------------------------------------------------------

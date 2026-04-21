@@ -24,7 +24,8 @@
 //   3 = Shared (SRAM) — #gpu.address_space<workgroup>
 //
 // Pipeline position:
-//   quantforge-bufferize → **quantforge-smem-promotion** → quantforge-swizzle-load
+//   quantforge-bufferize → **quantforge-smem-promotion** →
+//   quantforge-swizzle-load
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "quantforge-smem-promotion"
@@ -70,8 +71,7 @@ static bool isGlobalMemorySpace(MemRefType memrefTy) {
 /// tile dimensions for promotion.
 static bool isTileSizedSubview(memref::SubViewOp subview,
                                ArrayRef<int64_t> tileSizesM,
-                               ArrayRef<int64_t> tileSizesN,
-                               int64_t tileK) {
+                               ArrayRef<int64_t> tileSizesN, int64_t tileK) {
   MemRefType resultTy = subview.getResult().getType();
 
   // We only handle 2D tiles.
@@ -105,8 +105,7 @@ static bool hasBarrierBefore(Operation *op) {
 /// with `newK`. Returns empty op if no K-dependent offset exists.
 static memref::SubViewOp cloneSubviewWithKReplacement(IRRewriter &rewriter,
                                                       memref::SubViewOp base,
-                                                      Value oldK,
-                                                      Value newK) {
+                                                      Value oldK, Value newK) {
   SmallVector<OpFoldResult> mixedOffsets = base.getMixedOffsets();
   SmallVector<OpFoldResult> offsets(mixedOffsets.begin(), mixedOffsets.end());
   bool replaced = false;
@@ -124,17 +123,15 @@ static memref::SubViewOp cloneSubviewWithKReplacement(IRRewriter &rewriter,
   SmallVector<OpFoldResult> mixedStrides = base.getMixedStrides();
   SmallVector<OpFoldResult> strides(mixedStrides.begin(), mixedStrides.end());
 
-  return rewriter.create<memref::SubViewOp>(base.getLoc(), base.getType(),
-                                             base.getSource(), offsets, sizes,
-                                             strides);
+  return rewriter.create<memref::SubViewOp>(
+      base.getLoc(), base.getType(), base.getSource(), offsets, sizes, strides);
 }
 
 /// Emit nested row/col async copy loops from `src` to `dst`.
 static Operation *emitAsyncCopyLoopNest(IRRewriter &rewriter, Location loc,
                                         Value src, Value dst,
                                         ArrayRef<int64_t> shape,
-                                        int64_t chunkElems,
-                                        Type asyncTokenTy) {
+                                        int64_t chunkElems, Type asyncTokenTy) {
   Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
   Value dimM = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
@@ -177,8 +174,8 @@ struct SharedMemoryPromotionPass
   SharedMemoryPromotionPass() = default;
 
   SharedMemoryPromotionPass(const SharedMemoryPromotionPass &other)
-      : PassWrapper<SharedMemoryPromotionPass,
-                    OperationPass<func::FuncOp>>(other) {
+      : PassWrapper<SharedMemoryPromotionPass, OperationPass<func::FuncOp>>(
+            other) {
     blockTileM.setValue(other.blockTileM.getValue());
     blockTileN.setValue(other.blockTileN.getValue());
     blockTileK.setValue(other.blockTileK.getValue());
@@ -190,13 +187,12 @@ struct SharedMemoryPromotionPass
   //------------------------------------------------------------------
   // Pass metadata
   //------------------------------------------------------------------
-  StringRef getArgument() const override {
-    return "quantforge-smem-promotion";
-  }
+  StringRef getArgument() const override { return "quantforge-smem-promotion"; }
 
   StringRef getDescription() const override {
     return "Promote tile-sized HBM memref.subview reads into Shared Memory "
-           "(SRAM) allocations with nvgpu.device_async_copy synchronization and "
+           "(SRAM) allocations with nvgpu.device_async_copy synchronization "
+           "and "
            "memref.dealloc for liveness analysis.";
   }
 
@@ -228,9 +224,8 @@ struct SharedMemoryPromotionPass
   // Dependent dialects
   //------------------------------------------------------------------
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<memref::MemRefDialect, gpu::GPUDialect,
-                    scf::SCFDialect, arith::ArithDialect,
-                    nvgpu::NVGPUDialect>();
+    registry.insert<memref::MemRefDialect, gpu::GPUDialect, scf::SCFDialect,
+                    arith::ArithDialect, nvgpu::NVGPUDialect>();
   }
 
   //------------------------------------------------------------------
@@ -335,9 +330,8 @@ struct SharedMemoryPromotionPass
         Value c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
         Value iterParity = rewriter.create<arith::RemUIOp>(loc, iterIdx, c2);
         Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-        Value isEven =
-            rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                           iterParity, c0);
+        Value isEven = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, iterParity, c0);
 
         auto curBufIf =
             rewriter.create<scf::IfOp>(loc, TypeRange{sramTy}, isEven,
@@ -366,7 +360,7 @@ struct SharedMemoryPromotionPass
             loc, arith::CmpIPredicate::ult, kNext, kUpper);
 
         auto fetchIf = rewriter.create<scf::IfOp>(loc, hasNext,
-                                                   /*withElseRegion=*/false);
+                                                  /*withElseRegion=*/false);
         {
           rewriter.setInsertionPointToStart(fetchIf.thenBlock());
           auto nextSubview =
@@ -385,9 +379,8 @@ struct SharedMemoryPromotionPass
               return !fetchIf->isProperAncestor(user);
             });
 
-        LLVM_DEBUG(llvm::dbgs()
-                   << "[SmemPromotion] ping-pong promoted subview "
-                   << shape[0] << "x" << shape[1] << " to SRAM\n");
+        LLVM_DEBUG(llvm::dbgs() << "[SmemPromotion] ping-pong promoted subview "
+                                << shape[0] << "x" << shape[1] << " to SRAM\n");
         ++promotedCount;
       }
 
@@ -397,15 +390,15 @@ struct SharedMemoryPromotionPass
           loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
       rewriter.create<nvgpu::DeviceAsyncWaitOp>(
           loc, prologGroup.getAsyncToken(), rewriter.getI32IntegerAttr(0));
-        rewriter.create<gpu::BarrierOp>(loc);
+      rewriter.create<gpu::BarrierOp>(loc);
 
       // Main-loop wait(1): keep one async group in flight.
       rewriter.setInsertionPoint(kBody.getTerminator());
       auto mainGroup = rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(
           loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
-      rewriter.create<nvgpu::DeviceAsyncWaitOp>(
-          loc, mainGroup.getAsyncToken(), rewriter.getI32IntegerAttr(1));
-        rewriter.create<gpu::BarrierOp>(loc);
+      rewriter.create<nvgpu::DeviceAsyncWaitOp>(loc, mainGroup.getAsyncToken(),
+                                                rewriter.getI32IntegerAttr(1));
+      rewriter.create<gpu::BarrierOp>(loc);
 
       // Epilog wait(0): drain remaining in-flight copies.
       rewriter.setInsertionPointAfter(kLoop);

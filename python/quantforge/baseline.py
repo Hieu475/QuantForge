@@ -114,11 +114,11 @@ def main():
     # Verify correctness: pack → unpack should be identity
     w_roundtrip = unpack_int4(w_packed)
     assert torch.equal(w_full, w_roundtrip), "Pack/Unpack roundtrip failed!"
-    print("✅ Pack/Unpack roundtrip: PASS")
+    print(" Pack/Unpack roundtrip: PASS")
 
     # Compute golden tensor
     golden = gemv_int4_baseline(x, w_packed, scale, zero_point)
-    print(f"✅ Golden tensor shape: {golden.shape}, dtype: {golden.dtype}")
+    print(f" Golden tensor shape: {golden.shape}, dtype: {golden.dtype}")
 
     # Save golden tensor for future comparison
     torch.save({
@@ -128,11 +128,11 @@ def main():
         'zero_point': zero_point.cpu(),
         'golden': golden.cpu(),
     }, 'test/golden_tensors.pt')
-    print("✅ Golden tensors saved to test/golden_tensors.pt")
+    print(" Golden tensors saved to test/golden_tensors.pt")
 
     # Benchmark
     latency = benchmark(gemv_int4_baseline, x, w_packed, scale, zero_point)
-    print(f"\n📊 PyTorch Naive W4A16 GEMV Latency: {latency * 1000:.3f} ms")
+    print(f"\n PyTorch Naive W4A16 GEMV Latency: {latency * 1000:.3f} ms")
     print(f"   (This is the baseline to beat with MLIR compiler)")
 
     # Memory bandwidth analysis
@@ -140,7 +140,7 @@ def main():
     x_bytes = x.numel() * 2        # FP16 = 2 bytes each
     total_bytes = w_bytes + x_bytes
     bw_achieved = total_bytes / latency / 1e9  # GB/s
-    print(f"\n📊 Effective Bandwidth: {bw_achieved:.1f} GB/s")
+    print(f"\n Effective Bandwidth: {bw_achieved:.1f} GB/s")
     print(f"   (RTX 4050 theoretical peak: ~192 GB/s)")
     print(f"   Utilization: {bw_achieved / 192 * 100:.1f}%")
 

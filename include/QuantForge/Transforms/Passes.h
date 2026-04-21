@@ -167,6 +167,15 @@ namespace mlir
 
         void registerSwizzleLoadPass();
 
+        // === Phase 5 Passes — Tensor Core Lowering & Register Fusion ===
+
+        /// Create the QuantForgeToNVGPU pass.
+        /// Phase 5 entry point for ldmatrix emission, register-level unpack,
+        /// and mma.sync fusion on Ampere+ GPUs.
+        std::unique_ptr<Pass> createQuantForgeToNVGPUPass();
+
+        void registerQuantForgeToNVGPUPass();
+
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
@@ -195,6 +204,7 @@ namespace mlir
             registerQuantForgeBufferizePass();
             registerSharedMemoryPromotionPass();
             registerSwizzleLoadPass();
+            registerQuantForgeToNVGPUPass();
         }
 
     } // namespace quantforge
