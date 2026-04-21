@@ -17,6 +17,7 @@ add_mlir_library(QuantForgeTransforms
   QuantForgeBufferizePass.cpp          # Task 4.1: One-Shot Bufferize
   SharedMemoryPromotionPass.cpp        # Task 4.2+4.4: HBM → SRAM promotion
   SwizzleLoadPass.cpp                  # Task 4.3: XOR bank conflict prevention
+  QuantForgeToNVGPUPass.cpp            # Phase 5.1: ldmatrix→prmt→dequant→mma.sync
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
