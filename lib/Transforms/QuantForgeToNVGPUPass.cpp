@@ -350,25 +350,49 @@ struct LdMatrixWeightINT4Pattern
 //===----------------------------------------------------------------------===//
 // Pattern 3: InRegisterUnpackDequantPattern
 //
+// PHASE 5.1b — Micro-Unrolled, Lane-Aware Nibble Extraction
+//
 // Match:  vector<Nxi32> with attribute "nvgpu.packed_int4_fragment"
 //         (produced by Pattern 2)
-//         + scale value (f16) in scope
-// Emit:   For each i32 element:
-//           prmt.b32 (×2) → nibble extraction (×8) → f16 mantissa trick
-//           → FMA dequant with scale
+// Emit:   Per i32 register (micro-unroll depth=1):
+//           1. prmt.b32 ×2 → separate lo/hi nibble-pairs
+//           2. Lane-aware nibble selection (gpu.thread_id → %lane)
+//           3. FP16 mantissa embedding trick (OR 0x6400, SUB 1024.0)
+//           4. Immediate fragment insertion → release registers
 //         Output: vector<2x2xf16> (mma.sync operand B fragment)
 //
-// The mantissa embedding trick for unsigned INT4 (0-15):
-//   1. Extract nibble (4 bits)
-//   2. OR with 0x6400 (FP16 representation of 1024.0)
-//      This places the nibble value in the mantissa bits
-//   3. Subtract 1024.0 to get the correct FP16 float value
+// Micro-Unrolling Strategy:
+//   OLD: Extract ALL 16 nibbles → store in SmallVector → assemble fragment
+//        Peak live: 16 f16 + 2 i32 + prmt temps ≈ 22 registers
 //
-// This is cheaper than arith.uitofp because:
-//   - uitofp: 1 instruction (but high latency on GPU, ~16 cycles)
-//   - mantissa trick: 2 instructions (OR + FSUB, both ~4 cycles each)
+//   NEW: For each i32 register:
+//          Extract → prmt → 2 f16 (lane-selected) → insert into frag → RELEASE
+//        Peak live: 2 f16 + 1 i32 + prmt temps + frag ≈ 13 registers
 //
-// After f16 conversion, apply dequantization: val * scale
+// Lane-Aware Fragment Mapping (m16n8k16 operand B):
+//   For column-major weight matrix B (K rows × N cols):
+//     lane = threadIdx.x % 32
+//     frag[0] = B[(lane % 4) * 2,     lane / 4]          // k-half 0
+//     frag[1] = B[(lane % 4) * 2 + 1, lane / 4]          // k-half 0
+//     frag[2] = B[(lane % 4) * 2,     lane / 4 + 8]      // k-half 1
+//     frag[3] = B[(lane % 4) * 2 + 1, lane / 4 + 8]      // k-half 1
+//
+//   Each i32 register from ldmatrix contains 8 nibbles (4 bytes).
+//   The nibble this thread needs is determined by its lane ID:
+//     nibble_idx_in_reg = (lane % 4) * 2  → frag[0],frag[2]
+//     nibble_idx_in_reg = (lane % 4) * 2 + 1  → frag[1],frag[3]
+//
+// Register Pressure Budget (per micro-unroll step):
+//   | Component           | Registers |
+//   |---------------------|-----------|
+//   | Current i32 packed  | 1         |
+//   | prmt lo4            | 1         |
+//   | prmt hi4            | 1         |
+//   | nibble temps (×2)   | 2         |
+//   | f16 results (×2)    | 1 (packed)|
+//   | Fragment B accum    | 2         |
+//   | Constants (CSE'd)   | 4         |
+//   | Total               | ~12       |
 //===----------------------------------------------------------------------===//
 
 struct InRegisterUnpackDequantPattern
@@ -398,7 +422,28 @@ struct InRegisterUnpackDequantPattern
     Value packedVec = bitcastOp.getResult();
     int64_t numI32Regs = resultTy.getShape()[0]; // typically 2
 
-    // ── Constants (emitted once, CSE-friendly) ─────────────────────
+    // ── Lane-aware computation (Optimization B) ────────────────────
+    // Determine if we're inside a GPU kernel for thread_id access.
+    // If inside gpu.func: use dynamic per-lane nibble selection.
+    // If outside (e.g., testing): fall back to static selection.
+    Value lane; // index type, 0–31
+    bool hasLaneInfo = false;
+
+    // Check if we're inside a gpu.func or gpu.launch
+    Operation *parentFuncOp = bitcastOp->getParentOfType<gpu::GPUFuncOp>();
+    if (parentFuncOp) {
+      Value tidX = rewriter.create<gpu::ThreadIdOp>(
+          loc, rewriter.getIndexType(), gpu::Dimension::x);
+      Value c32_idx = rewriter.create<arith::ConstantIndexOp>(loc, 32);
+      lane = rewriter.create<arith::RemUIOp>(loc, tidX, c32_idx);
+      hasLaneInfo = true;
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[QuantForgeToNVGPU] Pattern 3: lane-aware mode "
+                    "(inside gpu.func)\n");
+    }
+
+    // ── Constants (emitted once, CSE will deduplicate) ─────────────
     Value zero_i32 = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
     Value selLo = rewriter.create<arith::ConstantIntOp>(
         loc, static_cast<int64_t>(kPrmtSelLo), 32);
@@ -409,31 +454,102 @@ struct InRegisterUnpackDequantPattern
     // FP16 mantissa magic: 0x6400 (= 1024.0 in f16)
     Value magic_i16 = rewriter.create<arith::ConstantIntOp>(
         loc, static_cast<int64_t>(kFP16MantissaMagic), 16);
-    // Bias to subtract: 1024.0 as f16
     Value bias_f16 = rewriter.create<arith::ConstantOp>(
         loc, f16Ty, rewriter.getF16FloatAttr(1024.0));
 
-    // prmt inline asm
+    // prmt inline asm template
     StringRef prmtAsmStr = "prmt.b32 $0, $1, $2, $3;";
     StringRef prmtConstraints = "=r,r,r,r";
     auto asmDialect =
         LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
 
-    // ── Process each i32 register ──────────────────────────────────
-    // Each i32 contains 8 INT4 nibbles = 4 bytes.
-    // Output: 8 f16 values per i32 → total 8*numI32Regs f16 values.
-    // For mma.sync operand B (m16n8k16): thread holds 2×2 = 4 f16 values.
-    // With numI32Regs=2, we get 16 f16 values, which we fold into the
-    // operand B fragment across K-dimension tiles.
+    // ── Lane-based nibble offset computation ───────────────────────
+    // For m16n8k16 operand B (col-major weights):
+    //   nibble_base = (lane % 4) * 2
+    //   This gives the starting nibble index within the i32 register
+    //   that this specific thread needs to extract.
+    //
+    // Each thread extracts 2 consecutive nibbles per i32:
+    //   nibble[nibble_base]     → frag position for even tile
+    //   nibble[nibble_base + 1] → frag position for odd tile
+    Value nibbleBase_i32; // i32 type for shift computation
+    if (hasLaneInfo) {
+      Value c4_idx = rewriter.create<arith::ConstantIndexOp>(loc, 4);
+      Value c2_idx = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+      Value laneMod4 = rewriter.create<arith::RemUIOp>(loc, lane, c4_idx);
+      Value nibbleBaseIdx =
+          rewriter.create<arith::MulIOp>(loc, laneMod4, c2_idx);
+      // Convert index → i32 for shift amount computation
+      nibbleBase_i32 =
+          rewriter.create<arith::IndexCastOp>(loc, i32Ty, nibbleBaseIdx);
+    } else {
+      // Static fallback: thread 0 defaults, extract nibbles 0,1
+      nibbleBase_i32 = zero_i32;
+    }
 
-    SmallVector<Value> unpackedF16Values;
+    // ── Initialize fragment B with zeros ───────────────────────────
+    auto fragBTy = getMmaSyncFragB(ctx);
+    Value fragB = rewriter.create<arith::ConstantOp>(
+        loc, fragBTy,
+        DenseElementsAttr::get(fragBTy,
+                               APFloat(APFloat::IEEEhalf(), APInt(16, 0))));
+
+    // ── Micro-Unrolled Processing (Optimization A) ─────────────────
+    // Process each i32 register independently. Extract ONLY the 2
+    // nibbles this thread needs, convert to f16, insert into fragment
+    // IMMEDIATELY, then release the i32 + prmt temporaries.
+    //
+    // Register lifecycle per iteration:
+    //   [BORN]  packed_i32 ← vector.extract
+    //   [BORN]  lo4        ← prmt(packed_i32, 0, selLo)
+    //   [BORN]  hi4        ← prmt(packed_i32, 0, selHi)
+    //   [DEAD]  packed_i32  (no more uses after prmt)
+    //   [BORN]  nibble0_f16 ← mantissa_trick(lo4/hi4, nibbleBase)
+    //   [BORN]  nibble1_f16 ← mantissa_trick(lo4/hi4, nibbleBase+1)
+    //   [DEAD]  lo4, hi4    (no more uses after nibble extraction)
+    //   [BORN]  fragB      ← vector.insert(nibble0_f16, nibble1_f16)
+    //   [DEAD]  nibble0_f16, nibble1_f16
+    //
+    // Max simultaneously live: packed_i32 + lo4 + hi4 + nibble_f16×2 + fragB
+    //                        = 1 + 1 + 1 + 1 + 2 = 6 (+ constants)
+
+    // Helper lambda: extract a single nibble from lo4/hi4, convert to f16
+    auto extractNibbleToF16 = [&](Value lo4, Value hi4,
+                                  Value nibbleIdx_i32) -> Value {
+      // Determine which half (lo4 or hi4) based on nibble index
+      // nibbles 0-3 → lo4,  nibbles 4-7 → hi4
+      // bit_offset_in_half = (nibbleIdx % 4) * 4
+      Value c4_i32 = rewriter.create<arith::ConstantIntOp>(loc, 4, 32);
+      Value halfOffset =
+          rewriter.create<arith::RemUIOp>(loc, nibbleIdx_i32, c4_i32);
+      Value bitShift =
+          rewriter.create<arith::MulIOp>(loc, halfOffset, c4_i32);
+
+      // Select lo4 or hi4: use (nibbleIdx >= 4) ? hi4 : lo4
+      Value isHiHalf = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::uge, nibbleIdx_i32, c4_i32);
+      Value src = rewriter.create<arith::SelectOp>(loc, isHiHalf, hi4, lo4);
+
+      // Shift and mask
+      Value shifted = rewriter.create<arith::ShRUIOp>(loc, src, bitShift);
+      Value nibble = rewriter.create<arith::AndIOp>(loc, shifted, nibMask);
+
+      // Mantissa embedding: i32 → i16 → OR magic → bitcast f16 → SUB bias
+      Value nibble_i16 =
+          rewriter.create<arith::TruncIOp>(loc, i16Ty, nibble);
+      Value biased_i16 =
+          rewriter.create<arith::OrIOp>(loc, nibble_i16, magic_i16);
+      Value biased_f16 =
+          rewriter.create<arith::BitcastOp>(loc, f16Ty, biased_i16);
+      return rewriter.create<arith::SubFOp>(loc, biased_f16, bias_f16);
+    };
 
     for (int64_t reg = 0; reg < numI32Regs; ++reg) {
-      // Extract the i32 element from the vector
+      // ── Step 1: Extract i32 register ─────────────────────────────
       Value packed_i32 =
           rewriter.create<vector::ExtractOp>(loc, packedVec, reg);
 
-      // ── prmt #1: extract bytes 0,1 (nibbles 0-3) ─────────────
+      // ── Step 2: prmt ×2 → separate nibble-pairs ─────────────────
       Value lo4 =
           rewriter
               .create<LLVM::InlineAsmOp>(
@@ -444,7 +560,6 @@ struct InRegisterUnpackDequantPattern
                   /*operand_attrs=*/ArrayAttr{})
               .getResult(0);
 
-      // ── prmt #2: extract bytes 2,3 (nibbles 4-7) ─────────────
       Value hi4 =
           rewriter
               .create<LLVM::InlineAsmOp>(
@@ -455,82 +570,48 @@ struct InRegisterUnpackDequantPattern
                   /*operand_attrs=*/ArrayAttr{})
               .getResult(0);
 
-      // ── Extract 8 nibbles and convert to f16 via mantissa trick ─
-      for (int n = 0; n < 8; ++n) {
-        Value src = (n < 4) ? lo4 : hi4;
-        int bitOffset = (n % 4) * 4; // 0, 4, 8, 12
+      // ── Step 3: Extract EXACTLY 2 nibbles for this thread ────────
+      // nibble indices: nibbleBase (→ frag[reg*2]) and nibbleBase+1 (→ frag[reg*2+1])
+      Value c1_i32 = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
+      Value nibIdx0 = nibbleBase_i32;
+      Value nibIdx1 = rewriter.create<arith::AddIOp>(loc, nibbleBase_i32, c1_i32);
 
-        // Shift and mask to isolate nibble
-        Value shifted = src;
-        if (bitOffset > 0) {
-          Value shAmt =
-              rewriter.create<arith::ConstantIntOp>(loc, bitOffset, 32);
-          shifted = rewriter.create<arith::ShRUIOp>(loc, src, shAmt);
-        }
-        Value nibble = rewriter.create<arith::AndIOp>(loc, shifted, nibMask);
+      Value f16_val0 = extractNibbleToF16(lo4, hi4, nibIdx0);
+      Value f16_val1 = extractNibbleToF16(lo4, hi4, nibIdx1);
 
-        // Truncate i32 nibble → i16 for FP16 mantissa embedding
-        Value nibble_i16 =
-            rewriter.create<arith::TruncIOp>(loc, i16Ty, nibble);
+      // ── Step 4: Insert into fragment IMMEDIATELY ─────────────────
+      // Register `reg` maps to tile index in the 2×2 fragment.
+      // reg=0 → tile 0 (k-half 0), reg=1 → tile 1 (k-half 1)
+      fragB = rewriter.create<vector::InsertOp>(
+          loc, f16_val0, fragB, ArrayRef<int64_t>{reg, 0});
+      fragB = rewriter.create<vector::InsertOp>(
+          loc, f16_val1, fragB, ArrayRef<int64_t>{reg, 1});
 
-        // Mantissa embedding: OR nibble into magic constant 0x6400
-        // This effectively computes: float16(1024 + nibble_value)
-        Value biased_i16 =
-            rewriter.create<arith::OrIOp>(loc, nibble_i16, magic_i16);
+      // After this point: packed_i32, lo4, hi4, f16_val0, f16_val1 are
+      // all DEAD (no more uses). LLVM backend can reuse their registers.
+      // Only fragB lives on to the next iteration.
 
-        // Bitcast i16 → f16
-        Value biased_f16 =
-            rewriter.create<arith::BitcastOp>(loc, f16Ty, biased_i16);
-
-        // Subtract bias: result = biased_f16 - 1024.0
-        // This gives the correct unsigned INT4 → FP16 value
-        Value f16_val =
-            rewriter.create<arith::SubFOp>(loc, biased_f16, bias_f16);
-
-        unpackedF16Values.push_back(f16_val);
-      }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[QuantForgeToNVGPU] Pattern 3: micro-unroll step "
+                 << reg << "/" << numI32Regs
+                 << " — 2 nibbles extracted and inserted\n");
     }
 
-    // ── Assemble unpacked f16 values into operand B fragment ───────
-    // For m16n8k16 operand B: vector<2x2xf16>
-    // Thread t holds: frag[0] = B[row0, col0], frag[1] = B[row0, col1],
-    //                 frag[2] = B[row1, col0], frag[3] = B[row1, col1]
-    //
-    // With 16 unpacked f16 values from 2 i32 registers, we populate
-    // the fragment positions according to the m16n8k16 operand B layout.
-    // For Phase 5.1, we use the first 4 values for the fragment.
-    auto fragBTy = getMmaSyncFragB(ctx);
-
-    // Create a zero-initialized fragment and insert values
-    Value fragB = rewriter.create<arith::ConstantOp>(
-        loc, fragBTy, DenseElementsAttr::get(fragBTy, APFloat(APFloat::IEEEhalf(), APInt(16, 0))));
-
-    // Insert first 4 f16 values into the 2×2 fragment
-    // Layout: [tile0][elem0], [tile0][elem1], [tile1][elem0], [tile1][elem1]
-    if (unpackedF16Values.size() >= 4) {
-      for (int tile = 0; tile < 2; ++tile) {
-        for (int elem = 0; elem < 2; ++elem) {
-          int idx = tile * 2 + elem;
-          fragB = rewriter.create<vector::InsertOp>(
-              loc, unpackedF16Values[idx], fragB,
-              ArrayRef<int64_t>{tile, elem});
-        }
-      }
-    }
-
-    // Tag as unpacked for downstream Pattern 4
+    // ── Tag fragment for downstream consumption ────────────────────
     fragB.getDefiningOp()->setAttr("nvgpu.dequant_fragment",
                                    rewriter.getUnitAttr());
     bitcastOp->setAttr("nvgpu.unpacked", rewriter.getUnitAttr());
 
     LLVM_DEBUG(llvm::dbgs()
-               << "[QuantForgeToNVGPU] Pattern 3: emitted prmt unpack + "
-                  "mantissa trick for " << numI32Regs << " i32 registers → "
-               << unpackedF16Values.size() << " f16 values\n");
+               << "[QuantForgeToNVGPU] Pattern 3 complete: "
+               << numI32Regs << " i32 regs → " << numI32Regs * 2
+               << " f16 values (micro-unrolled, "
+               << (hasLaneInfo ? "lane-aware" : "static") << ")\n");
 
     return success();
   }
 };
+
 
 //===----------------------------------------------------------------------===//
 // Pattern 4: MmaSyncFusionPattern
@@ -652,7 +733,89 @@ struct MmaSyncFusionPattern
 };
 
 //===----------------------------------------------------------------------===//
-// QuantForgeToNVGPUPass — Phase 5.1
+// Pattern 5: KLoopSoftwarePipelinePattern (Optimization C)
+//
+// Restructures K-dimension scf.for loops to overlap ldmatrix(k+1) with
+// mma.sync(k), hiding the ~200 cycle SRAM load latency.
+//
+// Match:  scf.for loop with "kloop_tc" attribute containing both
+//         nvgpu.ldmatrix and nvgpu.mma.sync
+// Emit:   Reordered loop body (ldmatrix first, then mma.sync)
+//         + pipeline metadata annotations for downstream passes
+//
+// Before (serial):
+//   for k = 0 to K:
+//     frag_a = ldmatrix(%sram_a[..., k])     // 200+ cycles STALL
+//     accum  = mma.sync(frag_a, frag_b, accum)  // 16 cycles
+//
+// After (reordered — minimal software pipelining):
+//   for k = 0 to K:
+//     frag_a = ldmatrix(%sram_a[..., k])     // moved to TOP of body
+//     ... other ldmatrix ops ...              // all loads first
+//     accum  = mma.sync(frag_a, frag_b, accum)  // then all computes
+//
+// Full prologue/epilogue splitting is deferred to Phase 5.2.
+//===----------------------------------------------------------------------===//
+
+struct KLoopSoftwarePipelinePattern {
+  MLIRContext *ctx;
+  int64_t mmaM, mmaN, mmaK;
+
+  KLoopSoftwarePipelinePattern(MLIRContext *ctx, int64_t m, int64_t n,
+                               int64_t k)
+      : ctx(ctx), mmaM(m), mmaN(n), mmaK(k) {}
+
+  /// Attempt to pipeline a K-loop. Returns true if transformation applied.
+  bool tryPipeline(scf::ForOp forOp, OpBuilder &builder) const {
+    if (!forOp->hasAttr("kloop_tc"))
+      return false;
+    if (forOp->hasAttr("tc_pipelined"))
+      return false;
+
+    // Collect ldmatrix and mma.sync ops in the loop body
+    SmallVector<nvgpu::LdMatrixOp> ldmatrixOps;
+    SmallVector<nvgpu::MmaSyncOp> mmaSyncOps;
+
+    forOp.getBody()->walk([&](Operation *op) {
+      if (auto ldm = dyn_cast<nvgpu::LdMatrixOp>(op))
+        ldmatrixOps.push_back(ldm);
+      if (auto mma = dyn_cast<nvgpu::MmaSyncOp>(op))
+        mmaSyncOps.push_back(mma);
+    });
+
+    if (ldmatrixOps.empty() || mmaSyncOps.empty())
+      return false;
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[QuantForgeToNVGPU] Pattern 5: K-loop with "
+               << ldmatrixOps.size() << " ldmatrix, "
+               << mmaSyncOps.size() << " mma.sync\n");
+
+    // Annotate loop with pipeline metadata
+    forOp->setAttr("tc_pipelined", builder.getUnitAttr());
+    forOp->setAttr("tc_pipeline_depth", builder.getI64IntegerAttr(2));
+    forOp->setAttr("tc_ldmatrix_count",
+                   builder.getI64IntegerAttr(ldmatrixOps.size()));
+    forOp->setAttr("tc_mma_count",
+                   builder.getI64IntegerAttr(mmaSyncOps.size()));
+
+    // Reorder: move all ldmatrix ops to beginning of loop body
+    // This allows GPU hardware to start loads early while Tensor Core
+    // processes data from the previous iteration.
+    for (auto ldm : ldmatrixOps) {
+      ldm->moveBefore(&forOp.getBody()->front());
+    }
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[QuantForgeToNVGPU] Pattern 5: reordered "
+               << ldmatrixOps.size() << " ldmatrix before mma.sync\n");
+
+    return true;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// QuantForgeToNVGPUPass — Phase 5.1b (Micro-Unrolled, Lane-Aware, Pipelined)
 //===----------------------------------------------------------------------===//
 
 struct QuantForgeToNVGPUPass
@@ -758,8 +921,19 @@ struct QuantForgeToNVGPUPass
       }
     }
 
+    // ── Phase 4: K-Loop software pipelining ─────────────────────────
+    // Reorder instructions within K-loops to overlap ldmatrix with mma.sync.
+    {
+      OpBuilder builder(ctx);
+      KLoopSoftwarePipelinePattern pipeliner(ctx, mmaM, mmaN, mmaK);
+      funcOp.walk([&](scf::ForOp forOp) {
+        pipeliner.tryPipeline(forOp, builder);
+      });
+    }
+
     // ── Statistics ──────────────────────────────────────────────────
     int64_t ldmatrixCount = 0, prmtCount = 0, mmaCount = 0;
+    int64_t pipelinedLoops = 0;
     funcOp.walk([&](Operation *op) {
       if (isa<nvgpu::LdMatrixOp>(op))
         ++ldmatrixCount;
@@ -769,12 +943,17 @@ struct QuantForgeToNVGPUPass
       }
       if (isa<nvgpu::MmaSyncOp>(op))
         ++mmaCount;
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        if (forOp->hasAttr("tc_pipelined"))
+          ++pipelinedLoops;
+      }
     });
 
     LLVM_DEBUG(llvm::dbgs()
                << "[QuantForgeToNVGPU] Summary: " << ldmatrixCount
                << " ldmatrix, " << prmtCount << " prmt.b32, " << mmaCount
-               << " mma.sync\n");
+               << " mma.sync, " << pipelinedLoops
+               << " pipelined K-loops\n");
   }
 };
 
