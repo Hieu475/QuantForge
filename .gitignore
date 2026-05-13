@@ -53,3 +53,7 @@ Research.md
 
 fix.patch
 compile_commands.json
+
+docs/
+README.md
+ROADMAP.md
