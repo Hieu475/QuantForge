@@ -5,6 +5,20 @@ build/
 cmake-build-*/
 .cache/
 
+# In-source CMake/Make artifacts (accidentally generated in source tree)
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/tablegen_compile_commands.yml
+
+# Compiled outputs that can appear in source tree from in-source builds
+**/*.a
+**/*.o
+**/*.o.d
+**/*.dwo
+**/quantforge-opt
+
 # IDE
 .idea/
 .vscode/
@@ -39,3 +53,7 @@ Research.md
 
 fix.patch
 compile_commands.json
+
+/out
+README.md
+ROADMAP.md
