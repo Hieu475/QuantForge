@@ -78,6 +78,7 @@ ctest --test-dir build -L lit                     # same, via CTest
 # GPU end-to-end (needs an NVIDIA GPU, CUDA toolkit in /usr/local/cuda or $CUDA_HOME,
 # python with torch + pytest). Skipped automatically when unavailable.
 QUANTFORGE_BUILD_DIR=$PWD/build python -m pytest -v
+scripts/ci_gpu_preflight.sh                       # checks a (CI) machine: toolchain, CUDA, torch, RAM
 scripts/sanitize.sh                               # compute-sanitizer memcheck + racecheck (22 pipeline variants)
 python python/quantforge/benchmark.py --cold --group-size 128 --shape 1x4096x4096 \
     "decode=true" --compare benchmarks/baseline_decode_rtx4050_sm89.json   # perf regression (--cold: DRAM weights)

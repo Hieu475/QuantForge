@@ -1,0 +1,4 @@
+# Custom labels of the self-hosted GPU runner used by the `gpu` job in workflows/ci.yml
+self-hosted-runner:
+  labels:
+    - gpu

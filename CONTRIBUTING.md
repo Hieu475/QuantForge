@@ -42,3 +42,22 @@ LLVM/MLIR 18.1.x only. Moving to a newer MLIR is a deliberate port (the
 
 By contributing you agree that your contribution is licensed under the project's
 license (Apache-2.0 with LLVM Exceptions, see `LICENSE`).
+
+## Setting up the GPU CI runner
+
+The `gpu` job of `.github/workflows/ci.yml` runs on a self-hosted runner with the labels
+`self-hosted, linux, gpu`. A machine is ready when `scripts/ci_gpu_preflight.sh` prints
+`preflight: all good`; it checks, and names the missing package for:
+
+* cmake >= 3.21, ninja, g++ (the build and the PyTorch C++ extension), `llvm-18-dev libmlir-18-dev mlir-18-tools`
+* an NVIDIA GPU with compute capability >= 8.0, the driver, `CUDA_HOME` (default `/usr/local/cuda`) with
+  `ptxas`, the CUDA headers and `compute-sanitizer`
+* the `python3` on the runner's PATH with `torch` (CUDA build) and `pytest`; `vllm` and `transformers`
+  are optional (the Marlin comparison, the real-checkpoint test and the Qwen benchmarks skip without them)
+* >= 8 GiB of available RAM (`QUANTFORGE_BUILD_JOBS` caps the build parallelism, default 6) and 5 GiB of disk
+
+The job runs: preflight, build (preset `default`), `pytest`, `scripts/sanitize.sh` and, nightly, the three
+regression comparisons against `benchmarks/baseline_*.json` (15 % tolerance). The baselines were recorded
+on an RTX 4050 Laptop GPU: on another GPU `benchmark.py --compare` warns and the comparison is meaningless
+until the baselines are regenerated there (`benchmark.py ... --json benchmarks/baseline_*.json`).
+First run populates `~/.cache/quantforge/kernels` and `~/.cache/torch_extensions` (a few minutes, then ~5 s).

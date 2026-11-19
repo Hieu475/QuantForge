@@ -62,10 +62,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preflight (toolchain, CUDA, torch, memory)
+        run: scripts/ci_gpu_preflight.sh
+
       - name: Build
         run: |
           cmake --preset default
-          cmake --build --preset default
+          # ~0.6 GiB per compile job: an unbounded ninja run once exhausted the RAM of a 15 GiB runner
+          cmake --build --preset default --parallel "${QUANTFORGE_BUILD_JOBS:-6}"
 
       - name: GPU end-to-end tests
         run: python3 -m pytest -v
