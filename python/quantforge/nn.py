@@ -69,16 +69,26 @@ class QuantLinear(nn.Module):
             raise ValueError(f"in_features={lin.in_features} has no usable group size (<= {group_size})")
         if fmt == "int4" and lin.out_features % 2:
             raise ValueError("int4 needs an even out_features")
-        w = lin.weight.data.to(device, torch.float32).t().contiguous()       # [K, N]
-        if fmt == "fp8":
-            packed, scale, zero = quant.quantize_fp8(w, g)
-        elif fmt == "int8":
-            packed, scale, zero = quant.quantize_groupwise_int8(w, g)
-        elif fmt == "int4":
-            q, scale, zero = quant.quantize_groupwise(w, g)
-            packed = quant.pack_int4(q)
-        else:
-            raise ValueError(f"fmt must be one of {FORMATS}")
+        w = lin.weight.data.t()                                              # [K, N] view
+        K, N = w.shape
+        # quantise in chunks of rows (groups run along K): a 150k-row lm_head must not need several
+        # fp32 copies of itself on a small GPU
+        step = max(g, (1 << 22) // max(N, 1) // g * g)
+        parts = []
+        for r in range(0, K, step):
+            wc = w[r:r + step].to(device, torch.float32).contiguous()
+            if fmt == "fp8":
+                packed, scale, zero = quant.quantize_fp8(wc, g)
+            elif fmt == "int8":
+                packed, scale, zero = quant.quantize_groupwise_int8(wc, g)
+            elif fmt == "int4":
+                q, scale, zero = quant.quantize_groupwise(wc, g)
+                packed = quant.pack_int4(q)
+            else:
+                raise ValueError(f"fmt must be one of {FORMATS}")
+            parts.append((packed, scale, zero))
+            del wc
+        packed, scale, zero = (torch.cat([p[i] for p in parts]) for i in range(3))
         bias = None if lin.bias is None else lin.bias.data.to(device, torch.float16)
         return cls(packed.contiguous(), scale.contiguous(), zero.contiguous(), bias, g, fmt)
 

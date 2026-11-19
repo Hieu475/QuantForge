@@ -152,8 +152,18 @@ out = model.generate(ids.cuda(), max_new_tokens=64)             # the Linears ar
 epilogue) for Llama / Qwen / Mistral style blocks, and works under `torch.compile` and CUDA graphs.
 Layers whose `in_features` is not a multiple of the group size fall back to 64 / 32 / 16 (else stay dense).
 `QuantLinear.from_quantized(packed, scale, zero, ...)` wraps GPTQ / AWQ tensors converted with `quantforge.quant`.
-Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (Qwen2.5-0.5B, RTN: int4 ppl 24.09,
-183 tok/s CUDA-graph decode vs fp16 19.93 / 129; with an INT8 head 24.08 / 209).
+Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (RTN, group 128, wikitext-2 8 x 512,
+CUDA-graph decode on the 6 GB RTX 4050):
+
+| model | fp16 | INT4 | INT4 + INT8 head |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | ppl 19.93, 129 tok/s | 24.09, 183 tok/s | 24.08, 209 tok/s |
+| Qwen2.5-1.5B-Instruct | 13.48, 49 tok/s (3.1 GB) | - | 15.31, 97 tok/s (1.5 GB) |
+| Qwen2.5-3B-Instruct | does not fit in 6 GB | - | 14.29, 61 tok/s (2.5 GB) |
+
+(RTN INT4 costs 1-4 perplexity points; quantise with GPTQ / AWQ and wrap the result with
+`QuantLinear.from_quantized` for a better quality.) Layers are quantised in row chunks, so the 150k-row
+`lm_head` of a 3B model needs no fp32 copy of itself on the GPU.
 
 ### As a PyTorch op
 

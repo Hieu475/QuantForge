@@ -87,3 +87,22 @@ def test_quantize_head_only_and_group_fallback_and_generate():
     assert qnn.QuantLinear.from_linear(lin, "int4", 128).group_size == 32
     with pytest.raises(ValueError):
         qnn.QuantLinear.from_linear(nn.Linear(97, 64).half(), "int4", 128)
+
+
+def test_quantized_model_under_torch_compile_and_chunked_quantisation():
+    _require_gpu()
+    import quantforge.nn as qnn
+
+    model = _tiny("llama")
+    qnn.quantize_model(model, "int4", 64)
+    cm = torch.compile(model)
+    with torch.no_grad():
+        for _ in range(2):                                   # fresh inputs: the fused QKV must not be stale
+            x = torch.randint(0, 512, (2, 24), device="cuda")
+            assert (cm(x).logits.float() - model(x).logits.float()).abs().max().item() < 5e-3
+    # a layer with many rows is quantised in chunks: identical to the one-shot quantisation
+    lin = nn.Linear(2048, 4096, bias=False).half()
+    a = qnn.QuantLinear.from_linear(lin, "int4", 128)
+    from quantforge import quant
+    q, s, z = quant.quantize_groupwise(lin.weight.data.t().float().cuda().contiguous(), 128)
+    assert torch.equal(a.packed, quant.pack_int4(q)) and torch.equal(a.scale, s) and torch.equal(a.zero, z)

@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--head", choices=("none",) + qnn.FORMATS, default="none",
                     help="also quantise the lm_head with this format (group size from --group-size)")
+    ap.add_argument("--no-fp16", action="store_true", help="skip the fp16 baseline (does not fit the GPU)")
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--seqlen", type=int, default=512)
     ns = ap.parse_args()
@@ -46,9 +47,10 @@ def main():
         return AutoModelForCausalLM.from_pretrained(ns.model, dtype=torch.float16, low_cpu_mem_usage=True).eval()
 
     res = {}
-    m = load().cuda()
-    res["fp16"] = (perplexity(m, ids, ns.seqlen), graph_run(m, tok, prompt, 48)[0], torch.cuda.memory_allocated())
-    del m; gc.collect(); torch.cuda.empty_cache()
+    if not ns.no_fp16:
+        m = load().cuda()
+        res["fp16"] = (perplexity(m, ids, ns.seqlen), graph_run(m, tok, prompt, 48)[0], torch.cuda.memory_allocated())
+        del m; gc.collect(); torch.cuda.empty_cache()
 
     m = load()
     t = time.time()
