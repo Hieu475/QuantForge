@@ -38,8 +38,19 @@ come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop 
 | 1 × 4096 × 11008 | 126.7 | 139.2 | 482.3 | 0.91× |
 | 1 × 11008 × 4096 | 127.0 | 135.1 | 483.3 | 0.94× |
 | 16 × 4096 × 11008 | 127.4 | 148.9 | 498.6 | 0.86× |
+| 32 × 4096 × 4096 | 50.8 | 57.8 | 181.0 | 0.88× |
+| 32 × 4096 × 11008 | 129.8 | 148.8 | 497.1 | 0.87× |
+| 64 × 4096 × 4096 | 58.6 | 86.9 | 181.4 | 0.67× |
+| 64 × 4096 × 11008 | 139.4 | 197.9 | 507.0 | 0.70× |
+| 128 × 4096 × 4096 | 104.1 | 150.8 | 188.7 | 0.69× |
+| 256 × 4096 × 4096 | 198.7 | 261.1 | 207.2 | 0.76× |
 | 512 × 4096 × 4096 | 387.9 | 456.7 | 371.1 | 0.85× |
 | 2048 × 4096 × 4096 | 1514.6 | 1764.6 | 1427.1 | 0.86× |
+
+The rows with M = 32 … 256 (small-batch decode / short prefill; autotuned, the same method,
+[`benchmarks/marlin_midM_rtx4050_sm89.json`](benchmarks/marlin_midM_rtx4050_sm89.json)) are the weak spot:
+0.67–0.88× of Marlin (M = 64 / 128 are 0.67 / 0.69×: the kernel is limited by the Tensor Core / `ldmatrix`
+path at ~50 % tensor-pipe activity, not by DRAM; Marlin stays memory-bound up to M = 64).
 
 QuantForge is 2.5–4.8× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of
 the bytes) and 0.85–1.30× of Marlin: **the "≥ 90 % of Marlin" goal is reached for decode

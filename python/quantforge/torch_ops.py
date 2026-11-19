@@ -18,7 +18,7 @@
   once before capturing a graph** (a module load is not allowed during capture).
 * Kernels are built per (row bucket, K, N, group size) and cached (``bucket_rows``: <= 16, 64, 128,
   256, 384, 512, ... 4096, then multiples of 1024; the call's activations are zero-padded to the bucket);
-  ``M <= 16`` uses the decode schedule, ``M <= 64`` a 64-row tile.
+  ``M <= 16`` uses the decode schedule, ``M <= 32`` / ``M <= 64`` 32- / 64-row tiles.
   ``set_autotune(True)`` measures the tile options once per shape (``quantforge.autotune``, cached
   on disk) instead of using the default schedule.
 """
@@ -72,10 +72,18 @@ def clear_cache() -> None:
 # A kernel is compiled for a bucket of row counts, not for every M: a request with M rows runs the
 # kernel of its bucket (activations zero-padded, extra rows dropped), so a server that sees prompt
 # lengths 1..4096 compiles at most len(_BUCKETS) kernels per layer shape instead of one per length.
-# M <= 16 is one decode kernel; the buckets above are multiples of the 64 / 128-row block tiles.
-_BUCKETS = (16, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
-_SKINNY_OPTS = ("block-tile-m=64 block-tile-n=128 warp-tile-m=32 warp-tile-n=64 "
-                "block-tile-k=64 smem-stages=1")
+# M <= 16 is one decode kernel; 32 and 64 are the skinny kernels (32 / 64-row block tiles); the buckets
+# above are multiples of the 64 / 128-row block tiles.
+_BUCKETS = (16, 32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+# Skinny schedules, the best of a sweep over tiles / K tile / stages / look-ahead (RTX 4050, cold weights,
+# 4096 x 4096): 32 rows 58.6 us (the old 64-row schedule: 68.6 us), 64 rows 87 us (97 us); the 11008 / 14336
+# wide shapes gain 3-10 % (64 rows) and 20-34 % (32 rows).
+_SKINNY_OPTS = {
+    32: ("block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=128 "
+         "smem-stages=1"),
+    64: ("block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-n=128 block-tile-k=64 "
+         "smem-stages=1 prefetch-distance=1"),
+}
 
 
 def bucket_rows(M: int) -> int:
@@ -117,7 +125,7 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
                 k = autotune(M, K, N, group_size=g, bits=4 if kind == 4 else 8, fp8=kind == 9,
                               epilogue=activation, accumulate=not overwrite)
             else:
-                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else _prefill_opts(M, K, N)
+                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS[M] if M <= 64 else _prefill_opts(M, K, N)
                 k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
                                     bits=4 if kind == 4 else 8, fp8=kind == 9, epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k

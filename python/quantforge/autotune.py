@@ -95,10 +95,20 @@ def candidates(M: int, bits: int = 4) -> list[str]:
         for st in ("smem-stages=1", ""):
             out.append(f"block-tile-m=64 block-tile-n=128 warp-tile-m=32 warp-tile-n=64 block-tile-k=64 {st}".strip())
     if M <= 64:  # skinny tiles waste less work than 128 rows
+        # sweep over (32 / 64-row tiles) x (warp N tile) x (K tile) x (look-ahead): the best skinny
+        # schedules use 128-deep K tiles at 32 rows and a 32 x 64 warp tile at 64 rows
         for bm in (32, 64):
-            for wn in (32, 64):
-                out.append(f"block-tile-m={bm} warp-tile-m=16 warp-tile-n={wn} block-tile-n=128 block-tile-k=64")
-                out.append(f"block-tile-m={bm} warp-tile-m=16 warp-tile-n={wn} block-tile-n=128 block-tile-k=32")
+            if bm >= 64 and M <= 32:
+                continue
+            for wn in (16, 32, 64):
+                for bk in (32, 64, 128):
+                    for pf in ("", " prefetch-distance=1"):
+                        out.append(f"block-tile-m={bm} warp-tile-m=16 warp-tile-n={wn} block-tile-n=128 "
+                                   f"block-tile-k={bk} smem-stages=1{pf}")
+        if M > 32:
+            for wm, wn in ((32, 32), (32, 64), (64, 16), (64, 32)):
+                out.append(f"block-tile-m=64 warp-tile-m={wm} warp-tile-n={wn} block-tile-n=128 "
+                           f"block-tile-k=64 smem-stages=1 prefetch-distance=1")
     return out
 
 
@@ -131,8 +141,11 @@ def _m_bucket(M: int) -> str:
     return ">4096"
 
 
+_CANDIDATES_VERSION = 2   # bump when `candidates` changes so that stale winners are re-tuned
+
+
 def cache_key(M, K, N, group_size, bits, gpu, acc, fp8=False):
-    return f"{gpu}|w{bits}{'f' if fp8 else ''}|g{group_size}|{acc}|M{_m_bucket(M)}|K{K}|N{N}"
+    return f"v{_CANDIDATES_VERSION}|{gpu}|w{bits}{'f' if fp8 else ''}|g{group_size}|{acc}|M{_m_bucket(M)}|K{K}|N{N}"
 
 
 def autotune(M: int, K: int, N: int, group_size: int | None = None, bits: int = 4, acc: str = "f32",

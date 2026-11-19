@@ -107,6 +107,21 @@ Measured with `ncu` and a micro-kernel that only reads the packed weights (RTX 4
 Untried: stream-K / persistent scheduling for the tail wave; Marlin-style offline repacking (contiguous 16-byte-per-thread reads, dequantisation
 straight into the MMA fragment layout, no shared-memory round trip for B).
 
+## Small batch (16 < M ≤ 256)
+
+Measured with `compare_marlin.py --autotune` (RTX 4050, cold weights): M = 32 0.88x, 64 0.67x, 128 0.69x, 256 0.76x
+of Marlin at 4096 x 4096. A sweep over block tile M (16 / 32 / 64 / 128), warp tile M / N, K tile, stages and look-ahead
+found the best skinny schedules: 32 rows `block-tile-m=32 warp-tile-n=32 block-tile-n=128 block-tile-k=128` (58.6 us, the
+earlier default 68.6 us), 64 rows `block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-k=64 prefetch-distance=1`
+(87 us, was 97 us); they are the `torch_ops` defaults (a 32-row bucket was added) and the autotune candidates (the tune
+cache key now carries a candidates version). 16-row block tiles (more blocks, 4x the weight traffic) are 30 % slower,
+and more resident blocks do not help (64 x 1024 x 16384 with 256 blocks takes as long as 64 x 4096 x 4096 with 64): at
+M = 64 `ncu` shows the Tensor pipe 51 % active, issue slots 36 %, DRAM 52 %, stalls spread over `mio_throttle`,
+`math_pipe_throttle`, `wait`, `long_scoreboard`, `barrier` (1.0-1.4 each): the kernel is bound by the shared-memory /
+`ldmatrix` / MMA issue path, not by the weight stream -- Marlin keeps B in registers (dequantised straight into the MMA
+fragments), which is the repacking work listed under "Untried". M = 128 / 256 sweeps (64 / 128-row tiles, warp tiles up to
+64 x 64) improve only 3 %.
+
 ## Prefill (M ≥ 256)
 
 `ncu` on 512 × 4096 × 4096 (128 × 128 block tiles): Tensor Core pipe 70 % active, dominant stall
