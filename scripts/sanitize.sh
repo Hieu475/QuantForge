@@ -36,6 +36,9 @@ CASES=(
   "decode=true epilogue=silu|16 256 128 64 4"
   "epilogue=gelu|128 128 128 64 4"
   "block-tile-m=64 block-tile-n=128 warp-tile-m=32 warp-tile-n=64 block-tile-k=64 smem-stages=1|128 256 256 128 4"
+  # the torch op's 32- / 64-row skinny schedules (small-batch decode)
+  "block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=128 smem-stages=1|32 256 256 128 4"
+  "block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-n=128 block-tile-k=64 smem-stages=1 prefetch-distance=1|64 256 256 128 4"
   # C = A @ W (no initial read of C), alone and with the look-ahead registers; fused gate / up
   "decode=true accumulate=false prefetch-distance=2 smem-stages=1|16 512 256 128 4"
   "accumulate=false|128 128 128 64 4"
