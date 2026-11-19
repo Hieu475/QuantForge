@@ -20,6 +20,11 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/InitAllDialects.h"
+#include "mlir/InitAllExtensions.h"
+#include "mlir/InitAllPasses.h"
+#include "mlir/Target/LLVM/NVVM/Target.h"
+#include "mlir/Target/LLVMIR/Dialect/All.h"
 
 #include "QuantForge/Dialect/QuantForge/QuantForgeDialect.h"
 #include "QuantForge/Transforms/Passes.h"
@@ -45,6 +50,19 @@ int main(int argc, char **argv)
 
     // Register QuantForge dialect
     registry.insert<mlir::quantforge::QuantForgeDialect>();
+
+    // Upstream dialects/extensions/passes so that a single quantforge-opt
+    // invocation can drive the whole pipeline (tiling -> bufferization ->
+    // GPU outlining -> NVVM -> PTX) without switching to mlir-opt.
+    mlir::registerAllDialects(registry);
+    mlir::registerAllExtensions(registry);
+    mlir::registerAllPasses();
+
+    // Translation + NVVM target so `gpu-module-to-binary` can emit PTX.
+    mlir::registerAllGPUToLLVMIRTranslations(registry);
+    mlir::registerBuiltinDialectTranslation(registry);
+    mlir::registerLLVMDialectTranslation(registry);
+    mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
 
     // Register QuantForge passes
     mlir::quantforge::registerQuantForgePasses();

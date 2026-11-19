@@ -34,6 +34,7 @@
 #define DEBUG_TYPE "lower-dequant-to-arith"
 
 #include "QuantForge/Transforms/Passes.h"
+#include "QuantForge/Transforms/DequantUtils.h"
 #include "QuantForge/Dialect/QuantForge/QuantForgeOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -114,11 +115,15 @@ namespace
             // Input: identity map  (d0, d1, …) → (d0, d1, …)
             AffineMap inputMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
 
-            // Scale: scalar → broadcast over all dims: (d0, d1, …) → ()
-            AffineMap scaleMap = AffineMap::get(rank, 0, {}, ctx);
-
-            // ZeroPoint: scalar → broadcast: (d0, d1, …) → ()
-            AffineMap zpMap = AffineMap::get(rank, 0, {}, ctx);
+            // Scale / zero-point: per-tensor (rank 0 -> ()) or block-wise
+            // (e.g. [K/G, N] -> (d0 floordiv G, d1)).
+            auto scaleMapOr = getDequantParamMapIdentity(inputTy, scaleTy);
+            auto zpMapOr = getDequantParamMapIdentity(inputTy, zpTy);
+            if (failed(scaleMapOr) || failed(zpMapOr))
+                return rewriter.notifyMatchFailure(
+                    dequantOp, "unsupported scale / zero_point layout");
+            AffineMap scaleMap = *scaleMapOr;
+            AffineMap zpMap = *zpMapOr;
 
             // Output: identity
             AffineMap outputMap = AffineMap::getMultiDimIdentityMap(rank, ctx);

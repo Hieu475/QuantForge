@@ -20,14 +20,15 @@
 // CHECK:     scf.forall
 // 2) Block reduction K-loop
 // CHECK:       scf.for
-// 3) Warp distribution 2 loops
-// CHECK:           scf.forall
-// 4) Instruction-level 3 loops
+// 3) Warp distribution: 2 scf.for loops
+// CHECK:         scf.for
+// CHECK:           scf.for
+// 4) Instruction-level: 3 scf.for loops
 // CHECK:             scf.for
 // CHECK:               scf.for
 // CHECK:                 scf.for
 // Tiled matmul
-// CHECK:                     linalg.matmul
+// CHECK:                   linalg.matmul
 // No un-tiled matmul remains
 // CHECK-NOT:     linalg.matmul ins(%A, %B
 func.func @matmul_4096x4096(
@@ -48,11 +49,12 @@ func.func @matmul_4096x4096(
 // CHECK-LABEL: func.func @matmul_256x256
 // CHECK:     scf.forall
 // CHECK:       scf.for
-// CHECK:         scf.forall
+// CHECK:         scf.for
 // CHECK:           scf.for
 // CHECK:             scf.for
 // CHECK:               scf.for
-// CHECK:                 linalg.matmul
+// CHECK:                 scf.for
+// CHECK:                   linalg.matmul
 func.func @matmul_256x256(
     %A   : tensor<256x256xf32>,
     %B   : tensor<256x256xf32>,
@@ -71,10 +73,11 @@ func.func @matmul_256x256(
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @generic_2d_parallel
 // CHECK:     scf.forall
-// CHECK:       scf.forall
+// CHECK:       scf.for
 // CHECK:         scf.for
 // CHECK:           scf.for
-// CHECK:             linalg.generic
+// CHECK:             scf.for
+// CHECK:               linalg.generic
 func.func @generic_2d_parallel(
     %in  : tensor<4096x4096xf16>,
     %out : tensor<4096x4096xf16>) -> tensor<4096x4096xf16>

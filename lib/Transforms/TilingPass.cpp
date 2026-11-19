@@ -240,6 +240,17 @@ struct TilingPass
         continue;
       }
 
+      // The instruction-level M and N loops enumerate the (m16 × n8) MMA
+      // tiles of a warp tile; they are distributed over the lanes of a warp
+      // (threadIdx.x) by quantforge-thread-distribute. The K loop is a true
+      // reduction and stays sequential.
+      if (iterRank >= 2 && threadResult->loops.size() >= 2) {
+        threadResult->loops[0]->setAttr("quantforge.lane_m",
+                                        UnitAttr::get(ctx));
+        threadResult->loops[1]->setAttr("quantforge.lane_n",
+                                        UnitAttr::get(ctx));
+      }
+
       // ── Replacements (Innermost out to outermost) ──────────────
       rewriter.replaceOp(l4Op, threadResult->replacements);
       rewriter.replaceOp(l3Op, warpResult->replacements);

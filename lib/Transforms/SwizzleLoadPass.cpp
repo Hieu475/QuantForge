@@ -41,6 +41,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -165,6 +166,26 @@ struct SwizzleLoadPass
     IRRewriter rewriter(ctx);
     int64_t swizzledCount = 0;
 
+    // Safety: swizzling is only sound if EVERY access to a shared buffer goes
+    // through the rewritten 2-D memref.load/store. If a buffer is also touched
+    // by anything else (vector.transfer_*, vector.load/store, subviews,
+    // casts, ...), only some accesses would be remapped and the data would be
+    // silently corrupted. Such buffers are left untouched.
+    DenseSet<Value> unsafeBuffers;
+    funcOp.walk([&](Operation *op) {
+      for (Value operand : op->getOperands()) {
+        auto ty = dyn_cast<MemRefType>(operand.getType());
+        if (!ty || !isSharedMemorySpace(ty))
+          continue;
+        bool plain = isa<memref::LoadOp, memref::StoreOp>(op) &&
+                     getNumIndices(op) == 2;
+        bool bookkeeping = isa<memref::AllocOp, memref::DeallocOp,
+                               gpu::BarrierOp>(op);
+        if (!plain && !bookkeeping)
+          unsafeBuffers.insert(operand);
+      }
+    });
+
     // Collect all memref.load and memref.store ops accessing SRAM
     SmallVector<Operation *> opsToSwizzle;
     funcOp.walk([&](Operation *op) {
@@ -178,6 +199,14 @@ struct SwizzleLoadPass
       MemRefType memrefTy = getMemRefType(op);
       if (!memrefTy || !isSharedMemorySpace(memrefTy))
         return;
+
+      Value buffer = isa<memref::LoadOp>(op) ? cast<memref::LoadOp>(op).getMemRef()
+                                             : cast<memref::StoreOp>(op).getMemRef();
+      if (unsafeBuffers.contains(buffer)) {
+        op->emitWarning("shared buffer is accessed by non load/store ops; "
+                        "skipping swizzle to avoid inconsistent layouts");
+        return;
+      }
 
       // Only swizzle 2D accesses (row, col)
       if (getNumIndices(op) != 2)

@@ -58,7 +58,7 @@
 
 // WAR barrier before yield
 // CHECK:         gpu.barrier
-// CHECK:         scf.yield
+// CHECK-NEXT:    }
 
 func.func @smem_promotion_kloop(
     %A : memref<4096x4096xf16>,

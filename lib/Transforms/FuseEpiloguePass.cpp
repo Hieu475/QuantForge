@@ -1,0 +1,199 @@
+//===----------------------------------------------------------------------===//
+// quantforge-fuse-epilogue{kind=relu|silu|gelu} — activation on the accumulator
+//
+// The kernel computes C = C_init + A @ dequant(W). The final global store of
+// every accumulator fragment is rewritten to store act(value) instead, so
+// act(bias + A @ W) costs no extra pass over the output (one read + one write
+// of the whole [M, N] tensor saved per activation).
+//
+//   relu : max(x, 0)
+//   silu : x * sigmoid(x)
+//   gelu : x * sigmoid(2*sqrt(2/pi) * (x + 0.044715 x^3))   (the tanh form:
+//          0.5 (1 + tanh z) == sigmoid(2 z) exactly)
+//   swiglu: fused MLP gate / up. The weights are column-interleaved (gate_j at column
+//          2j, up_j at 2j+1), so the two columns of every f32 vector<2> accumulator
+//          fragment are (gate_j, up_j): the store becomes  C[r, c / 2] = silu(v0) * v1
+//          (to the ROOT output memref: the subview chain is folded into absolute
+//          coordinates). The output is half as wide as the GEMM; needs
+//          quantforge-overwrite-output (the pair of columns is not where it is read).
+//
+// sigmoid(z) = 1 / (1 + 2^(-z log2 e)) uses inline `ex2.approx.ftz.f32` (there is no
+// libdevice, and convert-gpu-to-nvvm rejects llvm.intr.exp2). Only f32
+// accumulators: stores of f32 values to a *global* memref inside gpu.launch are
+// rewritten, which in the fused single-kernel pipeline are exactly the C tile
+// (the unfused dequantisation kernel stores f16).
+//===----------------------------------------------------------------------===//
+
+#define DEBUG_TYPE "quantforge-fuse-epilogue"
+
+#include "QuantForge/Transforms/Passes.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/Pass/Pass.h"
+
+using namespace mlir;
+using namespace mlir::quantforge;
+
+namespace {
+
+struct FuseEpiloguePass
+    : public PassWrapper<FuseEpiloguePass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseEpiloguePass)
+  StringRef getArgument() const override { return "quantforge-fuse-epilogue"; }
+  StringRef getDescription() const override {
+    return "Apply relu / silu / gelu to the accumulator fragments right before "
+           "they are stored to the output.";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, LLVM::LLVMDialect, vector::VectorDialect>();
+  }
+  Option<std::string> kind{*this, "kind",
+                           llvm::cl::desc("relu | silu | gelu (none: no-op)"),
+                           llvm::cl::init("none")};
+  FuseEpiloguePass() = default;
+  FuseEpiloguePass(const FuseEpiloguePass &other)
+      : PassWrapper<FuseEpiloguePass, OperationPass<func::FuncOp>>(other) {
+    kind.setValue(other.kind.getValue());
+  }
+
+  static Value constant(OpBuilder &b, Location loc, Type ty, double v) {
+    if (auto vt = dyn_cast<VectorType>(ty))
+      return b.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(vt, b.getF32FloatAttr(v)));
+    return b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(v));
+  }
+
+  /// 2^x with the PTX approximation instruction (scalar f32; vectors are unrolled).
+  static Value exp2(OpBuilder &b, Location loc, Value x) {
+    if (auto vt = dyn_cast<VectorType>(x.getType())) {
+      Value out = b.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(vt, b.getF32FloatAttr(0.0f)));
+      for (int64_t i = 0; i < vt.getNumElements(); ++i) {
+        Value e = b.create<vector::ExtractOp>(loc, x, ArrayRef<int64_t>{i});
+        out = b.create<vector::InsertOp>(loc, exp2(b, loc, e), out,
+                                         ArrayRef<int64_t>{i});
+      }
+      return out;
+    }
+    return b
+        .create<LLVM::InlineAsmOp>(
+            loc, /*resultTypes=*/TypeRange{b.getF32Type()},
+            /*operands=*/ValueRange{x}, "ex2.approx.ftz.f32 $0, $1;", "=f,f",
+            /*has_side_effects=*/false, /*is_align_stack=*/false,
+            LLVM::AsmDialectAttr::get(b.getContext(), LLVM::AsmDialect::AD_ATT),
+            /*operand_attrs=*/ArrayAttr())
+        .getResult(0);
+  }
+
+  static Value sigmoid(OpBuilder &b, Location loc, Value z) {
+    Type ty = z.getType();
+    Value negLog2e = constant(b, loc, ty, -1.4426950408889634);
+    Value e = exp2(b, loc, b.create<arith::MulFOp>(loc, z, negLog2e));
+    Value one = constant(b, loc, ty, 1.0);
+    return b.create<arith::DivFOp>(loc, one, b.create<arith::AddFOp>(loc, one, e));
+  }
+
+  Value apply(OpBuilder &b, Location loc, Value x) const {
+    Type ty = x.getType();
+    if (kind == "relu")
+      return b.create<arith::MaximumFOp>(loc, x, constant(b, loc, ty, 0.0));
+    if (kind == "silu")
+      return b.create<arith::MulFOp>(loc, x, sigmoid(b, loc, x));
+    // gelu (tanh form)
+    Value x2 = b.create<arith::MulFOp>(loc, x, x);
+    Value cubic = b.create<arith::MulFOp>(loc, x2, constant(b, loc, ty, 0.044715));
+    Value inner = b.create<arith::AddFOp>(
+        loc, x, b.create<arith::MulFOp>(loc, cubic, x));
+    Value z = b.create<arith::MulFOp>(loc, inner,
+                                      constant(b, loc, ty, 1.5957691216057308));
+    return b.create<arith::MulFOp>(loc, x, sigmoid(b, loc, z));
+  }
+
+  static bool isF32OrVecF32(Type t) {
+    if (auto vt = dyn_cast<VectorType>(t))
+      t = vt.getElementType();
+    return t.isF32();
+  }
+
+  void runOnOperation() override {
+    if (kind == "none" || kind.empty())
+      return;
+    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu") {
+      getOperation().emitError("quantforge-fuse-epilogue: unknown kind '")
+          << kind << "' (relu | silu | gelu | swiglu)";
+      return signalPassFailure();
+    }
+    SmallVector<Operation *> stores;
+    getOperation().walk([&](gpu::LaunchOp launch) {
+      launch.walk([&](Operation *op) {
+        if (auto s = dyn_cast<vector::StoreOp>(op)) {
+          if (!s.getMemRefType().getMemorySpace() &&
+              isF32OrVecF32(s.getValueToStore().getType()))
+            stores.push_back(op);
+        } else if (auto s = dyn_cast<memref::StoreOp>(op)) {
+          if (!s.getMemRefType().getMemorySpace() &&
+              isF32OrVecF32(s.getValue().getType()))
+            stores.push_back(op);
+        }
+      });
+    });
+    if (kind == "swiglu") {
+      for (Operation *op : stores) {
+        auto st = dyn_cast<vector::StoreOp>(op);
+        auto vt = st ? dyn_cast<VectorType>(st.getValueToStore().getType()) : VectorType();
+        if (!st || !vt || vt.getNumElements() != 2) {
+          op->emitError("epilogue=swiglu needs the Tensor Core path (vector<2xf32> "
+                        "accumulator stores)");
+          return signalPassFailure();
+        }
+        OpBuilder b(st);
+        Location loc = st.getLoc();
+        Value memref = st.getBase();
+        Value row = st.getIndices()[0], col = st.getIndices()[1];
+        while (auto sv = memref.getDefiningOp<memref::SubViewOp>()) {
+          auto offs = sv.getMixedOffsets();
+          for (OpFoldResult stride : sv.getMixedStrides())
+            if (getConstantIntValue(stride) != 1) {
+              sv.emitError("swiglu epilogue needs unit strides");
+              return signalPassFailure();
+            }
+          row = b.create<arith::AddIOp>(loc, row, getValueOrCreateConstantIndexOp(b, loc, offs[0]));
+          col = b.create<arith::AddIOp>(loc, col, getValueOrCreateConstantIndexOp(b, loc, offs[1]));
+          memref = sv.getSource();
+        }
+        Value v = st.getValueToStore();
+        Value gate = b.create<vector::ExtractOp>(loc, v, ArrayRef<int64_t>{0});
+        Value up = b.create<vector::ExtractOp>(loc, v, ArrayRef<int64_t>{1});
+        Value silu = b.create<arith::MulFOp>(loc, gate, sigmoid(b, loc, gate));
+        Value res = b.create<arith::MulFOp>(loc, silu, up);
+        Value half = b.create<arith::DivUIOp>(loc, col, b.create<arith::ConstantIndexOp>(loc, 2));
+        b.create<memref::StoreOp>(loc, res, memref, ValueRange{row, half});
+        st->erase();
+      }
+      return;
+    }
+    for (Operation *op : stores) {
+      OpBuilder b(op);
+      if (auto s = dyn_cast<vector::StoreOp>(op))
+        s.getValueToStoreMutable().assign(apply(b, op->getLoc(), s.getValueToStore()));
+      else if (auto s = dyn_cast<memref::StoreOp>(op))
+        s.getValueMutable().assign(apply(b, op->getLoc(), s.getValue()));
+    }
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::quantforge::createFuseEpiloguePass() {
+  return std::make_unique<FuseEpiloguePass>();
+}
+void mlir::quantforge::registerFuseEpiloguePass() {
+  PassRegistration<FuseEpiloguePass>();
+}

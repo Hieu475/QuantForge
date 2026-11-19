@@ -17,11 +17,14 @@
 // CHECK-LABEL: func.func @manual_semantic_barrier_tags
 // CHECK:         scf.forall
 // CHECK:           scf.for
-// CHECK:             scf.for {{.*}} {quantforge.sram_load}
-// CHECK:             gpu.barrier
-// CHECK:             scf.for {{.*}} {quantforge.compute}
-// CHECK:             gpu.barrier
-// CHECK:             scf.yield
+// CHECK:             scf.for
+// CHECK:             } {quantforge.sram_load}
+// CHECK-NEXT:        gpu.barrier
+// CHECK:             scf.for
+// CHECK:             } {quantforge.compute}
+// CHECK-NEXT:        gpu.barrier
+// CHECK-NEXT:      }
+// CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
 func.func @manual_semantic_barrier_tags() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -64,15 +67,17 @@ func.func @manual_semantic_barrier_tags() {
 // CHECK:                 scf.for
 // CHECK:                   scf.for
 // CHECK:                     scf.for
+// CHECK:                       linalg.matmul
+//
+// 3) GPU mapping attributes on warp loops are printed after each loop body
+//    (inner warp-N loop closes first, then warp-M loop)
+// CHECK:               } {mapping = [#gpu.thread<y>]}
+// CHECK:             } {mapping = [#gpu.thread<z>]
 // CHECK:             gpu.barrier
 // CHECK:             scf.yield
 //
-// 3) GPU mapping attribute on block forall
+// 4) GPU mapping attribute on block forall
 // CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
-//
-// 4) GPU mapping attribute on warp loops (inside K-loop)
-// CHECK:             scf.for {{.*}} {mapping = [#gpu.thread<z>]
-// CHECK:               scf.for {{.*}} {mapping = [#gpu.thread<y>]}
 
 func.func @matmul_gpu_mapped(
     %A : tensor<4096x4096xf16>,
@@ -91,9 +96,9 @@ func.func @matmul_gpu_mapped(
 // -----------------------------------------------------------------
 // CHECK-LABEL: func.func @multi_block_forall_map
 // CHECK:         scf.forall
-// CHECK-SAME:      mapping = [#gpu.block<y>, #gpu.block<x>]
+// CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
 // CHECK:         scf.forall
-// CHECK-SAME:      mapping = [#gpu.block<y>, #gpu.block<x>]
+// CHECK:         } {mapping = [#gpu.block<y>, #gpu.block<x>]}
 func.func @multi_block_forall_map() {
   %c0 = arith.constant 0 : index
   %c128 = arith.constant 128 : index

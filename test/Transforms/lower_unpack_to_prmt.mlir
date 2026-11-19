@@ -33,7 +33,7 @@ func.func @test_prmt_basic(%packed: tensor<4x8xi8>) -> tensor<4x16xi8> {
 // CHECK-NOT:   qf.unpack
 // CHECK:       scf.for
 // CHECK:         scf.for
-// CHECK:           llvm.inline_asm {{.*}} prmt.b32
+// CHECK:           llvm.inline_asm {{.*}}prmt.b32
 func.func @test_prmt_large(%packed: tensor<64x32xi8>) -> tensor<64x64xi8> {
   %out = qf.unpack %packed : tensor<64x32xi8> -> tensor<64x64xi8>
   return %out : tensor<64x64xi8>

@@ -8,8 +8,8 @@
 // QuantForge-specific configuration:
 //   • bufferizeFunctionBoundaries = true  (cross-function analysis)
 //   • allowReturnAllocs = true            (functions may return memref.alloc)
-//   • copyBeforeWrite = true              (safe: insert copy when in-place
-//                                          analysis cannot prove safety)
+//   • analysis-driven copies              (copies only where in-place
+//                                          bufferization is not provably safe)
 //   • IdentityLayoutMap at function boundaries
 //
 // After this pass, all tensor.empty → memref.alloc, all
@@ -107,10 +107,11 @@ struct QuantForgeBufferizePass
     // Allow returning allocs from loops (needed for K-reduction loops).
     options.allowReturnAllocsFromLoops = true;
 
-    // Safe default: insert copies when in-place analysis cannot prove
-    // that a write is safe (no aliasing conflicts). Downstream
-    // canonicalization passes can eliminate redundant copies.
-    options.copyBeforeWrite = true;
+    // NOTE: do NOT set options.copyBeforeWrite = true. That mode skips the
+    // One-Shot analysis, and scf.for's resolveConflicts() then casts the
+    // plain AnalysisState to OneShotAnalysisState and segfaults. The
+    // default (analysis-driven) mode already inserts copies whenever
+    // in-place bufferization cannot be proven safe.
 
     // Use identity layout maps at function boundaries to keep memref
     // types simple and predictable for downstream GPU lowering.
@@ -121,7 +122,6 @@ struct QuantForgeBufferizePass
                << "[QuantForgeBufferize] running one-shot bufferize\n"
                << "  bufferizeFunctionBoundaries = true\n"
                << "  allowReturnAllocs = true\n"
-               << "  copyBeforeWrite = true\n"
                << "  LayoutMap = IdentityLayoutMap\n");
 
     // ── 2. Run One-Shot Module Bufferize ────────────────────────────
@@ -130,6 +130,19 @@ struct QuantForgeBufferizePass
       signalPassFailure();
       return;
     }
+
+    // ── 3. Drop self-copies ─────────────────────────────────────────
+    // One-Shot Bufferize materializes `memref.copy %x, %x` for in-place
+    // updates of loop-carried / forall-shared tensors. The canonicalizer in
+    // MLIR 18 does not fold them, and a surviving memref.copy lowers to a
+    // runtime call that does not exist on the device.
+    SmallVector<memref::CopyOp> selfCopies;
+    moduleOp.walk([&](memref::CopyOp copy) {
+      if (copy.getSource() == copy.getTarget())
+        selfCopies.push_back(copy);
+    });
+    for (memref::CopyOp copy : selfCopies)
+      copy.erase();
 
     LLVM_DEBUG(llvm::dbgs()
                << "[QuantForgeBufferize] bufferization complete\n");

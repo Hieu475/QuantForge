@@ -36,6 +36,7 @@
 #define DEBUG_TYPE "fuse-unpack-dequant"
 
 #include "QuantForge/Transforms/Passes.h"
+#include "QuantForge/Transforms/DequantUtils.h"
 #include "QuantForge/Dialect/QuantForge/QuantForgeOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -58,6 +59,26 @@ using namespace mlir::quantforge;
 
 namespace
 {
+
+    /// scale/zp indexing maps for a generic whose loop dims are `numLoops`
+    /// and whose logical (unpacked) element index is `elemExprs`.
+    static LogicalResult getParamMaps(DequantOp op, ArrayRef<AffineExpr> elemExprs,
+                                      unsigned numLoops, AffineMap &scaleMap,
+                                      AffineMap &zpMap)
+    {
+        auto inTy = dyn_cast<RankedTensorType>(op.getInput().getType());
+        auto sTy = dyn_cast<RankedTensorType>(op.getScale().getType());
+        auto zTy = dyn_cast<RankedTensorType>(op.getZeroPoint().getType());
+        if (!inTy || !sTy || !zTy)
+            return failure();
+        auto sm = getDequantParamMap(inTy, sTy, elemExprs, numLoops);
+        auto zm = getDequantParamMap(inTy, zTy, elemExprs, numLoops);
+        if (failed(sm) || failed(zm))
+            return failure();
+        scaleMap = *sm;
+        zpMap = *zm;
+        return success();
+    }
 
     /// Matches: %dq = qf.dequant(qf.unpack(%packed), %scale, %zp)
     /// and replaces both ops with a single fused linalg.generic.
@@ -124,6 +145,19 @@ namespace
                         dequantOp, "unpacked last dim != 2 * packed last dim");
             }
 
+            {
+                auto sTy = dyn_cast<RankedTensorType>(dequantOp.getScale().getType());
+                auto zTy =
+                    dyn_cast<RankedTensorType>(dequantOp.getZeroPoint().getType());
+                auto inTy =
+                    dyn_cast<RankedTensorType>(dequantOp.getInput().getType());
+                if (!sTy || !zTy || !inTy ||
+                    !isValidDequantParamType(inTy, sTy) ||
+                    !isValidDequantParamType(inTy, zTy))
+                    return rewriter.notifyMatchFailure(
+                        dequantOp, "unsupported scale / zero_point layout");
+            }
+
             Location loc = dequantOp.getLoc();
             MLIRContext *ctx = rewriter.getContext();
             auto f16Ty = rewriter.getF16Type();
@@ -165,7 +199,12 @@ namespace
 
             AffineMap identityMap =
                 AffineMap::getMultiDimIdentityMap(rank, ctx);
-            AffineMap scalarMap = AffineMap::get(rank, 0, {}, ctx);
+            SmallVector<AffineExpr> idExprs;
+            for (unsigned i = 0; i < rank; ++i)
+                idExprs.push_back(getAffineDimExpr(i, ctx));
+            AffineMap scaleMap, zpMap;
+            if (failed(getParamMaps(dequantOp, idExprs, rank, scaleMap, zpMap)))
+                return Value();
 
             SmallVector<utils::IteratorType> iterTypes(
                 rank, utils::IteratorType::parallel);
@@ -175,7 +214,7 @@ namespace
                 ValueRange{packed, dequantOp.getScale(),
                            dequantOp.getZeroPoint()},
                 ValueRange{emptyTensor},
-                ArrayRef<AffineMap>{identityMap, scalarMap, scalarMap,
+                ArrayRef<AffineMap>{identityMap, scaleMap, zpMap,
                                     identityMap},
                 iterTypes,
                 [f16Ty](OpBuilder &b, Location bodyLoc, ValueRange args)
@@ -238,7 +277,16 @@ namespace
                 packedExprs.push_back(getAffineDimExpr(i, ctx));
             AffineMap packedMap =
                 AffineMap::get(genericRank, 0, packedExprs, ctx);
-            AffineMap scalarMap = AffineMap::get(genericRank, 0, {}, ctx);
+            // logical (unpacked) index: [d0, ..., d_{r-2}, 2*d_{r-1} + d_r]
+            SmallVector<AffineExpr> elemExprs;
+            for (unsigned i = 0; i + 1 < rank; ++i)
+                elemExprs.push_back(getAffineDimExpr(i, ctx));
+            elemExprs.push_back(getAffineDimExpr(rank - 1, ctx) * 2 +
+                                getAffineDimExpr(rank, ctx));
+            AffineMap scaleMap, zpMap;
+            if (failed(getParamMaps(dequantOp, elemExprs, genericRank, scaleMap,
+                                    zpMap)))
+                return Value();
             AffineMap outputMap =
                 AffineMap::getMultiDimIdentityMap(genericRank, ctx);
 
@@ -250,7 +298,7 @@ namespace
                 ValueRange{packed, dequantOp.getScale(),
                            dequantOp.getZeroPoint()},
                 ValueRange{emptyTensor},
-                ArrayRef<AffineMap>{packedMap, scalarMap, scalarMap, outputMap},
+                ArrayRef<AffineMap>{packedMap, scaleMap, zpMap, outputMap},
                 iterTypes,
                 [rank, f16Ty](OpBuilder &b, Location bodyLoc, ValueRange args)
                 {
@@ -379,6 +427,19 @@ namespace
                 return rewriter.notifyMatchFailure(
                     dequantOp, "unpacked last dim != 2 * packed last dim");
 
+            {
+                auto sTy = dyn_cast<RankedTensorType>(dequantOp.getScale().getType());
+                auto zTy =
+                    dyn_cast<RankedTensorType>(dequantOp.getZeroPoint().getType());
+                auto inTy =
+                    dyn_cast<RankedTensorType>(dequantOp.getInput().getType());
+                if (!sTy || !zTy || !inTy ||
+                    !isValidDequantParamType(inTy, sTy) ||
+                    !isValidDequantParamType(inTy, zTy))
+                    return rewriter.notifyMatchFailure(
+                        dequantOp, "unsupported scale / zero_point layout");
+            }
+
             Location loc = dequantOp.getLoc();
             MLIRContext *ctx = rewriter.getContext();
             auto f16Ty = rewriter.getF16Type();
@@ -393,8 +454,7 @@ namespace
             // ── Build affine maps ──────────────────────────────────────────────
             // identity map over input rank (K,…,N)
             AffineMap identMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
-            // scalar map for scale / zp
-            AffineMap scalarMap = AffineMap::get(rank, 0, {}, ctx);
+            // scale / zp maps depend on which nibble is produced (below)
             SmallVector<utils::IteratorType> iterTypes(
                 rank, utils::IteratorType::parallel);
 
@@ -403,6 +463,13 @@ namespace
                 [&](bool isHigh) -> linalg::GenericOp
             {
                 // output type for this half: [..., N] x f16
+                SmallVector<AffineExpr> elemExprs;
+                for (unsigned i = 0; i + 1 < rank; ++i)
+                    elemExprs.push_back(getAffineDimExpr(i, ctx));
+                elemExprs.push_back(getAffineDimExpr(rank - 1, ctx) * 2 +
+                                    (isHigh ? 1 : 0));
+                AffineMap scaleMap, zpMap;
+                (void)getParamMaps(dequantOp, elemExprs, rank, scaleMap, zpMap);
                 auto sliceTy =
                     RankedTensorType::get(
                         SmallVector<int64_t>(inShape.begin(), inShape.end()),
@@ -417,7 +484,7 @@ namespace
                     ValueRange{packed, dequantOp.getScale(),
                                dequantOp.getZeroPoint()},
                     ValueRange{empty},
-                    ArrayRef<AffineMap>{identMap, scalarMap, scalarMap,
+                    ArrayRef<AffineMap>{identMap, scaleMap, zpMap,
                                         identMap},
                     iterTypes,
                     [isHigh, f16Ty](OpBuilder &b, Location bl, ValueRange args)

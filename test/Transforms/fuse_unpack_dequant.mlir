@@ -14,7 +14,7 @@
 // CHECK-DAG:     arith.constant 4 : i8
 // CHECK:         %[[EMPTY:.*]] = tensor.empty() : tensor<4096x2048x2xf16>
 // CHECK:         %[[GEN:.*]] = linalg.generic
-// CHECK-SAME:        ins(%{{.*}}, %{{.*}}, %{{.*}} :
+// CHECK-SAME:        ins(%{{[^:]*}}:
 // CHECK-SAME:             tensor<4096x2048xi8>, tensor<f16>, tensor<i8>)
 // CHECK-SAME:        outs(%[[EMPTY]] : tensor<4096x2048x2xf16>)
 // CHECK:         ^bb0({{.*}}: i8, {{.*}}: f16, {{.*}}: i8, {{.*}}: f16):
@@ -100,7 +100,7 @@ func.func @no_fuse_standalone_unpack(%packed: tensor<4x4xi8>) -> tensor<4x8xi8> 
 // CHECK-NOT:     tensor.collapse_shape
 // CHECK:         %[[EMPTY:.*]] = tensor.empty() : tensor<4096x4096xf16>
 // CHECK:         %[[GEN:.*]] = linalg.generic
-// CHECK-SAME:        ins(%{{.*}}, %{{.*}}, %{{.*}} :
+// CHECK-SAME:        ins(%{{[^:]*}}:
 // CHECK-SAME:             tensor<4096x4096xi8>, tensor<f16>, tensor<i8>)
 // CHECK-SAME:        outs(%[[EMPTY]] : tensor<4096x4096xf16>)
 // CHECK:         ^bb0({{.*}}: i8, {{.*}}: f16, {{.*}}: i8, {{.*}}: f16):

@@ -24,6 +24,14 @@
 // CHECK-NOT:     arith.select
 // CHECK-NOT:     linalg.index
 //
+// Shift/mask constants are hoisted above the loop nest
+// CHECK-DAG:     arith.constant 8  : i32
+// CHECK-DAG:     arith.constant 16 : i32
+// CHECK-DAG:     arith.constant 24 : i32
+// CHECK-DAG:     arith.constant 4  : i32
+// CHECK-DAG:     arith.constant 28 : i32
+// CHECK-DAG:     arith.constant 15 : i32
+//
 // Outer loop over rows
 // CHECK:         scf.for {{.*}} = {{.*}} to {{.*}} step
 // Inner loop over i32 chunks (N/4 = 128 iterations)
@@ -36,17 +44,11 @@
 // CHECK:             tensor.extract
 //
 // Pack into i32 (extui + shli + ori pattern)
-// CHECK-DAG:         arith.constant 8  : i32
-// CHECK-DAG:         arith.constant 16 : i32
-// CHECK-DAG:         arith.constant 24 : i32
 // CHECK:             arith.extui
 // CHECK:             arith.shli
 // CHECK:             arith.ori
 //
 // Extract nibbles with constant shifts
-// CHECK-DAG:         arith.constant 4  : i32
-// CHECK-DAG:         arith.constant 28 : i32
-// CHECK-DAG:         arith.constant 15 : i32
 // CHECK:             arith.shrui
 // CHECK:             arith.andi
 // CHECK:             arith.trunci

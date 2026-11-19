@@ -1,5 +1,6 @@
 // test/Transforms/lower_unpack_branch_free.mlir
 // RUN: quantforge-opt --lower-unpack-branch-free %s | FileCheck %s
+// RUN: quantforge-opt --fuse-unpack-dequant-branch-free %s | FileCheck --check-prefix=FUSE %s
 
 // =====================================================================
 // Phase 1 — Branch-Free Vectorized Unpacking
@@ -29,14 +30,14 @@
 // CHECK-DAG:     arith.constant 4  : i8
 // Low-nibble generic (no shrui before the andi)
 // CHECK:         linalg.generic
-// CHECK-SAME:        ins(%{{.*}} : tensor<4096x2048xi8>)
-// CHECK-SAME:        outs(%{{.*}} : tensor<4096x2048xi8>)
+// CHECK-SAME:        ins(%{{[^:]*}}: tensor<4096x2048xi8>)
+// CHECK-SAME:        outs(%{{[^:]*}}: tensor<4096x2048xi8>)
 // CHECK:         ^bb0(%[[B:.*]]: i8, %{{.*}}: i8):
 // CHECK:           arith.andi %[[B]]
 // High-nibble generic (shrui then andi)
 // CHECK:         linalg.generic
-// CHECK-SAME:        ins(%{{.*}} : tensor<4096x2048xi8>)
-// CHECK-SAME:        outs(%{{.*}} : tensor<4096x2048xi8>)
+// CHECK-SAME:        ins(%{{[^:]*}}: tensor<4096x2048xi8>)
+// CHECK-SAME:        outs(%{{[^:]*}}: tensor<4096x2048xi8>)
 // CHECK:         ^bb0(%[[B2:.*]]: i8, %{{.*}}: i8):
 // CHECK:           arith.shrui %[[B2]]
 // CHECK:           arith.andi
@@ -97,18 +98,18 @@ func.func @unpack_same_shape_bf_skip(%packed: tensor<4x8xi8>)
 // -----------------------------------------------------------------
 // Test 5: Fused branch-free — qf.unpack + qf.dequant → branch-free
 // -----------------------------------------------------------------
-// CHECK-LABEL: func.func @fuse_bf
-// CHECK-NOT:   qf.unpack
-// CHECK-NOT:   qf.dequant
-// CHECK-NOT:   arith.select
-// CHECK-NOT:   linalg.index
-// CHECK:       linalg.generic{{.*}}ins(%{{.*}}, %{{.*}}, %{{.*}}
-// CHECK:       arith.sitofp
-// CHECK:       linalg.generic{{.*}}ins(%{{.*}}, %{{.*}}, %{{.*}}
-// CHECK:       arith.shrui
-// CHECK:       arith.sitofp
-// CHECK:       tensor.insert_slice {{.*}}[0, 0]{{.*}}[1, 2]
-// CHECK:       tensor.insert_slice {{.*}}[0, 1]{{.*}}[1, 2]
+// FUSE-LABEL: func.func @fuse_bf
+// FUSE-NOT:   qf.unpack
+// FUSE-NOT:   qf.dequant
+// FUSE-NOT:   arith.select
+// FUSE-NOT:   linalg.index
+// FUSE:       linalg.generic{{.*}}ins(%{{[^:]*}}:
+// FUSE:       arith.sitofp
+// FUSE:       linalg.generic{{.*}}ins(%{{[^:]*}}:
+// FUSE:       arith.shrui
+// FUSE:       arith.sitofp
+// FUSE:       tensor.insert_slice {{.*}}[0, 0]{{.*}}[1, 2]
+// FUSE:       tensor.insert_slice {{.*}}[0, 1]{{.*}}[1, 2]
 func.func @fuse_bf(%packed: tensor<4096x2048xi8>,
                    %scale: tensor<f16>,
                    %zp: tensor<i8>) -> tensor<4096x4096xf16> {

@@ -25,6 +25,7 @@
 #define DEBUG_TYPE "canonicalize-dequant-zp"
 
 #include "QuantForge/Transforms/Passes.h"
+#include "QuantForge/Transforms/DequantUtils.h"
 #include "QuantForge/Dialect/QuantForge/QuantForgeOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -154,7 +155,16 @@ namespace
             // ── Build affine maps ─────────────────────────────────────────────
             AffineMap inputMap =
                 AffineMap::getMultiDimIdentityMap(rank, ctx);
-            AffineMap scaleMap = AffineMap::get(rank, 0, {}, ctx);
+            auto scaleTy =
+                dyn_cast<RankedTensorType>(dequantOp.getScale().getType());
+            if (!scaleTy)
+                return rewriter.notifyMatchFailure(dequantOp,
+                                                   "expected ranked scale");
+            auto scaleMapOr = getDequantParamMapIdentity(inputTy, scaleTy);
+            if (failed(scaleMapOr))
+                return rewriter.notifyMatchFailure(
+                    dequantOp, "unsupported scale layout");
+            AffineMap scaleMap = *scaleMapOr;
             AffineMap outputMap =
                 AffineMap::getMultiDimIdentityMap(rank, ctx);
 

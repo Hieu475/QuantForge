@@ -167,6 +167,106 @@ namespace mlir
 
         void registerSwizzleLoadPass();
 
+        // === GPU launch lowering (tiled/bufferized IR → gpu.launch) ===
+
+        /// Create the ForallToGPUPass.
+        /// Converts top-level memref-semantics scf.forall into gpu.launch
+        /// (one block per forall iteration, grid axes from the #gpu.block
+        /// mapping). Upstream MLIR 18 has no standalone pass for this.
+        std::unique_ptr<Pass> createForallToGPUPass();
+
+        void registerForallToGPUPass();
+
+        /// Create the HostAllocToGPUPass.
+        /// Rewrites host-side memref.alloc/dealloc into gpu.alloc/dealloc so
+        /// intermediate buffers are placed in device memory.
+        std::unique_ptr<Pass> createHostAllocToGPUPass();
+
+        void registerHostAllocToGPUPass();
+
+        /// Create the ThreadDistributePass.
+        /// Inside gpu.launch, removes the scf.for loops annotated by tiling /
+        /// gpu-mapping as warp (`mapping = #gpu.thread<..>`) or lane
+        /// (`quantforge.lane_m/lane_n`) parallel and replaces their induction
+        /// variables by threadIdx arithmetic.
+        std::unique_ptr<Pass> createThreadDistributePass();
+
+        void registerThreadDistributePass();
+
+        /// Create the WorkgroupAllocToAttributionPass (runs on gpu.func).
+        /// Turns workgroup-space memref.alloc into static gpu.func workgroup
+        /// attributions.
+        std::unique_ptr<Pass> createWorkgroupAllocToAttributionPass();
+
+        void registerWorkgroupAllocToAttributionPass();
+
+        /// Create the LowerVectorPass (module/any-op level).
+        /// vector→vector lowering (contract→dot, transfer→load/store) that
+        /// keeps memref types intact so shared memory (address space 3)
+        /// survives until convert-gpu-to-nvvm.
+        std::unique_ptr<Pass> createLowerVectorPass();
+
+        void registerLowerVectorPass();
+
+        /// Create the HoistVectorTransfersPass.
+        /// LICM + linalg::hoistRedundantVectorTransfers: loop-invariant
+        /// accumulator transfers become loop-carried vectors (registers).
+        std::unique_ptr<Pass> createHoistVectorTransfersPass();
+
+        void registerHoistVectorTransfersPass();
+
+        /// Create the FuseProducerIntoLoadsPass.
+        /// Replaces loads of a device buffer written by one elementwise
+        /// kernel with a recomputation of that kernel's value, then deletes
+        /// the producer. Fuses INT4 dequantization into the GEMM's
+        /// shared-memory staging (no f16 weight tensor in HBM).
+        std::unique_ptr<Pass> createFuseProducerIntoLoadsPass();
+
+        void registerFuseProducerIntoLoadsPass();
+
+        /// Expand affine.apply and fold div/rem/mul index arithmetic using
+        /// divisibility facts (prepares load vectorisation).
+        std::unique_ptr<Pass> createSimplifyIndexMathPass();
+        void registerSimplifyIndexMathPass();
+
+        /// Merge adjacent aligned scalar global loads inside gpu.launch into
+        /// vector.load (assumes base addresses aligned to <= 16 bytes).
+        std::unique_ptr<Pass> createVectorizeGlobalLoadsPass();
+        void registerVectorizeGlobalLoadsPass();
+
+        /// Replace per-element INT4/INT8 dequantisation trees feeding a
+        /// vector<8xf16> store by packed f16x2 arithmetic (magic-number
+        /// int -> f16 conversion; bit-identical to the scalar form).
+        std::unique_ptr<Pass> createVectorizeDequantPass();
+        void registerVectorizeDequantPass();
+
+        /// Move the dequantise+store of the next B tile behind the MMAs of
+        /// the current tile (the global loads stay at the top of the loop body
+        /// so their latency overlaps the Tensor Core work).
+        std::unique_ptr<Pass> createSinkDequantStoresPass();
+        void registerSinkDequantStoresPass();
+
+        /// Issue the weight loads of the K loop `distance` tiles ahead and
+        /// carry them through iter_args (more bytes in flight per block).
+        std::unique_ptr<Pass> createPrefetchWeightLoadsPass();
+        void registerPrefetchWeightLoadsPass();
+
+        /// Apply relu / silu / gelu to the accumulator fragments right before
+        /// their store to the output (option `kind`).
+        std::unique_ptr<Pass> createFuseEpiloguePass();
+        void registerFuseEpiloguePass();
+
+        /// C = A @ W instead of C += A @ W: the accumulators start from zero
+        /// (no initial read of C, no need to zero the output buffer).
+        std::unique_ptr<Pass> createOverwriteOutputPass();
+        void registerOverwriteOutputPass();
+
+        // === End-to-end pipeline ===
+
+        /// Register `--quantforge-gpu-pipeline`: tiling → bufferization →
+        /// gpu.launch → NVVM → PTX (gpu.binary). See GPUPipeline.cpp.
+        void registerGPUPipeline();
+
         // std::unique_ptr<Pass> createTensorCoreFusionPass();
 
         /// Register all QuantForge passes.
@@ -195,6 +295,23 @@ namespace mlir
             registerQuantForgeBufferizePass();
             registerSharedMemoryPromotionPass();
             registerSwizzleLoadPass();
+            // GPU launch lowering
+            registerForallToGPUPass();
+            registerHostAllocToGPUPass();
+            registerThreadDistributePass();
+            registerLowerVectorPass();
+            registerHoistVectorTransfersPass();
+            registerFuseProducerIntoLoadsPass();
+            registerSimplifyIndexMathPass();
+            registerVectorizeGlobalLoadsPass();
+            registerVectorizeDequantPass();
+            registerSinkDequantStoresPass();
+            registerPrefetchWeightLoadsPass();
+            registerFuseEpiloguePass();
+            registerOverwriteOutputPass();
+            registerWorkgroupAllocToAttributionPass();
+            // End-to-end pipeline (qf → PTX)
+            registerGPUPipeline();
         }
 
     } // namespace quantforge

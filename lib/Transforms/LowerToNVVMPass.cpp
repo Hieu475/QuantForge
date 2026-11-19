@@ -79,7 +79,7 @@ struct LowerToNVVMPass
 
     // Memory & Vector -> LLVM
     populateFinalizeMemRefToLLVMConversionPatterns(converter, patterns);
-    populateFinalizeMemRefToLLVMConversionPatterns(converter, patterns);
+    populateVectorToLLVMConversionPatterns(converter, patterns);
 
     // ── 4. Execute Full Conversion ──────────────────────────────
     if (failed(applyFullConversion(m, target, std::move(patterns)))) {

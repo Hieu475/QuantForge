@@ -8,9 +8,9 @@
 // Output:     [1, 4096] f16
 
 // CHECK-LABEL: func.func @matmul_int8_basic
-// CHECK:         %[[UNPACK:.*]] = qf.unpack %{{.*}} : tensor<2048x4096xi8> -> tensor<2048x4096xi8>
-// CHECK:         %[[SCALE:.*]] = arith.constant dense<1.000000e+00> : tensor<f16>
-// CHECK:         %[[ZP:.*]]    = arith.constant dense<0> : tensor<i8>
+// CHECK-DAG:     %[[SCALE:.*]] = arith.constant dense<1.000000e+00> : tensor<f16>
+// CHECK-DAG:     %[[ZP:.*]]    = arith.constant dense<0> : tensor<i8>
+// CHECK-DAG:     %[[UNPACK:.*]] = qf.unpack %{{.*}} : tensor<2048x4096xi8> -> tensor<2048x4096xi8>
 // CHECK:         %[[DQ:.*]]    = qf.dequant %[[UNPACK]], %[[SCALE]], %[[ZP]]
 // CHECK-SAME:        : tensor<2048x4096xi8>, tensor<f16>, tensor<i8> -> tensor<2048x4096xf16>
 // CHECK:         linalg.matmul
@@ -98,8 +98,8 @@ func.func @matmul_int8_both(%act: tensor<1x256xi8>,
 // Test 5a: attributes on weight constant are used for scale/zero_point
 // =====================================================================
 // CHECK-LABEL: func.func @matmul_with_attrs
-// CHECK:         %[[SCALE:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
-// CHECK:         %[[ZP:.*]]    = arith.constant dense<5> : tensor<i8>
+// CHECK-DAG:     %[[SCALE:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
+// CHECK-DAG:     %[[ZP:.*]]    = arith.constant dense<5> : tensor<i8>
 // CHECK:         qf.unpack %{{.*}} : tensor<2x4xi8> -> tensor<2x4xi8>
 // CHECK:         qf.dequant %{{.*}}, %[[SCALE]], %[[ZP]]
 func.func @matmul_with_attrs(%act: tensor<1x2xf16>)
@@ -117,8 +117,8 @@ func.func @matmul_with_attrs(%act: tensor<1x2xf16>)
 // Test 5b: attributes on the matmul op itself
 // =====================================================================
 // CHECK-LABEL: func.func @matmul_with_matmul_attrs
-// CHECK:         %[[SCALE2:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
-// CHECK:         %[[ZP2:.*]]    = arith.constant dense<5> : tensor<i8>
+// CHECK-DAG:     %[[SCALE2:.*]] = arith.constant dense<2.000000e+00> : tensor<f16>
+// CHECK-DAG:     %[[ZP2:.*]]    = arith.constant dense<5> : tensor<i8>
 // CHECK:         qf.unpack %{{.*}} : tensor<2x4xi8> -> tensor<2x4xi8>
 // CHECK:         qf.dequant %{{.*}}, %[[SCALE2]], %[[ZP2]]
 func.func @matmul_with_matmul_attrs(%act: tensor<1x2xf16>)

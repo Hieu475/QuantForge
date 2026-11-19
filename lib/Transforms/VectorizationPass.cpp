@@ -31,6 +31,20 @@ struct VectorizationPass
     : public PassWrapper<VectorizationPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorizationPass)
 
+  VectorizationPass() = default;
+  VectorizationPass(const VectorizationPass &other)
+      : PassWrapper<VectorizationPass, OperationPass<func::FuncOp>>(other) {
+    foldExtension.setValue(other.foldExtension.getValue());
+  }
+
+  Option<bool> foldExtension{
+      *this, "fold-extension",
+      llvm::cl::desc("Fold arith.extf on contract operands into the "
+                     "vector.contract (mixed-precision f16 x f16 -> f32). "
+                     "Needed for Tensor Core lowering; the scalar "
+                     "dot-product lowering requires uniform element types."),
+      llvm::cl::init(false)};
+
   StringRef getArgument() const override { return "quantforge-vectorization"; }
 
   StringRef getDescription() const override {
@@ -85,6 +99,12 @@ struct VectorizationPass
     // Clean up transfer/reduction forms that often appear post-vectorization.
     vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
     vector::populateVectorReductionToContractPatterns(patterns);
+    // Mixed precision (f16 operands, f32 accumulator): vectorization emits
+    // arith.extf on the operands before the contract. Fold the extension into
+    // vector.contract so the f16 operands stay visible to the Tensor Core
+    // lowering (m16n8k16 f16 x f16 -> f32).
+    if (foldExtension)
+      vector::populateFoldArithExtensionPatterns(patterns);
 
     if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
       signalPassFailure();

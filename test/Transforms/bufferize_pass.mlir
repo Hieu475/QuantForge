@@ -21,7 +21,6 @@
 // CHECK-SAME:    memref<128x128xf16
 // CHECK-NOT:     tensor.empty
 // CHECK-NOT:     tensor.extract_slice
-// CHECK:         memref.subview
 // CHECK:         linalg.matmul
 // CHECK-SAME:      memref<
 

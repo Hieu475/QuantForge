@@ -17,6 +17,16 @@ add_mlir_library(QuantForgeTransforms
   QuantForgeBufferizePass.cpp          # Task 4.1: One-Shot Bufferize
   SharedMemoryPromotionPass.cpp        # Task 4.2+4.4: HBM → SRAM promotion
   SwizzleLoadPass.cpp                  # Task 4.3: XOR bank conflict prevention
+  GPUPipeline.cpp                      # --quantforge-gpu-pipeline (qf -> PTX)
+  ThreadDistributePass.cpp             # warp/lane loops -> threadIdx
+  FuseProducerIntoLoadsPass.cpp        # dequant recomputed at the smem staging loads
+  PrefetchWeightLoadsPass.cpp          # multi-tile look-ahead of the weight loads (iter_args)
+  OverwriteOutputPass.cpp              # C = A @ W (accumulators start from zero)
+  FuseEpiloguePass.cpp                 # relu / silu / gelu on the accumulator before the C store
+  SinkDequantStoresPass.cpp            # overlap the weight-load latency with the MMAs
+  VectorizeDequantPass.cpp             # packed f16x2 dequantisation (magic-number i->f16)
+  VectorizeGlobalLoadsPass.cpp         # simplify index math, merge adjacent global loads
+  GPULaunchLowering.cpp                # scf.forall -> gpu.launch, host alloc -> gpu.alloc
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/QuantForge/Transforms
@@ -33,6 +43,8 @@ add_mlir_library(QuantForgeTransforms
   MLIRTransforms
   MLIRLinalgDialect
   MLIRArithDialect
+  MLIRAffineDialect
+  MLIRAffineUtils
   MLIRTensorDialect
   MLIRFuncDialect
   MLIRSCFDialect      # Phase 2: scf.for loops
@@ -45,6 +57,7 @@ add_mlir_library(QuantForgeTransforms
   MLIRVectorTransforms # Task 2.3.1: vector lowering/vectorization patterns
   # Task 3.2: GPU -> NVVM + LLVM conversion libraries
   MLIRNVVMDialect
+  MLIRNVGPUDialect
   MLIRGPUToNVVMTransforms
   MLIRArithToLLVM
   MLIRControlFlowToLLVM
@@ -60,6 +73,7 @@ add_mlir_library(QuantForgeTransforms
   # Task 4.1: Dialect-specific bufferization interfaces
   MLIRArithTransforms            # arith::registerBufferizableOpInterface
   MLIRLinalgTransformOps         # linalg bufferization interface (external models)
+  MLIRSCFUtils
   MLIRSCFTransforms              # scf::registerBufferizableOpInterface
   MLIRTensorTransforms           # tensor::registerBufferizableOpInterface
 )

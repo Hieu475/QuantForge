@@ -8,14 +8,15 @@
 // CHECK-LABEL: func.func @layout_aware_transform
 // CHECK:           %[[TID:.*]] = gpu.thread_id
 // CHECK:           %[[LANE:.*]] = arith.remui %[[TID]], %{{.*}} : index
-// CHECK-NEXT:      %[[OUTER:.*]] = scf.for
-// CHECK-SAME:        layout_aware
-// CHECK-NOT:         mma_consumer
+// CHECK-NEXT:      scf.for
 // CHECK:               %[[LPR:.*]] = arith.constant 4 : index
 // CHECK:               %[[CPG:.*]] = arith.constant 2 : index
 // CHECK:               %[[ROW0:.*]] = arith.divui %[[LANE]], %[[LPR]] : index
 // CHECK:               %[[LMOD:.*]] = arith.remui %[[LANE]], %[[LPR]] : index
 // CHECK:               %[[COL0:.*]] = arith.muli %[[LMOD]], %[[CPG]] : index
+// Attributes are printed after the loop body; mma_consumer is consumed.
+// CHECK:           } {layout_aware
+// CHECK-NOT:         mma_consumer
 func.func @layout_aware_transform() -> tensor<16x256xi8> {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

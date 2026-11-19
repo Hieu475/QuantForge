@@ -50,9 +50,17 @@ def QF_DequantOp : QF_Op<"dequant", [Pure]> {
     Applies scale and zero-point to convert quantized integer weights
     to floating point: output = (input - zero_point) * scale
 
+    `scale` / `zero_point` are either rank 0 (per-tensor) or have the same
+    rank as `input` with, along every dimension, an extent that divides the
+    input extent (block-wise / "group-wise" quantization): element
+    `[i, j]` of a `tensor<KxN>` input with `tensor<(K/G)xN>` parameters uses
+    parameter `[i / G, j]`.
+
     Example:
     ```mlir
     %fp = qf.dequant %int, %scale, %zp : tensor<4096x4096xi8>, tensor<f16>, tensor<i8> -> tensor<4096x4096xf16>
+    // group size 128 along K:
+    %fg = qf.dequant %int, %gs, %gz : tensor<4096x4096xi8>, tensor<32x4096xf16>, tensor<32x4096xi8> -> tensor<4096x4096xf16>
     ```
   }];
 
@@ -62,6 +70,7 @@ def QF_DequantOp : QF_Op<"dequant", [Pure]> {
     AnyTensor:$zero_point
   );
   let results = (outs AnyTensor:$output);
+  let hasVerifier = 1;
 
   let assemblyFormat = [{
     $input `,` $scale `,` $zero_point attr-dict `:`

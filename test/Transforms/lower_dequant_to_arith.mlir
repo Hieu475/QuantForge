@@ -31,7 +31,7 @@ func.func @dequant_basic(%input: tensor<4096x4096xi8>,
 // CHECK-LABEL: func.func @dequant_small
 // CHECK-NOT:     qf.dequant
 // CHECK:         linalg.generic
-// CHECK-SAME:        ins(%{{.*}}, %{{.*}}, %{{.*}} :
+// CHECK-SAME:        ins(%{{[^:]*}}:
 // CHECK-SAME:             tensor<2x4xi8>, tensor<f16>, tensor<i8>)
 // CHECK-SAME:        outs(%{{.*}} : tensor<2x4xf16>)
 func.func @dequant_small(%input: tensor<2x4xi8>,
