@@ -180,3 +180,16 @@ CUDA shim, so a rebuilt compiler never serves a stale kernel. A compile takes ~0
 (more for large prefill tiles); a hit costs a file read. `torch_ops` additionally maps the row count of
 a call to a bucket (`bucket_rows`) so that a server sees a handful of kernels per layer shape, not one
 per prompt length; rows above the real M are zero activations and are dropped.
+
+## Launches around the GEMM (torch op)
+
+A call with M < 16 rows used to launch: pad the activations (`at::constant_pad_nd` = allocate + fill +
+copy), the GEMM, the f32 -> f16 conversion of the result (and, before the overwrite kernel, a zeroing
+of the accumulator). The C++ hot path now copies the rows into a reusable zero-initialised
+`[Mp, K]` buffer (one launch; stale rows past M are harmless because a GEMM row only reads its own
+activation row, tested with NaN / inf poison), and the kernel overwrites its output. What remains is
+three launches per Linear. Removing the other two was measured to be worth little (a fused QKV and
+gate/up already cut the number of Linears per layer from 7 to 4) and costly: no pad needs the kernel
+to read only M activation rows (cp.async with a source size of 0 for the missing rows, one kernel per
+M; reading them unpadded faults with `illegal address`), and no convert needs an f16 output memref
+with an f32 accumulator, which the tensor-level IR cannot express without a temporary.

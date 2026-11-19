@@ -15,6 +15,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -43,6 +44,34 @@ struct KeyHash {
 };
 
 std::mutex g_mutex;
+
+// Zero-padded activation buffers for small row counts (decode / skinny buckets). An M-row call
+// copies its rows into the front of a reusable [Mp, K] buffer: one copy kernel instead of the
+// allocate + fill + copy that at::constant_pad_nd launches. The rows past M keep whatever an earlier
+// call left there: a GEMM row only depends on its own activation row, so they can only change the
+// output rows that are dropped (the buffer starts zeroed, so it never holds NaN / garbage memory).
+// One buffer per (device, stream, Mp, K): calls on different streams never share one.
+using ScratchKey = std::tuple<int, void *, int64_t, int64_t>;
+std::map<ScratchKey, at::Tensor> g_scratch;
+constexpr int64_t kScratchMaxRows = 64;
+
+at::Tensor padded_activations(const at::Tensor &x2, int64_t Mp) {
+  const int64_t M = x2.size(0), K = x2.size(1);
+  if (Mp > kScratchMaxRows)
+    return at::constant_pad_nd(x2, {0, 0, 0, Mp - M});
+  ScratchKey key{x2.device().index(),
+                 c10::cuda::getCurrentCUDAStream(x2.device().index()).stream(), Mp, K};
+  at::Tensor buf;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_scratch.find(key);
+    if (it == g_scratch.end())
+      it = g_scratch.emplace(key, at::zeros({Mp, K}, x2.options())).first;
+    buf = it->second;
+  }
+  buf.narrow(0, 0, M).copy_(x2);
+  return buf;
+}
 std::unordered_map<Key, Kernel, KeyHash> g_kernels;
 py::object *g_builder = nullptr;  // (M, K, N, group, device, activation) -> (fn, set_stream, Mp, Kp, Np)
 py::object *g_fallback = nullptr; // the Python implementation
@@ -111,7 +140,7 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
       !packed.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
     return call_fallback(x, packed, scale, zero, group_size, bias, activation);
 
-  at::Tensor act = (k.Mp == M) ? x2 : at::constant_pad_nd(x2, {0, 0, 0, k.Mp - M});
+  at::Tensor act = (k.Mp == M) ? x2 : padded_activations(x2, k.Mp);
   at::Tensor acc = overwrite
                        ? at::empty({k.Mp, N}, x.options().dtype(at::kFloat))
                        : bias->to(at::kFloat).expand({k.Mp, N}).contiguous();
@@ -135,6 +164,7 @@ void set_python_hooks(py::object builder, py::object fallback) {
 void clear_kernels() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_kernels.clear();
+  g_scratch.clear();
 }
 
 } // namespace

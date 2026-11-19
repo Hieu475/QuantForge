@@ -247,6 +247,28 @@ def test_row_buckets_share_kernels_and_stay_correct():
     assert len(qt._kernels) == 4
 
 
+def test_stale_padding_rows_do_not_leak_into_results():
+    """The C++ op reuses a padded activation buffer: rows past M keep what earlier calls left
+    there (here NaN / inf). A GEMM row depends only on its own activation row, so every result
+    must still be exact, whatever the call order."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+
+    K, N, G = 256, 128, 64
+    _, packed, scale, zp, _ = _case(1, K, N, G)
+    poison = torch.full((16, K), float("nan"), device="cuda", dtype=torch.float16)
+    poison[::2] = float("inf")
+    qt.w4a16_linear(poison, packed, scale, zp, G)            # fills the whole 16-row buffer
+    from quantforge import quant
+    W = dequant_reference(quant.unpack_int4(packed), scale, zp).float()     # the weights under test
+    for M in (1, 5, 16, 2, 9, 1):                            # descending / mixed order
+        act = _case(M, K, N, G, seed=M)[0]
+        ref = act.float() @ W
+        out = qt.w4a16_linear(act, packed, scale, zp, G)
+        assert torch.isfinite(out.float()).all(), M
+        assert _close(out, ref), M
+
+
 def _unpack(packed):
     lo, hi = packed & 0xF, (packed >> 4) & 0xF
     q = torch.stack((lo, hi), dim=-1).reshape(packed.shape[0], -1)
