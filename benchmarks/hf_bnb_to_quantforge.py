@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--new-tokens", type=int, default=48)
+    ap.add_argument("--quant-head", type=int, default=0, metavar="GROUP",
+                    help="also RTN-quantise the lm_head with this group size (0 = keep fp16)")
+    ap.add_argument("--head-bits", type=int, choices=(4, 8), default=8)
     ns = ap.parse_args()
 
     import pandas as pd
@@ -56,6 +59,14 @@ def main():
         if p.dtype == torch.bfloat16:             # norms, lm_head (buffers, e.g. rotary, stay as they are)
             p.data = p.data.half()
     m.config.torch_dtype = torch.float16
+    if ns.quant_head:
+        old = m.lm_head
+        m.lm_head = H.quantize_head(old, ns.quant_head, ns.head_bits, dense=False)[0]
+        if old.weight.data_ptr() != m.get_input_embeddings().weight.data_ptr():
+            old.weight.data = torch.empty(0, dtype=old.weight.dtype, device=old.weight.device)  # something
+            # (accelerate's hooks) keeps the module alive: release its 268 MB explicitly
+        del old
+        H.cleanup()
     H.cleanup()
     print(f"  converted to INT4 + QuantForge in {time.time() - t:.1f} s: {torch.cuda.memory_allocated() / 1e9:.2f} GB "
           f"on the GPU", flush=True)

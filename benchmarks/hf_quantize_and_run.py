@@ -38,12 +38,36 @@ G = 128
 
 class QLinear(nn.Module):
     """One quantised Linear: packed INT4 weight + group-wise scale / zero point (+ bias)."""
-    def __init__(self, packed, scale, zero, bias):
+    def __init__(self, packed, scale, zero, bias, group_size=G):
         super().__init__()
         self.packed, self.scale, self.zero, self.bias = packed, scale, zero, bias
+        self.group_size = group_size
 
     def forward(self, x):
-        return qt.w4a16_linear(x, self.packed, self.scale, self.zero, G, self.bias)
+        return qt.w4a16_linear(x, self.packed, self.scale, self.zero, self.group_size, self.bias)
+
+
+def quantize_head(lm_head, group_size, bits=4, dense=True):
+    """RTN INT4 / INT8 of the (possibly tied) lm_head with its own group size -> (QLinear, dense
+    dequantised fp16 [V, K] weight or None). INT8 (symmetric, per group) is practically lossless; INT4
+    with a smaller group costs a few % more bytes but keeps the logits closer to fp16. Quantised in
+    chunks of rows (groups run along K) so a 7B head never needs a full fp32 copy on a 6 GB GPU."""
+    w = lm_head.weight.data.t()                                                # [K, V] view
+    K, step = w.shape[0], max(group_size, (1024 // group_size) * group_size)
+    qs, ss, zs, deqs = [], [], [], []
+    for r in range(0, K, step):
+        wc = w[r:r + step].to("cuda", torch.float32).contiguous()
+        if bits == 8:
+            q, scale, zero = quant.quantize_groupwise_int8(wc, group_size)
+        else:
+            q, scale, zero = quant.quantize_groupwise(wc, group_size)
+        qs.append(q if bits == 8 else quant.pack_int4(q)); ss.append(scale); zs.append(zero)
+        if dense:
+            deqs.append(((q.float() - zero.float().repeat_interleave(group_size, 0))
+                         * scale.float().repeat_interleave(group_size, 0)).half())
+        del wc
+    mod = QLinear(torch.cat(qs), torch.cat(ss), torch.cat(zs), None, group_size)
+    return mod, (torch.cat(deqs).t().contiguous() if dense else None)
 
 
 def quantize_linear(lin):
@@ -170,6 +194,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF id or path of an fp16 causal LM")
     ap.add_argument("--text", required=True, help="wikitext-2 test parquet (column `text`)")
+    ap.add_argument("--quant-head", type=int, default=0, metavar="GROUP",
+                    help="also RTN-quantise the lm_head to INT4 with this group size (0 = keep fp16)")
+    ap.add_argument("--head-bits", type=int, choices=(4, 8), default=4,
+                    help="bit width of the quantised lm_head (with --quant-head)")
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--new-tokens", type=int, default=48)
@@ -225,6 +253,8 @@ def main():
     def stage_ref():
         m = load(ns.model).to("cuda")
         apply_ref(m, qp)
+        if ns.quant_head:      # untie from the embedding first: only the head is quantised
+            m.lm_head.weight = nn.Parameter(quantize_head(m.lm_head, ns.quant_head, ns.head_bits)[1], requires_grad=False)
         r = {"ppl": perplexity(m, ids, ns.seqlen)}
         with torch.no_grad():
             r["logits"] = m(x0).logits.float().cpu()
@@ -239,6 +269,8 @@ def main():
                 child.cuda()
         m.lm_head.cuda()
         apply_qf(m, qp)
+        if ns.quant_head:
+            m.lm_head = quantize_head(m.lm_head, ns.quant_head, ns.head_bits, dense=False)[0]
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         t = time.time()

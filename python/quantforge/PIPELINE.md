@@ -203,5 +203,13 @@ step is 22 ms of ideal weight traffic, 29 ms measured. The default K tile (64) w
 wide layers (gate/up 447 us vs 364 us with 128, via the torch op); `torch_ops._decode_opts` picks the
 tile by N. In the model the large kernel runs ~8 % slower than alone (385-395 us vs 353-364 us) and shows
 rare 0.5-1.4 ms outliers (another process using the GPU), not clock throttling (sm clock 2565 MHz, no
-throttle flags during the run). Remaining: fp16 `lm_head` (7 % of the step; RTN-quantising it costs
-2.2 perplexity on Qwen2.5-0.5B, a GPTQ-quantised head would not), the 1400 unfused HF kernels (10 %).
+throttle flags during the run). Remaining: fp16 `lm_head` (7 % of the step). `hf_quantize_and_run.py --quant-head GROUP`
+RTN-quantises it (Qwen2.5-0.5B-Instruct, RTN decoder, wikitext-2 8 x 512; fp16 head: ppl 24.09, CUDA-graph
+decode 184 tok/s): group 128 -> ppl 26.29, 223 tok/s; group 64 -> 25.91, 221; group 32 -> 25.19, 220. So
+the speed-up is +20 % for any group, and a smaller group only buys back part of the quality (the tied
+head is also the embedding table, which RTN handles badly); kernel == dequantised reference in every case
+(ppl within 0.002, 48/48 tokens). An INT8 head (`--quant-head 128 --head-bits 8`; the torch op takes a plain int8 [K, N]
+weight and picks the W8A16 kernel from `packed.shape[1] == scale.shape[1]`) is the lossless route:
+ppl 24.08 with group 128 (fp16 head 24.09), 214 tok/s (+16 %); group 32: 24.09, 209 tok/s, Mistral-7B-Instruct-v0.3 (NF4 -> INT4, `hf_bnb_to_quantforge.py --quant-head 128 --head-bits 8`, back to
+back runs): ppl 8.507 vs 8.506, 35.3 vs 34.4 tok/s (HF generate), 34.9 vs 34.2 (graph) = +2-3 %, as predicted
+by 134 MB / 160 GB/s ~ 0.8 ms of a 28 ms step, and 0.27 GB less VRAM (4.07 GB), the 1400 unfused HF kernels (10 %).

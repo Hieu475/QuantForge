@@ -249,14 +249,17 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   offline weight repacking.
 * No split-K (1 × 11008 × 4096 leaves only 64 blocks), no stream-K; the decode schedule
   uses one 16-row tile (M ≤ 16; larger M uses the 128-row schedule).
-* Only W4A16 / W8A16: no FP8, NF4, activation quantization, act-order GPTQ.
+* W4A16 and W8A16 (the torch op picks the 8-bit kernel when `packed` is a plain int8 `[K, N]`; no swiglu / per-tensor for 8 bit); no FP8, NF4, activation quantization. Act-order GPTQ (`desc_act=True`)
+  works through `quant.from_gptq_act_order` (rows permuted offline, `perm=` in `w4a16_linear`
+  gathers the activations: one extra small kernel per call).
   Zero points are stored unpacked (`int8 [K/G, N]`); AWQ / GPTQ checkpoints are repacked
   offline in Python (`quantforge.quant`). Besides round-trip tests against independent packers,
   real 4-bit checkpoints (Qwen2.5-0.5B-Instruct AWQ and GPTQ-Int4, group size 128, layers of
   shape 896 → 4864, 4864 → 896, 896 → 128, 896 → 896) are run through the kernels and compared
   with vLLM's AWQ dequantisation and an f32 reference built from the GPTQ file format
   (`test/E2E/test_real_checkpoints.py`: downloads a few MB with HTTP Range requests, skips offline).
-  Only `desc_act=False` GPTQ and `zero_point=True` AWQ (GEMM version) are covered.
+  Real checkpoints are covered for `desc_act=False` GPTQ and `zero_point=True` AWQ (GEMM version);
+  act-order is tested against a synthetic g_idx only.
 * Epilogue: bias and residual are fused by initializing the accumulator
   (`run(bias=, residual=)`); `relu` / `silu` / `gelu` (tanh form) are applied to the f32
   accumulator before the store (`build(epilogue="silu")`, `activation=` in the torch op), i.e.
