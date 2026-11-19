@@ -186,6 +186,32 @@ the GEMMs grow.
 `QuantLinear.from_quantized` for a better quality.) Layers are quantised in row chunks, so the 150k-row
 `lm_head` of a 3B model needs no fp32 copy of itself on the GPU.
 
+### Better 4-bit quality: GPTQ in the library
+
+```python
+import quantforge.gptq as qgptq
+calib = qgptq.calibration_ids(tokenizer, train_text, nsamples=128, seqlen=512)    # [128, 512] token ids
+qgptq.quantize_model_gptq(model, calib, group_size=128)                          # INT4, replaces RTN
+qnn.quantize_model(model, "int8", only=("lm_head",), fuse=False)                  # lossless INT8 head
+```
+
+Sequential GPTQ (Hessian of every Linear input from the already quantised blocks, column-wise error compensation
+through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated). 43 s for Qwen2.5-0.5B,
+125 s for 1.5B on the RTX 4050. Wikitext-2 perplexity (8 x 512 test tokens; calibration: 128 x 512 tokens of the *train*
+split; INT8 head; `benchmarks/hf_gptq.py`):
+
+| model | fp16 | RTN INT4 | GPTQ INT4 | share of the RTN loss recovered |
+|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B-Instruct | 19.93 | 24.08 | **21.38** (group 64: 21.26) | 65 % |
+| Qwen2.5-1.5B-Instruct | 13.48 | 15.31 | **15.00** | 17 % |
+| Llama-3.2-1B-Instruct | 20.15 | 24.42 | **23.39** | 24 % |
+| OLMo-2-0425-1B-Instruct | 19.32 | 21.31 | **20.62** | 34 % |
+
+The speed of the kernels does not change (same layout). Options that did *not* help consistently, hence off by
+default: `clip=True` (per-group range shrinking: 1.5B 15.00 -> 14.40, OLMo 20.62 -> 19.77 but 0.5B 21.38 -> 21.66 and
+Llama-1B 23.39 -> 30.87), `act_order=True` (0.5B 21.74, and the layers lose the q/k/v fusion: 169 vs 226 tok/s), a
+larger damping (0.1: 21.54; 0.03: 21.61) or more calibration windows (256: 21.44).
+
 ### As a PyTorch op
 
 ```python

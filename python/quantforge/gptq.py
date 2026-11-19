@@ -1,0 +1,228 @@
+"""GPTQ post-training quantisation (Frantar et al., 2022) producing QuantForge layers.
+
+    import quantforge.gptq as qgptq
+    ids = qgptq.calibration_ids(tokenizer, texts, nsamples=128, seqlen=512)       # [nsamples, seqlen]
+    qgptq.quantize_model_gptq(model, ids, group_size=128)                         # Llama / Qwen / Mistral ...
+
+Layer by layer, the decoder blocks are run on the calibration tokens (with the previously quantised blocks
+in place), the Hessian ``H = 2 X^T X / n`` of every Linear's input is accumulated, and the weights are
+quantised column by column with the error of each column compensated in the not yet quantised ones (via
+the Cholesky factor of ``H^-1``). Round-to-nearest ignores the activations; GPTQ typically recovers most of
+the perplexity it loses (see the README for measurements).
+
+``act_order=True`` quantises the columns in order of decreasing Hessian diagonal (better quality for small
+groups); the layer then carries an input permutation (``QuantLinear.perm``), which disables the q/k/v
+fusion of those layers. Only 4-bit asymmetric group-wise weights are produced (the QuantForge INT4
+layout), with scales rounded to f16 *before* the error is propagated, so the optimisation sees the same
+dequantised weights the kernels use.
+"""
+from __future__ import annotations
+
+import gc
+import math
+import time
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+from . import quant
+from .nn import QuantLinear, _fuse
+
+__all__ = ["gptq_quantize_weight", "calibration_ids", "quantize_model_gptq"]
+
+
+@torch.no_grad()
+def gptq_quantize_weight(W: torch.Tensor, H: torch.Tensor, group_size: int = 128, blocksize: int = 128,
+                         damp: float = 0.01, act_order: bool = False, bits: int = 4, clip: bool = False):
+    """Quantise ``W [out, in]`` given the input Hessian ``H [in, in]``.
+
+    Returns ``(q, scale, zero, perm)`` in QuantForge orientation: ``q`` int8 ``[in, out]`` (values
+    ``0 .. 2^bits-1``, rows already in the permuted order if ``perm`` is not None), ``scale`` f16
+    ``[in/G, out]``, ``zero`` int8 ``[in/G, out]``, ``perm`` int64 ``[in]`` or None."""
+    W = W.clone().float()
+    H = H.clone().float()
+    rows, cols = W.shape
+    if cols % group_size:
+        raise ValueError(f"in_features {cols} is not a multiple of the group size {group_size}")
+    blocksize = max(group_size, blocksize // group_size * group_size)
+    qmax = 2 ** bits - 1
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W[:, dead] = 0
+    perm = None
+    if act_order:
+        perm = torch.argsort(torch.diag(H), descending=True)
+        W, H = W[:, perm], H[perm][:, perm]
+    H += damp * torch.mean(torch.diag(H)) * torch.eye(cols, device=H.device)
+    L = torch.linalg.cholesky(H)
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(L), upper=True)
+
+    codes = torch.empty(rows, cols, dtype=torch.int8, device=W.device)
+    scales, zeros = [], []
+    for i1 in range(0, cols, blocksize):
+        i2 = min(i1 + blocksize, cols)
+        W1 = W[:, i1:i2].clone()
+        Err1 = torch.zeros_like(W1)
+        Hinv1 = Hinv[i1:i2, i1:i2]
+        for i in range(i2 - i1):
+            if i % group_size == 0:              # parameters of the next group from the *updated* weights
+                g = W1[:, i:i + group_size]
+                lo, hi = g.amin(dim=1), g.amax(dim=1)
+                scale = ((hi - lo) / qmax).clamp(min=1e-8).half()
+                zero = (-lo / scale.float()).round().clamp(0, qmax)
+                if clip:      # shrink the range of each row when that lowers its rounding error in the group
+                    best = ((g - (((g / scale.float().unsqueeze(1) + zero.unsqueeze(1)).round().clamp(0, qmax)
+                                   - zero.unsqueeze(1)) * scale.float().unsqueeze(1))) ** 2).sum(1)
+                    for p in (0.97, 0.94, 0.9, 0.85, 0.8):
+                        sc = (((hi - lo) * p) / qmax).clamp(min=1e-8).half()
+                        zr = (-(lo * p) / sc.float()).round().clamp(0, qmax)
+                        e = ((g - (((g / sc.float().unsqueeze(1) + zr.unsqueeze(1)).round().clamp(0, qmax)
+                                   - zr.unsqueeze(1)) * sc.float().unsqueeze(1))) ** 2).sum(1)
+                        better = e < best
+                        best = torch.where(better, e, best)
+                        scale = torch.where(better, sc, scale)
+                        zero = torch.where(better, zr, zero)
+                scales.append(scale)
+                zeros.append(zero.to(torch.int8))
+                sf, zf = scale.float(), zero
+            w = W1[:, i]
+            q = (w / sf + zf).round().clamp(0, qmax)
+            codes[:, i1 + i] = q.to(torch.int8)
+            err = (w - (q - zf) * sf) / Hinv1[i, i]
+            W1[:, i:] -= err.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
+            Err1[:, i] = err
+        W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    return codes.t().contiguous(), torch.stack(scales).contiguous(), torch.stack(zeros).contiguous(), perm
+
+
+def calibration_ids(tokenizer, texts, nsamples: int = 128, seqlen: int = 512, seed: int = 0) -> torch.Tensor:
+    """``nsamples`` random windows of ``seqlen`` tokens of the concatenated `texts` (a str or a list)."""
+    if not isinstance(texts, str):
+        texts = "\n\n".join(texts)
+    ids = tokenizer(texts, return_tensors="pt").input_ids[0]
+    if ids.numel() <= seqlen:
+        raise ValueError("calibration text is shorter than one window")
+    g = torch.Generator().manual_seed(seed)
+    starts = torch.randint(0, ids.numel() - seqlen, (nsamples,), generator=g)
+    return torch.stack([ids[s:s + seqlen] for s in starts.tolist()])
+
+
+class _Stop(Exception):
+    pass
+
+
+class _Catcher(nn.Module):
+    """Stands in for the first decoder layer: records its inputs and aborts the forward pass."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer, self.inputs, self.kwargs = layer, [], None
+
+    def forward(self, hidden_states, *args, **kwargs):
+        self.inputs.append(hidden_states.detach())
+        if self.kwargs is None:
+            self.kwargs = kwargs
+        raise _Stop
+
+
+def _find_layers(model: nn.Module) -> nn.ModuleList:
+    for path in ("model.layers", "transformer.h", "model.decoder.layers", "gpt_neox.layers"):
+        obj = model
+        try:
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            return obj
+        except AttributeError:
+            continue
+    raise ValueError("cannot find the decoder layers (expected model.layers)")
+
+
+@torch.no_grad()
+def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: int = 128,
+                        damp: float = 0.01, act_order: bool = False, blocksize: int = 128, clip: bool = False,
+                        fuse: bool = True, device="cuda", verbose: bool = True) -> dict:
+    """GPTQ-quantise every Linear inside the decoder layers of `model` (fp16, e.g. loaded on the CPU) to
+    INT4 and replace them with :class:`QuantLinear`. ``calib_ids`` is ``[nsamples, seqlen]`` token ids
+    (see :func:`calibration_ids`); the ``lm_head`` / embeddings are left alone (use
+    ``quantize_model(model, 'int8', only=('lm_head',), fuse=False)`` for the head afterwards).
+    Returns ``{"quantized": n, "seconds": s, "fused_qkv": n, "fused_mlp": n, "act_order": n}``."""
+    t0 = time.time()
+    model.config.use_cache = False
+    layers = _find_layers(model)
+    # everything outside the decoder layers (embeddings, rotary, final norm, head) runs on the GPU; the layers
+    # themselves are moved one at a time below
+    def to_device_except_layers(module):
+        for child in module.children():
+            if child is layers:
+                continue
+            if any(m is layers for m in child.modules()):
+                to_device_except_layers(child)
+            else:
+                child.to(device)
+        for p in module.parameters(recurse=False):
+            p.data = p.data.to(device)
+        for name, b in module.named_buffers(recurse=False):
+            module._buffers[name] = b.to(device)
+
+    to_device_except_layers(model)
+    catcher = _Catcher(layers[0])
+    layers[0] = catcher
+    ids = calib_ids.to(device)
+    try:
+        for i in range(ids.shape[0]):
+            try:
+                model(ids[i:i + 1])
+            except _Stop:
+                pass
+    finally:
+        layers[0] = catcher.layer
+    inps, kwargs = catcher.inputs, catcher.kwargs
+    kwargs = {k: v for k, v in kwargs.items() if k not in ("past_key_values", "past_key_value")}
+    kwargs["use_cache"] = False
+    n_tokens = len(inps) * inps[0].shape[1]
+    stats = {"quantized": 0, "act_order": 0}
+
+    for li, layer in enumerate(layers):
+        layer.to(device)
+        targets = {name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)}
+        hess = {n: torch.zeros(m.in_features, m.in_features, device=device) for n, m in targets.items()}
+
+        def make_hook(n):
+            def hook(_, args):
+                x = args[0].reshape(-1, args[0].shape[-1]).float()
+                hess[n].addmm_(x.t(), x, alpha=2.0 / n_tokens)
+            return hook
+
+        handles = [m.register_forward_pre_hook(make_hook(n)) for n, m in targets.items()]
+        for x in inps:
+            layer(x, **kwargs)
+        for h in handles:
+            h.remove()
+        for n, m in targets.items():
+            q, scale, zero, perm = gptq_quantize_weight(m.weight.data.to(device), hess[n], group_size,
+                                                        blocksize, damp, act_order, clip=clip)
+            bias = None if m.bias is None else m.bias.data.to(device, torch.float16)
+            ql = QuantLinear.from_quantized(quant.pack_int4(q), scale, zero, bias, group_size, "int4",
+                                            None if perm is None else perm.to(device))
+            parent = layer.get_submodule(n.rsplit(".", 1)[0]) if "." in n else layer
+            setattr(parent, n.rsplit(".", 1)[-1], ql)
+            stats["quantized"] += 1
+            stats["act_order"] += perm is not None
+        del hess
+        # the next layer sees the outputs of the quantised one
+        new_inps = []
+        for x in inps:
+            out = layer(x, **kwargs)
+            new_inps.append((out[0] if isinstance(out, tuple) else out).detach())
+        inps = new_inps
+        gc.collect()
+        torch.cuda.empty_cache()
+        if verbose:
+            print(f"  layer {li + 1}/{len(layers)} quantised ({time.time() - t0:.0f} s)", flush=True)
+    stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
+    model.to(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    stats["seconds"] = time.time() - t0
+    return stats
