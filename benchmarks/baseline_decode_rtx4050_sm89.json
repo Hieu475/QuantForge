@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "compute_capability": "8.9",
+    "sm_count": 20,
+    "driver": "595.99.02",
+    "torch": "2.11.0+cu128",
+    "cuda_runtime": "12.8",
+    "python": "3.12.13",
+    "accumulator": "f32",
+    "git_commit": "9733ae0",
+    "git_dirty": true
+  },
+  "results": [
+    {
+      "size": 4096,
+      "m": 1,
+      "n": 4096,
+      "group_size": 128,
+      "weight_gbs": 162.4188351920661,
+      "config": "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1",
+      "ms": 0.05164800000000105,
+      "gflops": 649.6753407682644,
+      "max_abs_err": 0.0005035400390625
+    },
+    {
+      "size": 4096,
+      "m": 16,
+      "n": 4096,
+      "group_size": 128,
+      "weight_gbs": 162.2178217821797,
+      "config": "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1",
+      "ms": 0.051711999999999536,
+      "gflops": 10381.9405940595,
+      "max_abs_err": 0.00064849853515625
+    },
+    {
+      "size": 4096,
+      "m": 1,
+      "n": 11008,
+      "group_size": 128,
+      "weight_gbs": 150.79452054794533,
+      "config": "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1",
+      "ms": 0.14950399999999991,
+      "gflops": 603.1780821917813,
+      "max_abs_err": 0.000499725341796875
+    },
+    {
+      "size": 11008,
+      "m": 1,
+      "n": 4096,
+      "group_size": 128,
+      "weight_gbs": 170.501452081314,
+      "config": "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1",
+      "ms": 0.13222400000000198,
+      "gflops": 682.005808325256,
+      "max_abs_err": 0.00218963623046875
+    }
+  ],
+  "torch": [
+    {
+      "size": 4096,
+      "m": 1,
+      "n": 4096,
+      "group_size": 128,
+      "ms": 0.18508799374103546,
+      "gflops": 181.28907943617048
+    },
+    {
+      "size": 4096,
+      "m": 16,
+      "n": 4096,
+      "group_size": 128,
+      "ms": 0.19731199741363525,
+      "gflops": 2720.9238112091584
+    },
+    {
+      "size": 4096,
+      "m": 1,
+      "n": 11008,
+      "group_size": 128,
+      "ms": 0.4895359873771667,
+      "gflops": 184.21022830855136
+    },
+    {
+      "size": 11008,
+      "m": 1,
+      "n": 4096,
+      "group_size": 128,
+      "ms": 0.4621120095252991,
+      "gflops": 195.1421606476624
+    }
+  ]
+}

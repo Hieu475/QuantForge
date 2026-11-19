@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "compute_capability": "8.9",
+    "sm_count": 20,
+    "driver": "595.99.02",
+    "torch": "2.11.0+cu128",
+    "cuda_runtime": "12.8",
+    "python": "3.12.13",
+    "accumulator": "f32",
+    "git_commit": "9733ae0",
+    "git_dirty": true
+  },
+  "results": [
+    {
+      "size": 1024,
+      "m": 1024,
+      "n": 1024,
+      "group_size": null,
+      "weight_gbs": 6.034691927853688,
+      "config": "",
+      "ms": 0.08687899999999991,
+      "gflops": 24718.098136488705,
+      "max_abs_err": 5.53131103515625e-05
+    },
+    {
+      "size": 2048,
+      "m": 2048,
+      "n": 2048,
+      "group_size": null,
+      "weight_gbs": 3.917069489790582,
+      "config": "",
+      "ms": 0.535388,
+      "gflops": 32088.633260364448,
+      "max_abs_err": 0.0001583099365234375
+    },
+    {
+      "size": 4096,
+      "m": 4096,
+      "n": 4096,
+      "group_size": null,
+      "weight_gbs": 2.3677851015352798,
+      "config": "",
+      "ms": 3.542807999999999,
+      "gflops": 38793.791103554024,
+      "max_abs_err": 0.000431060791015625
+    }
+  ],
+  "torch": [
+    {
+      "size": 1024,
+      "m": 1024,
+      "n": 1024,
+      "group_size": null,
+      "ms": 0.06889600306749344,
+      "gflops": 31169.93079984965
+    },
+    {
+      "size": 2048,
+      "m": 2048,
+      "n": 2048,
+      "group_size": null,
+      "ms": 0.3962559998035431,
+      "gflops": 43355.48027668347
+    },
+    {
+      "size": 4096,
+      "m": 4096,
+      "n": 4096,
+      "group_size": null,
+      "ms": 3.1170239448547363,
+      "gflops": 44093.005348537714
+    }
+  ]
+}
