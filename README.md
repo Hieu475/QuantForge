@@ -205,6 +205,30 @@ of a 0.5 B model are only 10–15 µs of GPU time each and every call still laun
 kernels around the GEMM (activation pad, f32 → f16 conversion, plus the GEMM; the accumulator
 zero-init is gone since kernels can overwrite their output).
 
+### Other models (from a Hugging Face cache)
+
+`benchmarks/hf_quantize_and_run.py` takes any fp16 Llama / Qwen2 / OLMo-2 / Phi-3 style model, quantises
+every decoder Linear to INT4 (round-to-nearest, asymmetric, group 128 — a plain quantiser: use GPTQ / AWQ
+checkpoints for quality), runs it on the kernels (q/k/v and gate/up fused) and compares it with the
+original fp16 model and with the same INT4 weights dequantised to dense fp16. wikitext-2 test, 8 × 512
+tokens, RTX 4050 laptop (6 GB):
+
+| model | perplexity fp16 | INT4 dense reference | **QuantForge** | greedy tokens = reference | decode tokens/s, CUDA graph, fp16 → QuantForge |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-1.5B-Instruct | 13.48 | 15.296 | **15.297** | 48/48 | 52 → 90 |
+| Llama-3.2-1B-Instruct | 20.15 | 24.399 | **24.403** | 48/48 | 67 → 124 |
+| OLMo-2-0425-1B-Instruct | 19.32 | 21.294 | **21.294** | 48/48 | 63 → 124 |
+| Qwen2.5-3B-Instruct | does not fit | – | 14.284 | – | – → 56 |
+| Llama-3.2-3B-Instruct | does not fit | – | 18.544 | – | – → 55 |
+| Phi-3.5-mini-instruct (3.8 B) | does not fit | – | 9.618 | – | – (HF generate: 54) |
+
+The kernels reproduce the dense INT4 reference to 0.004 perplexity (logits top-1 agreement 99.6–100 %); the
+gap to fp16 is the round-to-nearest quantiser's. The 3 B and 3.8 B models only run quantised on this
+card: 3.1 / 3.2 / 2.6 GB of GPU memory at peak (their fp16 weights are 5.6 – 7.3 GB). Phi-3.5's CUDA-graph
+capture fails inside Hugging Face's LongRoPE code (a data-dependent `if` on a GPU tensor), not in the
+kernels; its numbers above are from `generate`. Models with a fused `qkv_proj` / `gate_up_proj` (Phi-3)
+are handled, models whose `in_features` is not a multiple of 128 are rejected.
+
 ## Limitations
 
 * **Speed:** 0.85–1.30× Marlin on the RTX 4050 (see above); prefill GEMMs and
