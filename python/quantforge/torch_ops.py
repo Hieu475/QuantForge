@@ -6,6 +6,9 @@
 
 * ``packed`` int8 ``[K, N/2]`` (two INT4 per byte, low nibble = even column), ``scale`` f16 and
   ``zero_point`` int8, either ``[K/G, N]`` (group-wise) or scalars (``group_size=0``, per tensor).
+  **W8A16**: a group-wise weight whose ``packed`` is a plain int8 ``[K, N]`` tensor (signed values,
+  same scale / zero point layout; ``quant.quantize_groupwise_int8``) selects the 8-bit kernel -- the
+  width is inferred from ``packed.shape[1] == scale.shape[1]``. No swiglu / per-tensor for 8 bit.
 * Returns ``act(x @ dequant(W) (+ bias))`` (``activation`` = none | relu | silu | gelu | swiglu, fused) with the dtype of ``x`` (f16); accumulation is f32.
 * Works under ``torch.compile`` (a fake implementation provides the output shape) and in CUDA
   graphs: the kernel is launched on the current stream with no synchronisation or allocation of
@@ -72,12 +75,21 @@ def bucket_rows(M: int) -> int:
     return -(-M // 1024) * 1024
 
 
+def weight_bits(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> int:
+    """4 for packed INT4 [K, N/2], 8 for plain int8 [K, N] (group-wise only)."""
+    return 8 if group_size and packed.shape[1] == scale.shape[1] else 4
+
+
+def _out_cols(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> int:
+    return scale.shape[1] if group_size else packed.shape[1] * 2
+
+
 def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
-            activation: str = "none", overwrite: bool = False) -> W4A16Gemm:
+            activation: str = "none", overwrite: bool = False, bits: int = 4) -> W4A16Gemm:
     """The kernel serving M rows (see `bucket_rows`). `overwrite`: a kernel that writes
     C = A @ W without reading C (no bias; implied by swiglu)."""
     M = bucket_rows(M)
-    key = (M, K, N, group_size, device_index, _autotune, activation, overwrite)
+    key = (M, K, N, group_size, device_index, _autotune, activation, overwrite, bits)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -88,10 +100,10 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
             if _autotune:
                 from .autotune import autotune
 
-                k = autotune(M, K, N, group_size=g, epilogue=activation, accumulate=not overwrite)
+                k = autotune(M, K, N, group_size=g, bits=bits, epilogue=activation, accumulate=not overwrite)
             else:
                 opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else ""
-                k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
+                k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts, bits=bits,
                                     epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k
     return k
@@ -108,15 +120,18 @@ def _python_impl(
 ) -> torch.Tensor:
     """Reference / fallback implementation (also the hot path when the C++ runtime is unavailable)."""
     K = x.shape[-1]
-    N = packed.shape[1] * 2
+    bits = weight_bits(packed, scale, group_size)
+    N = _out_cols(packed, scale, group_size)
     swiglu = activation == "swiglu"
     cols = N // 2 if swiglu else N
     if swiglu and bias is not None:
         raise ValueError("activation='swiglu' does not take a bias")
+    if swiglu and bits != 4:
+        raise ValueError("activation='swiglu' needs an INT4 weight")
     overwrite = swiglu or bias is None
     x2 = x.reshape(-1, K).contiguous()
     M = x2.shape[0]
-    kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite)
+    kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite, bits)
     if group_size and (kern.Kp, kern.Np) == (K, N) and x2.is_cuda and not (
             x2.data_ptr() % 16 or packed.data_ptr() % 16 or scale.data_ptr() % 16
             or zero_point.data_ptr() % 16) and packed.is_contiguous() and scale.is_contiguous() \
@@ -137,7 +152,8 @@ def _python_impl(
 
 
 def _fake(x, packed, scale, zero_point, group_size, bias=None, activation="none"):
-    cols = packed.shape[1] if activation == "swiglu" else packed.shape[1] * 2
+    n = _out_cols(packed, scale, group_size)
+    cols = n // 2 if activation == "swiglu" else n
     return x.new_empty(*x.shape[:-1], cols)
 
 
@@ -154,8 +170,8 @@ def _load_cpp_runtime():
         ext = cpp_extension.load(name="quantforge_rt", sources=[str(src)], with_cuda=True,
                                  extra_include_paths=[f"{cuda}/include"], verbose=False)
 
-        def builder(M, K, N, group_size, device_index, activation, overwrite):
-            k = _kernel(M, K, N, group_size, device_index, activation, overwrite)
+        def builder(M, K, N, group_size, device_index, activation, overwrite, bits):
+            k = _kernel(M, K, N, group_size, device_index, activation, overwrite, bits)
             addr = lambda f: ctypes.cast(f, ctypes.c_void_p).value  # noqa: E731
             return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
 
@@ -186,12 +202,17 @@ def w4a16_linear(
     group_size: int,
     bias: Optional[torch.Tensor] = None,
     activation: str = "none",
+    perm: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``act(x @ dequant(W) + bias)`` for an f16 ``x`` of shape ``[..., K]`` (see the module
     docstring); ``activation``: none | relu | silu | gelu (tanh form) | swiglu, fused into the kernel.
     ``swiglu``: ``packed`` / ``scale`` / ``zero_point`` hold the gate and up projections interleaved
     by column (``quantforge.quant.interleave_gate_up``); the result is ``silu(x @ Wg) * (x @ Wu)``,
-    half as wide as the GEMM."""
+    half as wide as the GEMM.
+    ``perm``: row permutation of an act-order GPTQ weight (``quant.from_gptq_act_order``); the
+    activations are gathered with it first (one extra small kernel)."""
     if x.dtype != torch.float16:
         raise TypeError(f"x must be float16, got {x.dtype}")
+    if perm is not None:  # GPTQ act-order: the weight rows were permuted offline
+        x = x.index_select(-1, perm.to(x.device))
     return torch.ops.quantforge.w4a16_gemm(x, packed, scale, zero_point, group_size, bias, activation)

@@ -115,13 +115,42 @@ def from_gptq(qweight, qzeros, scales, g_idx=None, zeros_offset: int = 1):
         expect = torch.arange(K, device=g_idx.device) // G
         if not torch.equal(g_idx.to(expect.dtype), expect):
             raise NotImplementedError(
-                "GPTQ act-order (permuted g_idx) checkpoints need a row permutation; "
-                "re-quantize without desc_act or permute the rows offline"
+                "GPTQ act-order (permuted g_idx) checkpoints need a row permutation: "
+                "use from_gptq_act_order() and pass perm= to w4a16_linear"
             )
     w = qweight.to(torch.int64) & 0xFFFFFFFF
     q = torch.stack([(w >> (4 * i)) & 0xF for i in range(8)], dim=1).reshape(K, N)  # k = 8*row + i
     zero = (_unpack_words_along_last(qzeros) + zeros_offset) & 0xF
     return pack_int4(q.to(torch.int8)), scales.half().contiguous(), zero.to(torch.int8)
+
+
+def act_order_permutation(g_idx, group_size: int):
+    """Row permutation that makes an act-order GPTQ checkpoint group-contiguous.
+
+    ``g_idx[k]`` is the quantisation group of input row k (``desc_act=True`` checkpoints
+    store the rows in the original order but the groups are scattered). Returns ``perm``
+    (int64 [K]) such that rows ``perm`` form groups of ``group_size`` consecutive rows:
+    ``W[perm]`` has the plain ``i // G`` group layout and ``x @ W == x[..., perm] @ W[perm]``.
+    Raises ValueError if the groups are not all exactly ``group_size`` rows."""
+    g = g_idx.to(torch.int64)
+    counts = torch.bincount(g)
+    if counts.numel() * group_size != g.numel() or not bool((counts == group_size).all()):
+        raise ValueError("g_idx must assign exactly group_size rows to every group")
+    return torch.argsort(g, stable=True)
+
+
+def from_gptq_act_order(qweight, qzeros, scales, g_idx, zeros_offset: int = 1):
+    """GPTQ checkpoint with ``desc_act=True`` -> (packed, scale, zero, perm).
+
+    packed / scale / zero are in QuantForge layout with the rows already permuted to be
+    group-contiguous; ``perm`` (int64 [K]) must be applied to the activations:
+    ``y = x[..., perm] @ W`` (``w4a16_linear(..., perm=perm)`` does it)."""
+    K = qweight.shape[0] * 8
+    G = K // scales.shape[0]
+    perm = act_order_permutation(g_idx, G)
+    packed, scale, zero = from_gptq(qweight, qzeros, scales, None, zeros_offset)
+    q = unpack_int4(packed)[perm.to(packed.device)]
+    return pack_int4(q.contiguous()), scale, zero, perm
 
 
 def from_awq(qweight, qzeros, scales):

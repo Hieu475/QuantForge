@@ -59,6 +59,22 @@ def test_gptq_rejects_act_order():
         quant.from_gptq(qw, qz, s, g_idx.flip(0))
 
 
+def test_gptq_act_order_matches_reference():
+    K, N, G = 64, 32, 16
+    q, scale, zero = _rand_q(K, N, G)
+    qw, qz, s = quant.to_gptq(q, scale, zero)
+    g_idx = (torch.randperm(K) % (K // G)).to(torch.int32)    # rows scattered over the groups
+    # reference: row k is dequantised with the scale / zero of group g_idx[k]
+    deq = (q.float() - zero.float()[g_idx.long()]) * scale.float()[g_idx.long()]
+    packed, sc, zp, perm = quant.from_gptq_act_order(qw, qz, s, g_idx)
+    deq_perm = (quant.unpack_int4(packed).float() - zp.float().repeat_interleave(G, 0)) \
+        * sc.float().repeat_interleave(G, 0)
+    x = torch.randn(3, K)
+    assert torch.allclose(x[:, perm] @ deq_perm, x @ deq, atol=1e-4)
+    with pytest.raises(ValueError):
+        quant.act_order_permutation(torch.zeros(K, dtype=torch.int32), G)
+
+
 @pytest.mark.parametrize("symmetric", [False, True])
 def test_quantize_groupwise_error_is_small(symmetric):
     w = torch.randn(256, 64)

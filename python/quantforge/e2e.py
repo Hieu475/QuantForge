@@ -379,6 +379,11 @@ class W4A16Gemm:
             pipeline_opts = (pipeline_opts + " accumulate=false").strip()
         if bits == 4 and N % 2:
             raise ValueError("N must be even (two INT4 weights per byte)")
+        if (not accumulate or epilogue == "swiglu") and any(
+                f"{o}=false" in pipeline_opts for o in ("tensor-core", "hoist-acc", "threads", "shared-memory")):
+            # the C++ pipeline would abort the whole process (report_fatal_error) on this combination
+            raise ValueError("accumulate=False / epilogue='swiglu' need the Tensor Core path with "
+                             "hoist-acc (do not disable tensor-core, hoist-acc, threads or shared-memory)")
         if decode and "decode=" not in pipeline_opts:
             pipeline_opts = (pipeline_opts + " decode=true").strip()
         if group_size is not None and K % group_size:

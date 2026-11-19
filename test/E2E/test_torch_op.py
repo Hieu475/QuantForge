@@ -290,3 +290,72 @@ def _unpack(packed):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_gptq_act_order_end_to_end():
+    """desc_act=True: scattered g_idx -> row permutation offline, activation gather in the op."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant
+
+    M, K, N, G = 5, 512, 256, 128
+    g = torch.Generator().manual_seed(3)
+    q = torch.randint(0, 16, (K, N), dtype=torch.int8, generator=g)
+    scale = (torch.rand(K // G, N, generator=g) * 0.05 + 0.01).half()
+    zero = torch.randint(0, 16, (K // G, N), dtype=torch.int8, generator=g)
+    g_idx = (torch.randperm(K, generator=g) % (K // G)).to(torch.int32)
+    qw, qz, s = quant.to_gptq(q, scale, zero)
+    deq = (q.float() - zero.float()[g_idx.long()]) * scale.float()[g_idx.long()]   # act-order reference
+    x = torch.randn(M, K, generator=g).half().cuda()
+    ref = x.float() @ deq.cuda()
+    packed, sc, zp, perm = quant.from_gptq_act_order(qw.cuda(), qz.cuda(), s.cuda(), g_idx.cuda())
+    out = qt.w4a16_linear(x, packed, sc, zp, G, perm=perm)
+    assert _close(out, ref)
+
+
+def test_bad_option_combination_raises_instead_of_aborting():
+    import pytest
+    from quantforge.e2e import W4A16Gemm
+
+    with pytest.raises(ValueError, match="Tensor Core"):
+        W4A16Gemm.build(16, 256, 128, group_size=64, accumulate=False, pipeline_opts="hoist-acc=false")
+
+
+def test_int8_weights_through_the_op_eager_compile_graph():
+    """W8A16: a plain int8 [K, N] weight selects the 8-bit kernel (C++ runtime and Python fallback)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant
+
+    K, N, G = 512, 384, 128
+    g = torch.Generator().manual_seed(5)
+    w = torch.randn(K, N, generator=g) * 0.05
+    q8, scale, zero = quant.quantize_groupwise_int8(w, G)
+    q8, scale, zero = q8.cuda(), scale.cuda(), zero.cuda()
+    assert qt.weight_bits(q8, scale, G) == 8
+    deq = (q8.float() - zero.float().repeat_interleave(G, 0)) * scale.float().repeat_interleave(G, 0)
+    for M in (1, 7, 40):
+        x = torch.randn(M, K, generator=g).half().cuda()
+        ref = x.float() @ deq
+        out = qt.w4a16_linear(x, q8, scale, zero, G)
+        assert out.shape == (M, N) and _close(out, ref), M
+        bias = torch.randn(N, device="cuda", dtype=torch.float16)
+        assert _close(qt.w4a16_linear(x, q8, scale, zero, G, bias), ref + bias.float()), "bias"
+    # INT4 and INT8 weights of the same shape must not share a kernel
+    q4, s4, z4 = quant.quantize_groupwise(w, G)
+    x = torch.randn(3, K, generator=g).half().cuda()
+    p4 = quant.pack_int4(q4).cuda()
+    deq4 = (q4.float() - z4.float().repeat_interleave(G, 0)) * s4.float().repeat_interleave(G, 0)
+    assert _close(qt.w4a16_linear(x, p4, s4.cuda(), z4.cuda(), G), x.float() @ deq4.cuda())
+    assert _close(qt.w4a16_linear(x, q8, scale, zero, G), x.float() @ deq)
+    f = torch.compile(lambda a: qt.w4a16_linear(a, q8, scale, zero, G), fullgraph=True)
+    assert _close(f(x), x.float() @ deq)
+    graph = torch.cuda.CUDAGraph()
+    qt.w4a16_linear(x, q8, scale, zero, G)
+    with torch.cuda.graph(graph):
+        y = qt.w4a16_linear(x, q8, scale, zero, G)
+    graph.replay(); torch.cuda.synchronize()
+    assert _close(y, x.float() @ deq)
+    import pytest
+    with pytest.raises(Exception):
+        qt.w4a16_linear(x, q8, scale, zero, G, activation="swiglu")

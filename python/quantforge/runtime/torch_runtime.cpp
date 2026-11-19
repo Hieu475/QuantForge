@@ -32,13 +32,14 @@ struct Kernel {
   bool hot = false; // K and N need no padding
 };
 
-using Key = std::tuple<int64_t, int64_t, int64_t, int64_t, int, std::string, bool>;
+using Key = std::tuple<int64_t, int64_t, int64_t, int64_t, int, std::string, bool, int>;
 struct KeyHash {
   size_t operator()(const Key &k) const {
     size_t h = std::hash<std::string>()(std::get<5>(k));
     auto mix = [&](int64_t v) { h = h * 1000003u ^ std::hash<int64_t>()(v); };
     mix(std::get<0>(k)); mix(std::get<1>(k)); mix(std::get<2>(k));
     mix(std::get<3>(k)); mix(std::get<4>(k)); mix(std::get<6>(k) ? 1 : 0);
+    mix(std::get<7>(k));
     return h;
   }
 };
@@ -91,8 +92,8 @@ inline Desc2 describe(const at::Tensor &t) {
 inline bool aligned16(const at::Tensor &t) { return (reinterpret_cast<uintptr_t>(t.data_ptr()) & 15) == 0; }
 
 Kernel lookup(int64_t M, int64_t K, int64_t N, int64_t group, int device, const std::string &act,
-              bool overwrite) {
-  Key key{M, K, N, group, device, act, overwrite};
+              bool overwrite, int bits) {
+  Key key{M, K, N, group, device, act, overwrite, bits};
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_kernels.find(key);
@@ -100,7 +101,7 @@ Kernel lookup(int64_t M, int64_t K, int64_t N, int64_t group, int device, const 
       return it->second;
   }
   py::gil_scoped_acquire gil; // first use of this shape: compile / load it in Python
-  py::tuple r = (*g_builder)(M, K, N, group, device, act, overwrite);
+  py::tuple r = (*g_builder)(M, K, N, group, device, act, overwrite, bits);
   Kernel k;
   k.fn = reinterpret_cast<decltype(k.fn)>(r[0].cast<uintptr_t>());
   k.set_stream = reinterpret_cast<decltype(k.set_stream)>(r[1].cast<uintptr_t>());
@@ -126,14 +127,19 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
                       std::string activation) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "x must be a float16 CUDA tensor");
   TORCH_CHECK(x.dim() >= 1 && packed.dim() == 2, "bad shapes");
-  const int64_t K = x.size(-1), N = packed.size(1) * 2;
+  // INT4: packed [K, N/2]. INT8 (group-wise only): plain int8 [K, N], i.e. as wide as `scale`.
+  TORCH_CHECK(group_size == 0 || scale.dim() == 2, "group-wise scale must be [K/G, N]");
+  const int64_t N = group_size > 0 ? scale.size(1) : packed.size(1) * 2;
+  const int bits = (group_size > 0 && packed.size(1) == N) ? 8 : 4;
+  const int64_t K = x.size(-1);
   const int64_t M = x.numel() / K;
   c10::cuda::CUDAGuard guard(x.device());
   const bool swiglu = activation == "swiglu";
   TORCH_CHECK(!(swiglu && bias.has_value()), "activation='swiglu' does not take a bias");
+  TORCH_CHECK(!(swiglu && bits != 4), "activation='swiglu' needs an INT4 weight");
   const bool overwrite = swiglu || !bias.has_value(); // the kernel need not read C
   const int64_t cols = swiglu ? N / 2 : N;
-  Kernel k = lookup(M, K, N, group_size, x.device().index(), activation, overwrite);
+  Kernel k = lookup(M, K, N, group_size, x.device().index(), activation, overwrite, bits);
 
   at::Tensor x2 = x.reshape({M, K}).contiguous();
   if (!k.hot || !aligned16(x2) || !aligned16(packed) || !aligned16(scale) || !aligned16(zero) ||
