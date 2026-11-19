@@ -162,3 +162,22 @@ def interleave_gate_up(gate, up):
     qg, qu = unpack_int4(pg), unpack_int4(pu)                       # [K, N]
     inter = lambda a, b: torch.stack((a, b), dim=-1).reshape(a.shape[0], -1)  # noqa: E731
     return pack_int4(inter(qg, qu)), inter(sg, su).contiguous(), inter(zg, zu).contiguous()
+
+
+def concat_columns(*parts):
+    """Fuse several projections of the SAME input into one GEMM (e.g. attention q / k / v): the
+    weights are concatenated along N. Each part is (packed [K, N_i/2] int8, scale f16 [K/G, N_i],
+    zero int8 [K/G, N_i]) in QuantForge layout with the same K and group size, N_i even. Returns
+    the same triple for N = sum(N_i); the output of the fused GEMM is the concatenation of the
+    outputs (split it with ``out.split([N_1, N_2, ...], -1)``; concatenate the biases the same way).
+    Quantisation groups run along K, so nothing about the values changes."""
+    if not parts:
+        raise ValueError("nothing to concatenate")
+    k, g = parts[0][0].shape[0], parts[0][1].shape[0]
+    for packed, scale, zero in parts:
+        if packed.shape[0] != k or scale.shape[0] != g or zero.shape != scale.shape \
+                or packed.shape[1] * 2 != scale.shape[1]:
+            raise ValueError("parts must share K and the group size and have consistent shapes")
+    return (torch.cat([p[0] for p in parts], dim=1).contiguous(),
+            torch.cat([p[1] for p in parts], dim=1).contiguous(),
+            torch.cat([p[2] for p in parts], dim=1).contiguous())

@@ -62,10 +62,11 @@ def main():
     ap.add_argument("--base", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--quant-head", action="store_true", help="also quantise the tied lm_head (RTN)")
+    ap.add_argument("--no-fuse-qkv", action="store_true", help="keep q / k / v as three GEMMs")
     ns = ap.parse_args()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(ns.base)
-    fp16, ref, qf = build_variants(ns.base, ns.ckpt, "cuda", ns.quant_head)
+    fp16, ref, qf = build_variants(ns.base, ns.ckpt, "cuda", ns.quant_head, not ns.no_fuse_qkv)
     prompt = "Explain in one paragraph why the sky is blue."
     res = {}
     for name, m in (("fp16", fp16), ("quantforge", qf)):

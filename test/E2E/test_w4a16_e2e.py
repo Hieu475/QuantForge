@@ -401,6 +401,37 @@ def test_persistent_kernel_cache(monkeypatch=None):
                 os.environ["QUANTFORGE_KERNEL_CACHE"] = old
 
 
+def test_concat_columns_fuses_projections():
+    """q / k / v style fusion: one GEMM over the column-concatenated weights == three GEMMs."""
+    _require_gpu()
+    from quantforge import quant
+
+    M, K, G = 5, 256, 64
+    widths = (192, 64, 128)
+    parts, refs, biases = [], [], []
+    for i, n in enumerate(widths):
+        _, q, scale, zp = _group_inputs(M, K, n, G, seed=10 + i)
+        parts.append((pack_int4(q), scale, zp))
+        refs.append((q, scale, zp))
+        biases.append(torch.randn(n, device="cuda") * 3)
+    g = torch.Generator(device="cuda").manual_seed(99)
+    act = (torch.rand(M, K, device="cuda", generator=g) * 2 - 1).half()
+    packed, scale, zero = quant.concat_columns(*parts)
+    assert packed.shape == (K, sum(widths) // 2) and scale.shape == (K // G, sum(widths))
+    kern = W4A16Gemm.build(M, K, sum(widths), group_size=G, pad=True, pipeline_opts="decode=true")
+    out = kern.run(act, packed, scale, zero, bias=torch.cat(biases))
+    got = out.split(list(widths), dim=-1)
+    for (q, sc, zp), b, o in zip(refs, biases, got):
+        want = reference_gemm(act, q, sc, zp) + b
+        assert (o - want).abs().max().item() < 1e-4 * want.abs().max().item() + 1e-3
+    for bad in [(parts[0], (parts[1][0][:-1], parts[1][1], parts[1][2]))]:
+        try:
+            quant.concat_columns(*bad)
+        except ValueError:
+            continue
+        raise AssertionError("mismatched K must be rejected")
+
+
 def _check_decode(M, K, N):
     act, q, scale, zp = _inputs(M, K, N)
     out = W4A16Gemm.build(M, K, N, decode=True, pad=True).run(act, pack_int4(q), scale, zp)

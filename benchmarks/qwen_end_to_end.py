@@ -6,7 +6,7 @@ generation:
   fp16      the original fp16 weights                    (quality baseline)
   ref       the GPTQ weights dequantised to dense fp16   (what the quantised model should compute)
   quantforge every decoder Linear replaced by the QuantForge W4A16 kernel (gate_proj + up_proj fused into
-            one GEMM with the swiglu epilogue); embeddings / norms / lm_head stay fp16
+            one GEMM with the swiglu epilogue; q / k / v of the attention as one GEMM); embeddings / norms / lm_head stay fp16
 
     QUANTFORGE_BUILD_DIR=<build> python benchmarks/qwen_end_to_end.py \
         --ckpt <.../gptq/model.safetensors> --text <wikitext-2 test parquet> [--nseq 16 --seqlen 512]
@@ -64,6 +64,36 @@ class QFLinearRTN(nn.Module):
         return qt.w4a16_linear(x, self.packed, self.scale, self.zero, G, None)
 
 
+class QFQKV(nn.Module):
+    """q / k / v of one attention layer as ONE GEMM (weights and biases concatenated along N).
+    The HF attention calls q_proj, k_proj, v_proj on the same tensor: the first call runs the fused
+    GEMM and the other two take their slice of the result (keyed on the identity of the input)."""
+    def __init__(self, q, k, v):
+        super().__init__()
+        self.packed, self.scale, self.zero = quant.concat_columns(
+            *((m.packed, m.scale, m.zero) for m in (q, k, v)))
+        self.sizes = [m.packed.shape[1] * 2 for m in (q, k, v)]
+        biases = [m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=q.packed.device)
+                  for m, n in zip((q, k, v), self.sizes)]
+        self.bias = torch.cat(biases)
+        self._x, self._outs = None, None
+
+    def parts(self, x):
+        if self._x is not x:
+            self._outs = qt.w4a16_linear(x, self.packed, self.scale, self.zero, G, self.bias).split(self.sizes, -1)
+            self._x = x
+        return self._outs
+
+
+class QFQKVPart(nn.Module):
+    def __init__(self, fused, index):
+        super().__init__()
+        self.fused, self.index = fused, index
+
+    def forward(self, x):
+        return self.fused.parts(x)[self.index]
+
+
 class QFMLP(nn.Module):
     """down(silu(gate(x)) * up(x)) as ONE fused GEMM (gate / up weights interleaved by column,
     silu * up in the epilogue) followed by down_proj."""
@@ -82,7 +112,7 @@ def load_model(base, device):
     return AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.float16).to(device).eval()
 
 
-def build_variants(base, ckpt, device, quant_head=False):
+def build_variants(base, ckpt, device, quant_head=False, fuse_qkv=True):
     from safetensors.torch import load_file
     sd = load_file(ckpt, device=device)
     fp16 = load_model(base, device)
@@ -108,6 +138,10 @@ def build_variants(base, ckpt, device, quant_head=False):
             if not name.startswith("mlp."):
                 setattr(parent_q, leaf, mods[name])
         lq.mlp = QFMLP(mods["mlp.gate_proj"], mods["mlp.up_proj"], mods["mlp.down_proj"])
+        if fuse_qkv:
+            fused = QFQKV(mods["self_attn.q_proj"], mods["self_attn.k_proj"], mods["self_attn.v_proj"])
+            for i, leaf in enumerate(("q_proj", "k_proj", "v_proj")):
+                setattr(lq.self_attn, leaf, QFQKVPart(fused, i))
     for m in (fp16, ref, qf):  # embeddings / norms (and the tied lm_head) from the checkpoint
         m.model.embed_tokens.weight.data = sd["model.embed_tokens.weight"].half()
         m.model.norm.weight.data = sd["model.norm.weight"].half()
@@ -144,6 +178,7 @@ def main():
     ap.add_argument("--nseq", type=int, default=16)
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--new-tokens", type=int, default=48)
+    ap.add_argument("--no-fuse-qkv", action="store_true", help="keep q / k / v as three GEMMs")
     ap.add_argument("--quant-head", action="store_true",
                     help="also quantise the (tied) lm_head to 4 bit with RTN (not part of the checkpoint)")
     ns = ap.parse_args()
@@ -155,7 +190,7 @@ def main():
     ids = tok(text, return_tensors="pt").input_ids[0][: ns.nseq * ns.seqlen]
     print(f"{ids.numel()} tokens = {ids.numel() // ns.seqlen} x {ns.seqlen}")
 
-    fp16, ref, qf = build_variants(ns.base, ns.ckpt, "cuda", ns.quant_head)
+    fp16, ref, qf = build_variants(ns.base, ns.ckpt, "cuda", ns.quant_head, not ns.no_fuse_qkv)
     res = {}
     for name, m in (("fp16", fp16), ("ref (GPTQ dequantised)", ref), ("quantforge", qf)):
         t = time.time()

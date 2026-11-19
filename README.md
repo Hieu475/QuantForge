@@ -174,7 +174,8 @@ The whole lowering is described in [`python/quantforge/PIPELINE.md`](python/quan
 
 `benchmarks/qwen_end_to_end.py` and `benchmarks/qwen_decode_graph.py` run **Qwen2.5-0.5B-Instruct**
 with its official GPTQ-Int4 checkpoint, every decoder Linear replaced by the QuantForge kernel (the
-`gate_proj` and `up_proj` fused into one GEMM with the `swiglu` epilogue), on the RTX 4050 laptop GPU:
+`gate_proj` + `up_proj` fused into one GEMM with the `swiglu` epilogue, `q/k/v_proj` fused into one
+GEMM with `quant.concat_columns`), on the RTX 4050 laptop GPU:
 
 | wikitext-2 test, 8 × 512 tokens | perplexity |
 |---|--:|
@@ -190,15 +191,15 @@ in between; 48 of 48 greedy tokens identical). Batch-1 decode, whole step captur
 | | tokens/s |
 |---|--:|
 | fp16 | 129 |
-| QuantForge (GPTQ checkpoint) | 169 |
-| QuantForge + RTN 4-bit `lm_head` | 177 (perplexity +2.2: not recommended) |
+| QuantForge (GPTQ checkpoint) | 196 (176 with q/k/v as three GEMMs) |
+| QuantForge + RTN 4-bit `lm_head` | 239 (perplexity +2.2: not recommended) |
 
-GPU time of one decode step: the 168 W4A16 kernels take 2.6 ms against 4.4 ms for the same layers
-in cuBLAS fp16; what stays is the fp16 `lm_head` (272 MB, ~1.7 ms), attention / norms (~1.3 ms)
-and ~0.7 ms of small kernels around each call (activation padding, accumulator init, f32 → f16).
+GPU time of one decode step before the q/k/v and gate/up fusions: the 168 W4A16 kernels took 2.6 ms
+against 4.4 ms for the same layers in cuBLAS fp16 (now 120 kernels); what stays is the fp16 `lm_head` (272 MB, ~1.7 ms), attention / norms (~1.3 ms)
+and the small kernels around each call (activation padding, f32 → f16).
 Without the graph (HF `generate`, Python launching every kernel) the per-call overhead decides:
-the Python op gives 54 tokens/s, the C++ dispatcher hot path (see "As a PyTorch op") 81 (71 before
-the fused gate/up and the overwrite kernel removed 168 + 24 launches), fp16 105 — the layers
+the Python op gives 54 tokens/s, the C++ dispatcher hot path (see "As a PyTorch op") ~79 (71 before
+the fused gate/up, q/k/v and the overwrite kernel removed launches), fp16 ~100 — the layers
 of a 0.5 B model are only 10–15 µs of GPU time each and every call still launches four small
 kernels around the GEMM (activation pad, f32 → f16 conversion, plus the GEMM; the accumulator
 zero-init is gone since kernels can overwrite their output).
