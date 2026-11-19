@@ -359,3 +359,14 @@ def test_int8_weights_through_the_op_eager_compile_graph():
     import pytest
     with pytest.raises(Exception):
         qt.w4a16_linear(x, q8, scale, zero, G, activation="swiglu")
+
+
+def test_prefill_default_schedule_for_large_weights_is_correct():
+    _require_gpu()
+    import quantforge.torch_ops as qt
+
+    assert qt._prefill_opts(512, 4096, 11008) == "block-tile-k=32 smem-stages=3"
+    assert qt._prefill_opts(512, 4096, 4096) == "" and qt._prefill_opts(256, 4096, 11008) == ""
+    act, packed, scale, zp, ref = _case(512, 4096, 11008, 128)
+    out = qt.w4a16_linear(act, packed, scale, zp, 128)
+    assert _close(out, ref)

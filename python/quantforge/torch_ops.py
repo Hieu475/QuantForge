@@ -40,6 +40,15 @@ def _decode_opts(N: int) -> str:
     RTX 4050 (benchmarks in the commit message). `set_autotune(True)` replaces the rule by a search."""
     bk = 128 if N >= 8192 else 64
     return f"decode=true block-tile-n=128 warp-tile-n=16 block-tile-k={bk} smem-stages=1 prefetch-distance=1"
+
+
+def _prefill_opts(M: int, K: int, N: int) -> str:
+    """Default schedule of an M > 64 call. Large weights (K * N >= 2**25: 4096 x 11008, 11008 x 4096, ...)
+    run 8-12 % faster with a 3-stage pipeline of 32-deep K tiles from 512 rows up (RTX 4050, cold
+    weights; the 4096 x 4096 class and M < 512 do not gain, 256 x 11008 x 4096 loses 10 %)."""
+    return "block-tile-k=32 smem-stages=3" if M >= 512 and K * N >= 1 << 25 else ""
+
+
 _lock = threading.Lock()
 _kernels: dict[tuple, W4A16Gemm] = {}
 _autotune = False
@@ -102,7 +111,7 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
 
                 k = autotune(M, K, N, group_size=g, bits=bits, epilogue=activation, accumulate=not overwrite)
             else:
-                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else ""
+                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else _prefill_opts(M, K, N)
                 k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts, bits=bits,
                                     epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k

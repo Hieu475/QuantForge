@@ -114,7 +114,12 @@ straight into the MMA fragment layout, no shared-memory round trip for B).
 registers and shared memory): 2.13 waves run as 3 (71 % at best), the same wave quantization as in
 decode. 64 × 128 block tiles with a 64-wide K tile double the block count: 491 → 457 µs
 (0.79× → 0.85× Marlin); at M = 2048 the 128 × 128 tile stays best. The autotuner tries both and its
-cache now keys M in finer buckets (≤ 16, 32, …, 4096). Remaining gap to cuBLAS / Marlin: MMA issue
+cache now keys M in finer buckets (≤ 16, 32, …, 4096). Large weights (K x N >= 2**25) at M >= 512 lose ~20 % throughput with the default
+128 x 128 x 32, 2-stage schedule (31 vs 38 TFLOP/s at 2048 x 4096 x 11008 / 4096 x 14336); a 3-stage pipeline
+(`block-tile-k=32 smem-stages=3`) is 8-12 % faster there (and 4 % slower at 4096 x 4096, 10 % slower at
+256 x 11008 x 4096): `torch_ops._prefill_opts` uses it for M >= 512 and K x N >= 2**25, the autotuner has
+it as a candidate. `prefetch-distance=1` does nothing for prefill (0.464 vs 0.467 ms at 512 x 4096 x 4096), and
+64 x 64 / 128 x 64 block tiles, 4 stages and 64-deep K tiles are all slower. Remaining gap to cuBLAS / Marlin: MMA issue
 gaps between the dequantisation and the HMMA stream (no software pipelining of the two).
 
 ## Group-wise quantization

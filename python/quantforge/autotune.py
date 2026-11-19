@@ -85,6 +85,10 @@ def candidates(M: int, bits: int = 4) -> list[str]:
                  "warp-tile-m=32 warp-tile-n=64", "warp-tile-m=64 warp-tile-n=32",
                  "warp-tile-m=128 warp-tile-n=32"):
         out.append(opts)
+    # 3 stages of the 32-deep K tile: -11 % at 2048 x 4096 x 11008 (wave quantization / occupancy
+    # effects: +4 % slower at 2048 x 4096 x 4096), hence a candidate, not the default
+    if M >= 256:
+        out.append("block-tile-k=32 smem-stages=3")
     # 64 x 128 block tiles: twice the blocks, so the last wave of a 512-row GEMM is fuller
     # (512 x 4096 x 4096: 128 -> 256 blocks for 60 resident slots; -5 % time)
     if M >= 256:
