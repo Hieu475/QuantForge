@@ -1,0 +1,7 @@
+{
+  "title": "QuantForge Notes",
+  "tagline": "Writing a compiler for low-precision LLM kernels: what worked, what did not, and the numbers.",
+  "author": "Hieu475",
+  "github_url": "",
+  "footer": "QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB)."
+}

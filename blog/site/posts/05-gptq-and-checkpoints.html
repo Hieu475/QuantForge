@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps - QuantForge Notes</title>
+<meta name="description" content="Round-to-nearest INT4 costs 1 to 4 perplexity points. A GPTQ implementation in the library recovers 17 to 65 percent of that, real AWQ and GPTQ checkpoints are loaded and verified, and the things that did not help are listed.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps</h1><p class="lede">Round-to-nearest INT4 costs 1 to 4 perplexity points. A GPTQ implementation in the library recovers 17 to 65 percent of that, real AWQ and GPTQ checkpoints are loaded and verified, and the things that did not help are listed.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#round-to-nearest-the-baseline">Round-to-nearest: the baseline</a></li>
+<li><a href="#gptq-in-the-library">GPTQ in the library</a><ul>
+<li><a href="#things-that-did-not-help-so-they-are-off-by-default">Things that did not help (so they are off by default)</a></li>
+</ul>
+</li>
+<li><a href="#real-awq-and-gptq-checkpoints">Real AWQ and GPTQ checkpoints</a><ul>
+<li><a href="#the-trap-that-cost-an-hour-awq-changes-the-norms">The trap that cost an hour: AWQ changes the norms</a></li>
+</ul>
+</li>
+<li><a href="#reproducing">Reproducing</a></li>
+</ul>
+</div>
+</details><p>Fast kernels are only half of a quantisation story: the other half is how much quality the 4-bit weights lose. The library therefore has two ways to obtain weights, a one-line round-to-nearest quantiser and a calibrated one, and it can load checkpoints produced by other tools.</p>
+<h2 id="round-to-nearest-the-baseline">Round-to-nearest: the baseline<a class="headerlink" href="#round-to-nearest-the-baseline" title="Permanent link">#</a></h2>
+<p><code>quantforge.nn.quantize_model(model, "int4", group_size=128)</code> quantises every <code>nn.Linear</code> independently: each group of 128 input rows of a column maps its minimum and maximum to the 16 levels. It takes 3 seconds for a 0.5B model, needs no data, and loses a visible amount of quality (1 to 4 perplexity points on the models below). The head (<code>lm_head</code>) is kept in fp16 by default; quantising it to INT8 is lossless (perplexity 24.08 against 24.09 for Qwen2.5-0.5B) and 16 percent faster, so the numbers in this post use an INT8 head everywhere.</p>
+<h2 id="gptq-in-the-library">GPTQ in the library<a class="headerlink" href="#gptq-in-the-library" title="Permanent link">#</a></h2>
+<p><code>quantforge.gptq.quantize_model_gptq</code> implements sequential GPTQ (Frantar et al.) producing exactly the layouts the kernels consume:</p>
+<ol>
+<li>the decoder layers are run on 128 calibration windows of 512 tokens; the hidden states entering the first layer are captured with a stand-in module that records its inputs and aborts the forward pass;</li>
+<li>layer by layer, a forward pre-hook on every Linear accumulates the Hessian of its input, <code>H = 2 X^T X / n</code>, while the layer processes the calibration activations;</li>
+<li>each Linear is quantised column by column; the error of every rounded column, scaled by the diagonal of the inverse Cholesky factor of <code>H</code>, is pushed onto the columns not yet quantised;</li>
+<li>the group scale and zero point are computed from the <em>updated</em> weights at the start of each group, with the scale rounded to f16 <strong>before</strong> the error is propagated so the optimisation sees the weights the kernel will actually use;</li>
+<li>the quantised layer is run again on the calibration set; its outputs are the inputs of the next layer (so later layers see the quantisation noise of earlier ones).</li>
+</ol>
+<p>Calibration takes 43 seconds for Qwen2.5-0.5B and 125 seconds for 1.5B on the 6 GB laptop GPU. Memory is bounded by one layer, its Hessians (the largest, <code>down_proj</code>, is <code>intermediate x intermediate</code> in f32) and the stored activations.</p>
+<figure class="viz"><div class="viz-title">Wikitext-2 perplexity of the quantised models (lower is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>RTN INT4</span><span class="lg"><i class="sw s2"></i>GPTQ INT4</span><span class="lg"><i class="sw mk"></i>fp16 reference</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Wikitext-2 perplexity of the quantised models (lower is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">6</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">12</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">18</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">24</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">30</text><path class="s1" d="M104.2 268 V72.9 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - RTN INT4: 24.08</title></path><text class="val" x="121.2" y="63.9" text-anchor="middle">24.08</text><path class="s2" d="M140.2 268 V95.3 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - GPTQ INT4: 21.38</title></path><text class="val" x="157.2" y="86.3" text-anchor="middle">21.38</text><line class="marker" x1="99.2" y1="103.2" x2="179.2" y2="103.2"><title>Qwen2.5
+0.5B - fp16 reference: 19.93</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V145.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - RTN INT4: 15.31</title></path><text class="val" x="295.8" y="136.4" text-anchor="middle">15.31</text><path class="s2" d="M314.8 268 V148.0 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - GPTQ INT4: 15.00</title></path><text class="val" x="331.8" y="139.0" text-anchor="middle">15.00</text><line class="marker" x1="273.8" y1="156.6" x2="353.8" y2="156.6"><title>Qwen2.5
+1.5B - fp16 reference: 13.48</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V70.1 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - RTN INT4: 24.42</title></path><text class="val" x="470.2" y="61.1" text-anchor="middle">24.42</text><path class="s2" d="M489.2 268 V78.6 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - GPTQ INT4: 23.39</title></path><text class="val" x="506.2" y="69.6" text-anchor="middle">23.39</text><line class="marker" x1="448.2" y1="101.4" x2="528.2" y2="101.4"><title>Llama-3.2
+1B - fp16 reference: 20.15</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V95.8 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - RTN INT4: 21.31</title></path><text class="val" x="644.8" y="86.8" text-anchor="middle">21.31</text><path class="s2" d="M663.8 268 V101.5 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - GPTQ INT4: 20.62</title></path><text class="val" x="680.8" y="92.5" text-anchor="middle">20.62</text><line class="marker" x1="622.8" y1="108.3" x2="702.8" y2="108.3"><title>OLMo-2
+1B - fp16 reference: 19.32</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>8 x 512 test tokens; GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>fp16 reference</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>24.08</td><td>21.38</td><td>19.93</td></tr><tr><th>Qwen2.5 1.5B</th><td>15.31</td><td>15.00</td><td>13.48</td></tr><tr><th>Llama-3.2 1B</th><td>24.42</td><td>23.39</td><td>20.15</td></tr><tr><th>OLMo-2 1B</th><td>21.31</td><td>20.62</td><td>19.32</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">RTN INT4</th>
+<th style="text-align: right;">GPTQ INT4</th>
+<th style="text-align: right;">share of the RTN loss recovered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B-Instruct</td>
+<td style="text-align: right;">19.93</td>
+<td style="text-align: right;">24.08</td>
+<td style="text-align: right;"><strong>21.38</strong></td>
+<td style="text-align: right;">65 %</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B-Instruct</td>
+<td style="text-align: right;">13.48</td>
+<td style="text-align: right;">15.31</td>
+<td style="text-align: right;"><strong>15.00</strong></td>
+<td style="text-align: right;">17 %</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B-Instruct</td>
+<td style="text-align: right;">20.15</td>
+<td style="text-align: right;">24.42</td>
+<td style="text-align: right;"><strong>23.39</strong></td>
+<td style="text-align: right;">24 %</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct</td>
+<td style="text-align: right;">19.32</td>
+<td style="text-align: right;">21.31</td>
+<td style="text-align: right;"><strong>20.62</strong></td>
+<td style="text-align: right;">34 %</td>
+</tr>
+</tbody>
+</table>
+<p>Calibration uses windows of the Wikitext-2 <em>train</em> split; the perplexity is measured on 8 x 512 tokens of the <em>test</em> split. Decode speed does not change (the layout is the same): 226 tokens/s against 219 for Qwen2.5-0.5B in the same session, which is within the noise of this machine.</p>
+<p><strong>An honest reading</strong>: GPTQ always helps, but the gain is very uneven (65 percent of the loss on the smallest model, 17 percent on 1.5B). I do not have a clean explanation; models whose RTN loss is dominated by a few outlier channels benefit most. With an eight-window test set of 4096 tokens the second decimal of these perplexities is also noise-sensitive. A proper study would use the full test set and several seeds for the calibration windows.</p>
+<h3 id="things-that-did-not-help-so-they-are-off-by-default">Things that did not help (so they are off by default)<a class="headerlink" href="#things-that-did-not-help-so-they-are-off-by-default" title="Permanent link">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>variant</th>
+<th style="text-align: right;">Qwen 0.5B</th>
+<th style="text-align: right;">Qwen 1.5B</th>
+<th style="text-align: right;">Llama-3.2 1B</th>
+<th style="text-align: right;">OLMo-2 1B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPTQ, default (damping 0.01, group 128)</td>
+<td style="text-align: right;">21.38</td>
+<td style="text-align: right;">15.00</td>
+<td style="text-align: right;">23.39</td>
+<td style="text-align: right;">20.62</td>
+</tr>
+<tr>
+<td>+ per-group range clipping (<code>clip=True</code>)</td>
+<td style="text-align: right;">21.66</td>
+<td style="text-align: right;"><strong>14.40</strong></td>
+<td style="text-align: right;">30.87</td>
+<td style="text-align: right;"><strong>19.77</strong></td>
+</tr>
+<tr>
+<td>act-order (<code>act_order=True</code>)</td>
+<td style="text-align: right;">21.74</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>damping 0.1 / 0.03</td>
+<td style="text-align: right;">21.54 / 21.61</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>256 calibration windows</td>
+<td style="text-align: right;">21.44</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>group size 64</td>
+<td style="text-align: right;"><strong>21.26</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Range clipping (shrink the min/max of every group row when that lowers its weight-space rounding error) is the interesting one: it gives the best result on two models and the worst on Llama-3.2-1B, where perplexity jumps from 23.4 to 30.9. The criterion it optimises, the error of the weights, is not the error of the layer output that GPTQ optimises, and the two disagree on some layers. It stays an option. Act-order also costs speed: a layer with an input permutation cannot take part in the q/k/v fusion, so decode falls from 226 to 169 tokens/s on Qwen2.5-0.5B.</p>
+<h2 id="real-awq-and-gptq-checkpoints">Real AWQ and GPTQ checkpoints<a class="headerlink" href="#real-awq-and-gptq-checkpoints" title="Permanent link">#</a></h2>
+<p>Most 4-bit models on the Hub are AWQ or GPTQ files. <code>quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")</code> converts the int32-packed tensors into the kernel layout (<code>quant.from_gptq</code>, <code>quant.from_awq</code>), supports GPTQ <code>desc_act</code> checkpoints by permuting the rows offline (the activation permutation is applied by one small gather at run time) and the <code>gptq_v2</code> zero-point convention.</p>
+<p>Verification against a dense twin (the same dequantised weights in ordinary <code>nn.Linear</code> layers), Qwen2.5-0.5B-Instruct, 16 x 512 test tokens:</p>
+<table>
+<thead>
+<tr>
+<th>checkpoint</th>
+<th style="text-align: right;">perplexity, dense twin</th>
+<th style="text-align: right;">perplexity, QuantForge</th>
+<th style="text-align: right;">greedy decode</th>
+<th style="text-align: right;">decode speed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPTQ-Int4 (official Qwen)</td>
+<td style="text-align: right;">26.335</td>
+<td style="text-align: right;">26.336</td>
+<td style="text-align: right;">59 / 59 tokens identical</td>
+<td style="text-align: right;">182 tok/s</td>
+</tr>
+<tr>
+<td>AWQ (official Qwen)</td>
+<td style="text-align: right;">26.689</td>
+<td style="text-align: right;">26.689</td>
+<td style="text-align: right;">59 / 59 tokens identical</td>
+<td style="text-align: right;">184 tok/s</td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-trap-that-cost-an-hour-awq-changes-the-norms">The trap that cost an hour: AWQ changes the norms<a class="headerlink" href="#the-trap-that-cost-an-hour-awq-changes-the-norms" title="Permanent link">#</a></h3>
+<p>The first AWQ run printed a perplexity of <strong>83,014</strong> for the dense twin while the QuantForge model, built the same way, printed 26.7. A single layer matched to the last bit, so the kernel was fine. The cause: AWQ scales the input channels of a linear layer by a learned factor <code>s</code> to protect salient weights, and folds the inverse factor into the <em>preceding</em> operation, usually the RMSNorm weight. The norm weights stored in an AWQ checkpoint are therefore not the original model's. Loading only the quantised linear layers on top of the base model's norms gives garbage; the loader now copies every non-linear tensor (embeddings, norms) that exists in both the checkpoint and the model, and the README says so. GPTQ does not do this, which is why GPTQ worked on the first try.</p>
+<h2 id="reproducing">Reproducing<a class="headerlink" href="#reproducing" title="Permanent link">#</a></h2>
+<pre><code class="language-bash"># calibrated 4-bit, with the comparison against round-to-nearest
+python benchmarks/hf_gptq.py --model Qwen/Qwen2.5-0.5B-Instruct \
+    --train wikitext2-train.parquet --text wikitext2-test.parquet
+
+# a real checkpoint against its dense twin
+python benchmarks/hf_load_checkpoint.py --base Qwen/Qwen2.5-0.5B-Instruct \
+    --ckpt Qwen2.5-0.5B-Instruct-GPTQ-Int4/model.safetensors --method gptq --text wikitext2-test.parquet
+</code></pre>
+<p>Everything above ran on one RTX 4050 Laptop GPU with 6 GB of memory; the 3B model and Phi-3.5 (3.8B) are loaded on the CPU and quantised layer by layer on the GPU, and a 7B model runs from a 4-bit bitsandbytes checkpoint in 4.65 GB.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why are batches of 32 to 256 slower than Marlin? A post-mortem with a hand-written CUDA prototype - QuantForge Notes</title>
+<meta name="description" content="Profiling, ablations and a hand-written Marlin-style kernel to find out what limits the generated kernels at medium batch size. Most hypotheses were wrong, and the negative results are the useful part.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Why are batches of 32 to 256 slower than Marlin? A post-mortem with a hand-written CUDA prototype</h1><p class="lede">Profiling, ablations and a hand-written Marlin-style kernel to find out what limits the generated kernels at medium batch size. Most hypotheses were wrong, and the negative results are the useful part.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#hypothesis-1-the-schedule-is-wrong">Hypothesis 1: the schedule is wrong</a></li>
+<li><a href="#hypothesis-2-not-enough-parallelism">Hypothesis 2: not enough parallelism</a></li>
+<li><a href="#hypothesis-3-dram">Hypothesis 3: DRAM</a></li>
+<li><a href="#hypothesis-4-the-tensor-cores-are-saturated">Hypothesis 4: the Tensor Cores are saturated</a></li>
+<li><a href="#hypothesis-5-the-integer-work-of-the-dequantisation">Hypothesis 5: the integer work of the dequantisation</a></li>
+<li><a href="#hypothesis-6-b-should-stay-in-registers-like-in-marlin">Hypothesis 6: B should stay in registers like in Marlin</a></li>
+<li><a href="#what-i-take-from-this">What I take from this</a></li>
+</ul>
+</div>
+</details><p>The kernel table in the <a href="01-overview.html">overview</a> has one ugly region. At batch size 1 to 16 the generated kernels match Marlin; at 512 rows and more they reach 85 percent; but at <strong>32, 64, 128 and 256 rows they are 88, 67, 69 and 76 percent of Marlin</strong>. This regime matters in practice: it is what a server sees with a few concurrent requests or short prompts. This post is the investigation. The conclusion is not "here is the fix"; it is a list of things that are <em>not</em> the problem, with measurements.</p>
+<table>
+<thead>
+<tr>
+<th>M</th>
+<th style="text-align: right;">Marlin (us)</th>
+<th style="text-align: right;">QuantForge (us)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>32</td>
+<td style="text-align: right;">50.8</td>
+<td style="text-align: right;">57.8</td>
+<td style="text-align: right;">0.88</td>
+</tr>
+<tr>
+<td>64</td>
+<td style="text-align: right;">58.6</td>
+<td style="text-align: right;">86.9</td>
+<td style="text-align: right;">0.67</td>
+</tr>
+<tr>
+<td>128</td>
+<td style="text-align: right;">104.1</td>
+<td style="text-align: right;">150.8</td>
+<td style="text-align: right;">0.69</td>
+</tr>
+<tr>
+<td>256</td>
+<td style="text-align: right;">198.7</td>
+<td style="text-align: right;">261.1</td>
+<td style="text-align: right;">0.76</td>
+</tr>
+</tbody>
+</table>
+<p>(K = N = 4096, group 128, weights from DRAM.) At M = 64 the arithmetic is 2.1 GFLOP, about 47 microseconds at the 45 TFLOP/s cuBLAS reaches on this card; Marlin does it in 59.</p>
+<h2 id="hypothesis-1-the-schedule-is-wrong">Hypothesis 1: the schedule is wrong<a class="headerlink" href="#hypothesis-1-the-schedule-is-wrong" title="Permanent link">#</a></h2>
+<p>For M between 17 and 64 the first version used a 64-row tile intended for prefill. A sweep over block tile M (16, 32, 64, 128), warp tile, K tile, stages and look-ahead (up to about 190 configurations per M) found better ones: for 32 rows a 32-row block tile with a 128-deep K tile (<strong>68.6 to 58.6 microseconds</strong>), for 64 rows a 64-row tile with a 32 x 64 warp tile and one-tile look-ahead (<strong>97 to 87 microseconds</strong>). Both are now the defaults, and the autotuner searches the same space. That moved M = 32 from 0.75x to 0.88x and M = 64 from 0.61x to 0.67x of Marlin. Then the sweeps plateaued: at M = 64, the best eight configurations lie between 87 and 94 microseconds. Tiling is exhausted.</p>
+<h2 id="hypothesis-2-not-enough-parallelism">Hypothesis 2: not enough parallelism<a class="headerlink" href="#hypothesis-2-not-enough-parallelism" title="Permanent link">#</a></h2>
+<p>The grid for M = 64 has only 64 blocks on 20 SMs. If starvation were the problem, more blocks should help. They do not: a 64 x 1024 x 16384 problem has exactly the same number of weights as 64 x 4096 x 4096 but four times as many blocks (256 instead of 64, each with a quarter of the K loop), and it takes 110 microseconds against 102. Time follows the work per SM, not the number of idle SMs. Smaller 16-row block tiles (four times the blocks, but four times the weight traffic, since each block re-reads the weights) are 30 percent <em>slower</em>.</p>
+<h2 id="hypothesis-3-dram">Hypothesis 3: DRAM<a class="headerlink" href="#hypothesis-3-dram" title="Permanent link">#</a></h2>
+<p><code>ncu</code> at M = 64: DRAM throughput <strong>52 percent</strong> of peak. Not the limit.</p>
+<h2 id="hypothesis-4-the-tensor-cores-are-saturated">Hypothesis 4: the Tensor Cores are saturated<a class="headerlink" href="#hypothesis-4-the-tensor-cores-are-saturated" title="Permanent link">#</a></h2>
+<p>Tensor pipe active: <strong>51 percent</strong>, issue slots busy: <strong>36 percent</strong>. Neither is saturated. The stall reasons are spread almost evenly, each costing 1.0 to 1.4 cycles per issued instruction: shared-memory queue pressure (<code>mio_throttle</code> 1.38), the Tensor pipe being momentarily busy (<code>math_pipe_throttle</code> 1.23), fixed-latency dependences (<code>wait</code> 1.34), global-load latency (<code>long_scoreboard</code> 1.20), barriers (0.96). No single culprit, which is the signature of a kernel whose phases do not overlap well.</p>
+<h2 id="hypothesis-5-the-integer-work-of-the-dequantisation">Hypothesis 5: the integer work of the dequantisation<a class="headerlink" href="#hypothesis-5-the-integer-work-of-the-dequantisation" title="Permanent link">#</a></h2>
+<p>The instruction histogram of the M = 64 kernel's main loop shows what looks like the obvious suspect:</p>
+<table>
+<thead>
+<tr>
+<th>opcode</th>
+<th style="text-align: right;">warp instructions</th>
+<th style="text-align: right;">share</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LOP3</td>
+<td style="text-align: right;">697 K</td>
+<td style="text-align: right;">21 %</td>
+</tr>
+<tr>
+<td>HMMA (the useful work)</td>
+<td style="text-align: right;">524 K</td>
+<td style="text-align: right;">16 %</td>
+</tr>
+<tr>
+<td>SHF</td>
+<td style="text-align: right;">345 K</td>
+<td style="text-align: right;">10 %</td>
+</tr>
+<tr>
+<td>LDSM (<code>ldmatrix</code>)</td>
+<td style="text-align: right;">328 K</td>
+<td style="text-align: right;">10 %</td>
+</tr>
+<tr>
+<td>HMUL2 + HADD2</td>
+<td style="text-align: right;">524 K</td>
+<td style="text-align: right;">16 %</td>
+</tr>
+<tr>
+<td>IMAD, SGXT, others</td>
+<td style="text-align: right;">the rest</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>About 60 percent of the executed instructions are dequantisation; only 16 percent are Tensor Core instructions. Marlin avoids most of the unpacking arithmetic by pre-arranging the nibbles offline: pair nibble <code>p</code> with nibble <code>p + 4</code> of a 32-bit word, so that one shift and one <code>LOP3</code> produce a ready <code>f16x2</code> pair (7 instead of about 16 integer operations per 8 weights).</p>
+<p>Before redesigning the weight layout I <strong>ablated it</strong>: emit the cheap unpacking with the wrong (but timed) layout and measure. Result: <strong>3 percent at M = 64, 2.6 percent at M = 512, 1.2 percent at 2048 x 4096 x 4096</strong>. The kernels are not limited by the integer arithmetic even though it dominates the instruction count, because the issue slots are only 36 percent busy. A weight-layout change across the whole system would have bought 3 percent. Abandoned.</p>
+<h2 id="hypothesis-6-b-should-stay-in-registers-like-in-marlin">Hypothesis 6: B should stay in registers like in Marlin<a class="headerlink" href="#hypothesis-6-b-should-stay-in-registers-like-in-marlin" title="Permanent link">#</a></h2>
+<p>The structural difference with Marlin is where the dequantised weights live. The generated kernels stage the dequantised B tile through shared memory: dequantise, <code>st.shared</code>, <code>__syncthreads</code>, <code>ldmatrix</code>, <code>mma</code>. Marlin repacks the weights offline so that each thread loads 16 bytes that are exactly its B fragments of eight 8-column tiles, dequantises them in registers and feeds <code>mma</code> directly: no shared memory and no barrier for B. Implementing that inside the MLIR pipeline would be a multi-week project, so I first built the <strong>upper bound by hand</strong>.</p>
+<p>The prototype is a single CUDA file (<code>benchmarks/proto/bir_w4a16.cu</code> in the repository, about 300 lines):</p>
+<ul>
+<li>offline repack: per <code>k16</code> step, per 64-column strip, each lane gets one <code>uint4</code> holding 32 nibbles, ordered so that <code>(w &gt;&gt; 4t) &amp; 0x000F000F</code> is directly a half2 B register of the <code>m16n8k16</code> instruction (the Marlin nibble pairing);</li>
+<li>dequantisation: <code>lop3</code>, <code>sub.f16x2</code>, <code>mul.f16x2</code> straight into the <code>mma</code> operands;</li>
+<li>A staged through shared memory with <code>cp.async</code> and read with <code>ldmatrix</code>; four warps per block, each warp owning a 64-column strip over all M rows; K split across blocks and accumulated with atomics;</li>
+<li>a ring of prefetched weight loads (<code>PF</code> steps), scales and zero points loaded once per 128-row group;</li>
+<li>verified against an f32 reference (max error 0.0003).</li>
+</ul>
+<p>Sweeping warps per block (2, 4, 8), K slices (1 to 8), A stages (2 to 4) and prefetch distance (2 to 8), the best configurations:</p>
+<table>
+<thead>
+<tr>
+<th>M</th>
+<th style="text-align: right;">prototype</th>
+<th style="text-align: right;">generated kernel</th>
+<th style="text-align: right;">Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>32</td>
+<td style="text-align: right;">57.3 us</td>
+<td style="text-align: right;">57.8 us</td>
+<td style="text-align: right;">50.8 us</td>
+</tr>
+<tr>
+<td>64</td>
+<td style="text-align: right;"><strong>75.8 us</strong></td>
+<td style="text-align: right;">86.9 us</td>
+<td style="text-align: right;">58.6 us</td>
+</tr>
+</tbody>
+</table>
+<p>So <strong>keeping B in registers is worth about 13 percent at M = 64 and nothing at M = 32</strong> in a straightforward implementation, and the prototype is still 28 percent slower than Marlin at M = 64. It uses 254 registers per thread and runs one warp per scheduler, which leaves it latency-bound; closing the rest is occupancy and scheduling tuning of a hand-written kernel (register pressure, two blocks per SM, instruction scheduling), the kind of work that hand-written kernels receive, not something a change to the compiler's memory path would deliver by itself.</p>
+<h2 id="what-i-take-from-this">What I take from this<a class="headerlink" href="#what-i-take-from-this" title="Permanent link">#</a></h2>
+<ol>
+<li>For these kernels the <em>instruction mix is a bad predictor of speed</em>: dequantisation is 60 percent of the instructions and worth 3 percent of the time when removed.</li>
+<li>Tile sweeps are cheap and necessary, but they saturate; when the best eight configurations are within 8 percent of each other, the structure is the limit.</li>
+<li>A hand-written prototype is the fastest way to bound a large compiler project. A few hours of CUDA answered a question that would have cost weeks of MLIR work: the approach would have gained at most 13 percent at M = 64.</li>
+<li>The remaining gap to Marlin at medium batch is probably not a compiler-versus-human gap but a <em>tuning-depth</em> gap. A generated kernel with Marlin's register budget and scheduling would need a scheduler that understands register pressure, which this pipeline does not have.</li>
+</ol>
+<p>The generated kernels stay as they are, with the tuned defaults. The prototype is kept in the repository as a documented experiment.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

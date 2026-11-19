@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dequantising FP8 (E4M3) weights without hardware support: a bit trick that fits in four integer operations - QuantForge Notes</title>
+<meta name="description" content="How FP8 weights were added to the compiler although LLVM 18&#x27;s NVPTX backend has no FP8 type, why the conversion is exact, how it was vectorised, and what it costs.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Dequantising FP8 (E4M3) weights without hardware support: a bit trick that fits in four integer operations</h1><p class="lede">How FP8 weights were added to the compiler although LLVM 18&#x27;s NVPTX backend has no FP8 type, why the conversion is exact, how it was vectorised, and what it costs.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#the-observation">The observation</a></li>
+<li><a href="#it-is-verified-on-all-256-bytes">It is verified on all 256 bytes</a></li>
+<li><a href="#making-it-fast-packed-f16x2">Making it fast: packed f16x2</a></li>
+<li><a href="#what-fp8-costs-and-buys">What FP8 costs and buys</a></li>
+<li><a href="#what-it-does-not-do">What it does not do</a></li>
+</ul>
+</div>
+</details><p>FP8 is the other common 8-bit weight format. <strong>E4M3</strong> has 1 sign bit, 4 exponent bits (bias 7) and 3 mantissa bits, a maximum magnitude of 448, no infinities, and a single NaN encoding (<code>0x7F</code> and <code>0xFF</code>). It keeps relative precision across magnitudes, which suits weights better than a uniform INT8 grid when the values span a wide range.</p>
+<p>The compiler could not use the obvious route. The toolchain here is LLVM / MLIR 18: it has no E4M3 floating-point type in the NVPTX backend and does not expose the <code>cvt.f16x2.e4m3x2</code> instruction of newer PTX. Instead of waiting for a newer LLVM, I looked for a conversion that needs nothing but integer instructions.</p>
+<h2 id="the-observation">The observation<a class="headerlink" href="#the-observation" title="Permanent link">#</a></h2>
+<p>Take the FP8 byte <code>s eeee mmm</code> and consider the 16-bit pattern</p>
+<pre><code class="language-text">f16 bits = (s &lt;&lt; 15) | ((byte &amp; 0x7F) &lt;&lt; 7)
+         = s 0 0 e e e e m m m 0 0 0 0 0 0 0      (bit 15 .. bit 0)
+</code></pre>
+<p>Read as an IEEE half-precision number, the 4 exponent bits of the FP8 value land in the low four bits of the 5-bit f16 exponent field, the 3 mantissa bits land at the top of the 10-bit mantissa field. The exponent bias of f16 is 15 and that of E4M3 is 7, so the half-precision number is</p>
+<pre><code class="language-text">2^(e - 15) * (1 + m/8)  =  2^-8 * 2^(e - 7) * (1 + m/8)
+   (the half-precision number)     (2^-8 times the FP8 value)
+</code></pre>
+<p>that is, <strong>exactly 2^-8 times the FP8 value</strong>. The same holds for subnormals: with <code>e = 0</code> the FP8 value is <code>m/8 * 2^-6</code> and the f16 pattern is a subnormal worth <code>(m * 128 / 1024) * 2^-14 = m/8 * 2^-14</code>, again 2^-8 times the FP8 value. So</p>
+<pre><code class="language-text">value(byte) = bitcast_f16( ((byte &amp; 0x7F) &lt;&lt; 7) | ((byte &amp; 0x80) &lt;&lt; 8) ) * 256
+</code></pre>
+<p>and the multiplication by 256 is exact (the maximum is 448, far below the f16 limit). The group scale is multiplied afterwards, which is the only rounding, so the result is identical to dequantising in higher precision and rounding once.</p>
+<p>Cost: an AND, a shift, an AND, a shift, an OR, a bit-cast, and two multiplications, one of which is by a constant. NaN (<code>0x7F</code>) is read as 480 instead of NaN; quantised weights never contain it.</p>
+<h2 id="it-is-verified-on-all-256-bytes">It is verified on all 256 bytes<a class="headerlink" href="#it-is-verified-on-all-256-bytes" title="Permanent link">#</a></h2>
+<p>A unit test builds the trick in PyTorch for every byte value and compares with <code>torch.float8_e4m3fn</code> conversion: all 254 non-NaN bytes are identical, and <code>0x7F</code> reads as 480.0 as documented. The test lives next to the layout tests of the repository.</p>
+<h2 id="making-it-fast-packed-f16x2">Making it fast: packed f16x2<a class="headerlink" href="#making-it-fast-packed-f16x2" title="Permanent link">#</a></h2>
+<p>The first implementation was the scalar tree above (about 9 integer instructions per weight). The kernels are memory-bound at decode, so at 1 x 4096 x 4096 it already tied INT8 (97 against 100 microseconds). But inside a whole model the small layers are instruction-bound, and the scalar version decoded at 155 tokens/s against INT8's 165 on Qwen2.5-0.5B.</p>
+<p>The existing <code>vectorize-dequant</code> pass, which recognises eight dequantisation trees feeding one vector store and emits packed arithmetic, was extended to recognise the FP8 tree. For two bytes <code>b0, b1</code> it builds a 32-bit word <code>x = b0 | (b1 &lt;&lt; 16)</code> (each byte in its own 16-bit half), then does the AND / shift / OR on <strong>both halves at once</strong>:</p>
+<pre><code class="language-text">mag  = (x &lt;&lt; 7) &amp; 0x3F803F80
+sgn  = (x &lt;&lt; 8) &amp; 0x80008000
+half2 = mag | sgn                       // two f16 values worth 2^-8 times the FP8 values
+w     = (half2 * 256.h2) * scale.h2     // two mul.f16x2
+</code></pre>
+<p>The packed form is <strong>bit-identical</strong> to the scalar form (checked by the end-to-end tests and the sanitizer cases) and brought the whole-model decode back to 165 tokens/s. A FileCheck test asserts that the decode kernel contains no 16-bit shifts (the scalar form has 128 of them), so a future change that breaks the match is caught immediately.</p>
+<h2 id="what-fp8-costs-and-buys">What FP8 costs and buys<a class="headerlink" href="#what-fp8-costs-and-buys" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">INT8</th>
+<th style="text-align: right;">FP8 (E4M3)</th>
+<th>notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>decode kernel 1 x 4096 x 4096</td>
+<td style="text-align: right;">101 us</td>
+<td style="text-align: right;">99 us</td>
+<td>8-bit weights: twice the bytes of INT4</td>
+</tr>
+<tr>
+<td>decode kernel 1 x 4096 x 11008</td>
+<td style="text-align: right;">272 us</td>
+<td style="text-align: right;">271 us</td>
+<td></td>
+</tr>
+<tr>
+<td>prefill 512 x 4096 x 4096</td>
+<td style="text-align: right;">564 us</td>
+<td style="text-align: right;">584 us</td>
+<td>4 percent slower</td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B perplexity (fp16: 19.93)</td>
+<td style="text-align: right;">19.91</td>
+<td style="text-align: right;">20.10</td>
+<td>round-to-nearest, group 128</td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B decode (CUDA graph)</td>
+<td style="text-align: right;">165 tok/s</td>
+<td style="text-align: right;">165 tok/s</td>
+<td>after vectorising</td>
+</tr>
+</tbody>
+</table>
+<p>On this model INT8 and FP8 are equivalent in speed and close in quality, both about 28 percent faster than fp16 (165 against 129 tokens/s) on a model this small. They halve the weight bytes of fp16 rather than quartering them as INT4 does, so INT4 remains the format for speed. FP8 is the format for checkpoints that already ship in it, or when the quality loss of INT4 is unacceptable.</p>
+<h2 id="what-it-does-not-do">What it does not do<a class="headerlink" href="#what-it-does-not-do" title="Permanent link">#</a></h2>
+<p>Only the <em>weights</em> are FP8. The activations stay fp16 and the multiply-accumulate runs on the fp16 Tensor Core path. Using the FP8 Tensor Core of Ada (<code>mma</code> with <code>e4m3</code> operands) to double the arithmetic rate is a different project: it needs FP8 activations, per-tensor activation scales and a way to emit those instructions from LLVM 18. It is not done.</p>
+<p>The FP8 numbers also come from round-to-nearest quantisation of fp16 checkpoints; no FP8 checkpoint from the wild has been run through it yet.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

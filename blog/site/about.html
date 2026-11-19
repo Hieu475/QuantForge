@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About - QuantForge Notes</title>
+<meta name="description" content="Writing a compiler for low-precision LLM kernels: what worked, what did not, and the numbers.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="index.html">QuantForge Notes</a>
+  <nav><a href="index.html">Posts</a><a href="about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><h1>About</h1><p>This blog documents <strong>QuantForge</strong>, an open-source MLIR-based kernel compiler for weight-only quantised LLM inference (W4A16, W8A16 and FP8-weight GEMMs on NVIDIA sm_80+ GPUs), and the experiments around it.</p>
+<h2 id="what-is-in-the-project">What is in the project<a class="headerlink" href="#what-is-in-the-project" title="Permanent link">#</a></h2>
+<ul>
+<li>A <code>qf</code> MLIR dialect (<code>qf.unpack</code>, <code>qf.dequant</code>) and about twenty passes that lower a quantised matmul to PTX: tiling, shared-memory promotion with <code>cp.async</code> pipelines, fusion of the dequantisation into the weight loads, vectorised loads, packed <code>f16x2</code> dequantisation, register-resident accumulators, <code>mma.sync</code> Tensor Core lowering, weight prefetch, fused epilogues.</li>
+<li>A PyTorch custom op (<code>quantforge::w4a16_gemm</code>) with a C++ dispatcher hot path, works under <code>torch.compile</code> and CUDA graphs.</li>
+<li><code>quantforge.nn</code> / <code>quantforge.gptq</code>: quantise any Hugging Face causal LM (RTN or GPTQ) or load real AWQ / GPTQ checkpoints.</li>
+<li>37 FileCheck tests, about 70 GPU end-to-end tests, and a <code>compute-sanitizer</code> (memcheck + racecheck) script that runs 54 pipeline variants.</li>
+</ul>
+<h2 id="how-to-read-the-numbers">How to read the numbers<a class="headerlink" href="#how-to-read-the-numbers" title="Permanent link">#</a></h2>
+<p>All measurements come from <strong>one laptop GPU</strong> (RTX 4050, sm_89, 6 GB) that is also driving a desktop. Clock speeds drift by up to 30 percent between sessions, so ratios measured in the same run (for example against Marlin) are far more trustworthy than absolute times. There are no results yet on data-centre GPUs (A100, H100); that is the biggest open limitation.</p>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">#</a></h2>
+<p>Research prototype. It is useful for experiments and for understanding what a compiler can and cannot do for this class of kernel; it is not a replacement for production inference engines.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

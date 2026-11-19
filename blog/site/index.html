@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuantForge Notes</title>
+<meta name="description" content="Writing a compiler for low-precision LLM kernels: what worked, what did not, and the numbers.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="index.html">QuantForge Notes</a>
+  <nav><a href="index.html">Posts</a><a href="about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<section class="intro"><p>QuantForge is a small compiler, built on MLIR, that generates GPU kernels for <strong>low-precision LLM inference</strong>: INT4, INT8 and FP8 weights multiplied with fp16 activations. These notes are the engineering log of the project: how the kernels are generated, which ideas gave speed-ups, which ones did not, and every number with the method that produced it.</p>
+<p>The headline results on a laptop RTX 4050 are modest and honest: at batch 1 the generated kernels match or beat <a href="https://github.com/IST-DASLab/marlin">Marlin</a>, the hand-written reference, and a 1B-parameter model decodes about 2.2x faster than in fp16. At batch sizes 32 to 256 the kernels are 12 to 33 percent slower than Marlin, and one post explains why with data.</p>
+<p>Start with the overview, or jump to the post on the part you care about.</p></section><h2 class="sec">Posts</h2><ol class="posts"><li><a href="posts/01-overview.html"><span class="pt">QuantForge: generating INT4 / INT8 / FP8 GEMM kernels with MLIR</span></a><span class="pd">2026-11-20</span><p>What the project is, how the compiler pipeline is organised, and the full set of results: kernel time against Marlin, end-to-end decode speed on real models, and correctness evidence.</p></li><li><a href="posts/02-decode-instruction-bound.html"><span class="pt">Why the decode kernel was instruction-bound, and how it went from 53 to 38 microseconds</span></a><span class="pd">2026-11-20</span><p>A performance investigation in four steps: duplicated scale loads, a pass that stopped matching, a magic-number dequantisation, and wave quantisation. Plus the benchmarking pitfalls that nearly fooled me on a laptop GPU.</p></li><li><a href="posts/03-fp8-without-hardware.html"><span class="pt">Dequantising FP8 (E4M3) weights without hardware support: a bit trick that fits in four integer operations</span></a><span class="pd">2026-11-20</span><p>How FP8 weights were added to the compiler although LLVM 18&#x27;s NVPTX backend has no FP8 type, why the conversion is exact, how it was vectorised, and what it costs.</p></li><li><a href="posts/04-mid-batch-postmortem.html"><span class="pt">Why are batches of 32 to 256 slower than Marlin? A post-mortem with a hand-written CUDA prototype</span></a><span class="pd">2026-11-20</span><p>Profiling, ablations and a hand-written Marlin-style kernel to find out what limits the generated kernels at medium batch size. Most hypotheses were wrong, and the negative results are the useful part.</p></li><li><a href="posts/05-gptq-and-checkpoints.html"><span class="pt">Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps</span></a><span class="pd">2026-11-20</span><p>Round-to-nearest INT4 costs 1 to 4 perplexity points. A GPTQ implementation in the library recovers 17 to 65 percent of that, real AWQ and GPTQ checkpoints are loaded and verified, and the things that did not help are listed.</p></li></ol>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

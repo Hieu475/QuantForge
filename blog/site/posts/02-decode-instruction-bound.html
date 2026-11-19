@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why the decode kernel was instruction-bound, and how it went from 53 to 38 microseconds - QuantForge Notes</title>
+<meta name="description" content="A performance investigation in four steps: duplicated scale loads, a pass that stopped matching, a magic-number dequantisation, and wave quantisation. Plus the benchmarking pitfalls that nearly fooled me on a laptop GPU.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Why the decode kernel was instruction-bound, and how it went from 53 to 38 microseconds</h1><p class="lede">A performance investigation in four steps: duplicated scale loads, a pass that stopped matching, a magic-number dequantisation, and wave quantisation. Plus the benchmarking pitfalls that nearly fooled me on a laptop GPU.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#step-0-measure-the-right-thing">Step 0: measure the right thing</a></li>
+<li><a href="#step-1-count-instructions-not-bytes">Step 1: count instructions, not bytes</a></li>
+<li><a href="#step-2-the-scale-loads-that-were-loaded-eight-times">Step 2: the scale loads that were loaded eight times</a></li>
+<li><a href="#step-3-a-pass-that-silently-stopped-matching">Step 3: a pass that silently stopped matching</a></li>
+<li><a href="#step-4-dequantisation-in-two-instructions-per-two-weights">Step 4: dequantisation in two instructions per two weights</a></li>
+<li><a href="#step-5-wave-quantisation-the-last-10-percent">Step 5: wave quantisation, the last 10 percent</a></li>
+<li><a href="#summary">Summary</a></li>
+<li><a href="#a-caveat-about-the-38-microseconds">A caveat about the 38 microseconds</a></li>
+</ul>
+</div>
+</details><p>A batch-1 decode GEMM reads each INT4 weight once, so it should run at the speed of the memory system: for a 4096 x 4096 layer that is 8.4 MB of weights plus 0.5 MB of scales, about 47 microseconds at the 190 GB/s the card's specification allows (a read microbenchmark reached 183 GB/s). The first working kernel needed <strong>53 microseconds</strong>; the final one needs 38 (see the caveat at the end of the post). This post is the story of the missing 15, because the causes were not the ones I first suspected.</p>
+<h2 id="step-0-measure-the-right-thing">Step 0: measure the right thing<a class="headerlink" href="#step-0-measure-the-right-thing" title="Permanent link">#</a></h2>
+<p>Three measurement mistakes would have sent me in the wrong direction; they are worth listing because they apply to any kernel work on a laptop GPU.</p>
+<ol>
+<li><strong>Wall-clock timing hides the kernel.</strong> Launching from Python costs 45 to 270 microseconds, more than the kernel itself. All numbers here are device time from the CUPTI trace (the PyTorch profiler).</li>
+<li><strong>A warm L2 makes the kernel look 2x faster than it is.</strong> The RTX 4050 has 24 MB of L2, so an 8 MB INT4 weight stays resident between benchmark iterations and the benchmark measures the cache. Before every call I flush L2, and in a real model the weights always come from DRAM.</li>
+<li><strong>How you flush matters.</strong> Writing a 256 MB buffer (a <code>memset</code>) leaves dirty lines in L2; their write-back slows the <em>next</em> kernel by 20 to 50 percent. Reading the buffer evicts cleanly. The activations then have to be re-touched, otherwise an M = 16 case looks 20 percent slower than it is, because a harness that happens to copy the activations (to pad them) warms them for free.</li>
+</ol>
+<p>On top of that the GPU shares a desktop and its clocks drift by up to 30 percent between sessions (cuBLAS fp16 reached 25 TFLOP/s in one session and 44 in another). Rule: compare kernels <strong>interleaved in the same run</strong>, never against a number from yesterday.</p>
+<h2 id="step-1-count-instructions-not-bytes">Step 1: count instructions, not bytes<a class="headerlink" href="#step-1-count-instructions-not-bytes" title="Permanent link">#</a></h2>
+<p><code>ncu</code> gives the instruction mix per opcode (<code>sass__inst_executed_per_opcode</code>). For the first kernel it showed about <strong>7.7 thread-instructions per weight</strong>, including one <code>I2F</code> (integer-to-float conversion) per weight. A kernel that must hit memory speed with 8 MB of weights in 45 microseconds has to issue its instructions for 16.7 million weights in that time, on 20 SMs; at 7.7 instructions per weight it simply runs out of issue slots before it runs out of bandwidth. The kernel was <strong>instruction-bound</strong>, not memory-bound.</p>
+<h2 id="step-2-the-scale-loads-that-were-loaded-eight-times">Step 2: the scale loads that were loaded eight times<a class="headerlink" href="#step-2-the-scale-loads-that-were-loaded-eight-times" title="Permanent link">#</a></h2>
+<p>The dequantisation of one 16-byte work item (8 columns) needs eight scales and eight zero points. A pass (<code>vectorize-global-loads</code>) merges those eight scalar loads into one 16-byte load. It did not fire for the larger K tiles, because the index expression that maps a K row to its group (<code>k / 128</code>) was not folded to a constant: it was computed from values the pass did not recognise as bounded. The result was <strong>eight duplicate scale and zero-point loads per iteration</strong>. Fixing the bound analysis (the upper bound was derived from launch block-size arguments instead of from the tile sizes) took 1 x 4096 x 4096 from 53 to 46 microseconds, measured on its own.</p>
+<h2 id="step-3-a-pass-that-silently-stopped-matching">Step 3: a pass that silently stopped matching<a class="headerlink" href="#step-3-a-pass-that-silently-stopped-matching" title="Permanent link">#</a></h2>
+<p>The fix of step 2 had a side effect that cost more than it gained. After it, the scale/zero-point loads of the eight work items of a thread became <em>identical</em> (same address, because the group is the same), so common-subexpression elimination merged them. The vectoriser then replaced only the <strong>first</strong> of the now-identical loads; the packed-dequantisation pass (<code>vectorize-dequant</code>, step 4) pattern-matches "eight consecutive lanes extracted from the same vector load", and for seven of the eight items it no longer saw that shape. They fell back to the scalar path: <code>I2F</code> per weight again.</p>
+<p>Replacing <em>all</em> duplicates of the load fixed it. Measured against the same 53-microsecond baseline, the kernel dropped to <strong>38 microseconds</strong>, below Marlin's 49.4 for the same layer. The lesson is about compilers, not GPUs: a performance property that depends on a chain of pattern-matching passes is fragile, so the project now has a FileCheck test whose only job is to assert that the generated PTX contains no <code>cvt.rn.f16</code> (no scalar int-to-half conversion per weight). It guards exactly the failure described above.</p>
+<h2 id="step-4-dequantisation-in-two-instructions-per-two-weights">Step 4: dequantisation in two instructions per two weights<a class="headerlink" href="#step-4-dequantisation-in-two-instructions-per-two-weights" title="Permanent link">#</a></h2>
+<p>The packed form of the dequantisation is the well-known trick that Marlin uses. A nibble <code>q</code> (0 to 15) placed in the low mantissa bits of the half-precision constant <code>1152 = 0x6480</code> gives <strong>exactly <code>1152 + q</code></strong>, with no conversion instruction. For two weights at once, on a 32-bit register holding two half-precision lanes:</p>
+<pre><code class="language-text">packed  = (nibble_lo) | (nibble_hi &lt;&lt; 16) | 0x64806480        // one LOP3-style combination
+zero'   = (zero byte ^ 0x80) | 0x6400 per lane                  // 1152 + zero_point, built the same way
+diff    = packed - zero'          // sub.f16x2: exact, an integer in [-15, 15]
+weight  = diff * scale            // mul.f16x2: the only rounding
+</code></pre>
+<p>Both operands carry the same offset, the subtraction is exact (integers below 2048), and the single rounding happens in the multiplication, so the result is <strong>bit-identical</strong> to the textbook <code>(q - zero) * scale</code> computed in fp16. Per pair of weights that is one <code>sub.f16x2</code> and one <code>mul.f16x2</code>; the integer instructions around them unpack the nibbles.</p>
+<h2 id="step-5-wave-quantisation-the-last-10-percent">Step 5: wave quantisation, the last 10 percent<a class="headerlink" href="#step-5-wave-quantisation-the-last-10-percent" title="Permanent link">#</a></h2>
+<p>The wide shapes behave differently from 4096 x 4096. A sweep of the grid size against the bandwidth showed:</p>
+<ul>
+<li>when the grid fits in the resident blocks of the GPU (80 blocks of 128 columns at K tile 128 on this card) the kernel reads at <strong>about 183 GB/s</strong>;</li>
+<li>as soon as there is a second, partial wave, it drops to <strong>about 151 GB/s</strong>.</li>
+</ul>
+<p>A 4096 x 11008 layer has 86 column blocks for 80 slots. Two things helped: a smaller K tile (64 rather than 128, which lowers the shared memory per block and lets more blocks be resident) and a <strong>one-tile look-ahead for the weight loads</strong> (<code>prefetch-distance=1</code>: the global loads for the next tile are issued before the current tile is consumed, kept in rotating registers). The look-ahead removed 19 percent on layers with a long K loop. Two tiles of look-ahead or more did nothing: the loads were already early enough, which told me memory-level parallelism was not the limit either (DRAM throughput 146 against a 176 to 200 GB/s ceiling, with the long-scoreboard stalls reduced but the time unchanged).</p>
+<p>Things that were tried and <strong>did not help</strong>: split-K (a layer with K much larger than N only runs 4 percent slower, so there is no big tail to recover), a second shared-memory stage for decode, sinking the dequantisation stores, and wider block tiles (N = 256) to fit the grid in one wave.</p>
+<h2 id="summary">Summary<a class="headerlink" href="#summary" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>change</th>
+<th style="text-align: right;">1 x 4096 x 4096</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>first working kernel</td>
+<td style="text-align: right;">53 us</td>
+</tr>
+<tr>
+<td>fold the group index, one vector load for scale / zero point (alone)</td>
+<td style="text-align: right;">46 us</td>
+</tr>
+<tr>
+<td>replace all duplicated loads so the packed dequantisation matches again (measured against the 53 us kernel)</td>
+<td style="text-align: right;">38 us</td>
+</tr>
+<tr>
+<td>Marlin, same layer</td>
+<td style="text-align: right;">49.4 us</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern was the same each time: <strong>look at the instruction mix first</strong>. Bandwidth arithmetic said the kernel should be at 45 microseconds; only the opcode histogram said why it was not.</p>
+<h2 id="a-caveat-about-the-38-microseconds">A caveat about the 38 microseconds<a class="headerlink" href="#a-caveat-about-the-38-microseconds" title="Permanent link">#</a></h2>
+<p>8.9 MB in 38 microseconds is 235 GB/s, above the 183 GB/s that a pure-read microbenchmark reached and above the card's 190 GB/s specification. Marlin on the same layer under the same method moves its bytes at 180 GB/s. I do not have a complete explanation: the most likely one is that a part of the weights is still served from the 24 MB L2 despite the flush (the flush reads a 256 MB buffer, but the replacement policy is not strictly LRU, and the two kernels touch memory in different orders). So the <em>1.30x</em> at 4096 x 4096 should be read as "at least on par"; the wide shapes (4096 x 11008: 22.5 MB in 139 microseconds, 162 GB/s, 0.91x of Marlin) are the cleaner comparison. This is exactly the kind of thing that an A100 or H100 measurement with a larger, differently managed L2 would clarify.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>
