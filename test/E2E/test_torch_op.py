@@ -213,6 +213,40 @@ def test_no_bias_uses_overwrite_kernel_and_matches_bias_path():
     assert torch.equal(a, b) and _close(a, ref)
 
 
+def test_row_buckets_share_kernels_and_stay_correct():
+    """Calls with different M run the kernel of their row bucket: no kernel (= no compile) per
+    length, results unchanged by the zero padding."""
+    _require_gpu()
+    import time
+    import quantforge.torch_ops as qt
+
+    assert [qt.bucket_rows(m) for m in (1, 16, 17, 64, 65, 128, 129, 300, 4096, 4097, 5000)] == \
+        [16, 16, 64, 64, 128, 128, 256, 384, 4096, 5120, 5120]
+    K, N, G = 256, 192, 64
+    _, packed, scale, zp, _ = _case(1, K, N, G)
+    qt.clear_cache()
+    for M in (1, 3, 7, 16):                                    # one decode kernel for all
+        act, _, _, _, ref = _case(M, K, N, G)
+        assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), M
+    assert len(qt._kernels) == 1, list(qt._kernels)
+    for M in (17, 40, 64):                                     # the 64-row bucket
+        act, _, _, _, ref = _case(M, K, N, G)
+        assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), M
+    assert len(qt._kernels) == 2
+    t = time.time()
+    for M in (65, 100, 128, 129, 200, 256):                    # 128- and 256-row buckets
+        act, _, _, _, ref = _case(M, K, N, G)
+        assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), M
+    assert len(qt._kernels) == 4
+    # a length that falls in an already compiled bucket must not compile anything
+    act = _case(250, K, N, G)[0]
+    t = time.time()
+    qt.w4a16_linear(act, packed, scale, zp, G)
+    torch.cuda.synchronize()
+    assert time.time() - t < 0.5, "an already compiled bucket must not recompile"
+    assert len(qt._kernels) == 4
+
+
 def _unpack(packed):
     lo, hi = packed & 0xF, (packed >> 4) & 0xF
     q = torch.stack((lo, hi), dim=-1).reshape(packed.shape[0], -1)

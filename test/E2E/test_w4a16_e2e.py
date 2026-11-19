@@ -366,6 +366,38 @@ def test_swiglu_validation():
         raise AssertionError(f"{bad} should be rejected")
 
 
+def test_persistent_kernel_cache(monkeypatch=None):
+    """A second compile of the same IR / options is served from the persistent cache (no tool
+    runs, same PTX, kernel still runs); different options or a disabled cache compile again."""
+    _require_gpu()
+    with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as w1, \
+            tempfile.TemporaryDirectory() as w2, tempfile.TemporaryDirectory() as w3:
+        old = os.environ.get("QUANTFORGE_KERNEL_CACHE")
+        os.environ["QUANTFORGE_KERNEL_CACHE"] = cache
+        try:
+            ir = w4a16_gemm_ir(128, 128, 128)
+            first = compile_ir(ir, w1)
+            second = compile_ir(ir, w2)
+            assert not first.cached and second.cached
+            assert first.ptx == second.ptx and second.lib_path.parent.parent == Path(cache)
+            assert not compile_ir(ir, w3, pipeline_opts="smem-stages=1").cached     # other options
+            os.environ["QUANTFORGE_NO_KERNEL_CACHE"] = "1"
+            assert not compile_ir(ir, w3).cached
+            del os.environ["QUANTFORGE_NO_KERNEL_CACHE"]
+            kern = W4A16Gemm.build(128, 128, 128)       # built from the cache entry
+            assert kern.compiled.cached
+            act, q, scale, zp = _inputs(128, 128, 128)
+            out = kern.run(act, pack_int4(q), scale, zp)
+            ref = reference_gemm(act, q, scale, zp)
+            assert (out - ref).abs().max().item() < 1e-4 * ref.abs().max().item() + 1e-3
+        finally:
+            os.environ.pop("QUANTFORGE_NO_KERNEL_CACHE", None)
+            if old is None:
+                os.environ.pop("QUANTFORGE_KERNEL_CACHE", None)
+            else:
+                os.environ["QUANTFORGE_KERNEL_CACHE"] = old
+
+
 def _check_decode(M, K, N):
     act, q, scale, zp = _inputs(M, K, N)
     out = W4A16Gemm.build(M, K, N, decode=True, pad=True).run(act, pack_int4(q), scale, zp)

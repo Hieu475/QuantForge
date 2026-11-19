@@ -137,7 +137,11 @@ The op is registered by a small C++ extension (`runtime/torch_runtime.cpp`, buil
 about 10 s and cached by torch; `QUANTFORGE_NO_CPP=1` or a failed build falls back to the Python
 implementation) that keeps the whole call in C++ and calls back into Python only to compile a new
 shape or for the uncommon cases (K / N padding, per-tensor parameters, unaligned tensors).
-Kernels are compiled per shape on first use and cached; **warm each shape up once before
+Kernels are compiled for a *row bucket* (≤ 16, 64, 128, 256, 384, 512, … 4096, then multiples of 1024; the
+activations are zero-padded to the bucket) on first use, so 24 different prompt lengths need 9 kernels, and the
+compiled libraries are kept in `~/.cache/quantforge/kernels` (key = IR + options + tool binaries + shim source;
+`QUANTFORGE_KERNEL_CACHE` relocates it, `QUANTFORGE_NO_KERNEL_CACHE=1` disables it): a restarted server
+compiles nothing (the test suite takes 4 s instead of 46 s on a warm cache). Kernels are compiled per shape and cached; **warm each shape up once before
 capturing a graph** (module loading is not allowed during capture). `set_autotune(True)` tunes
 the tile options per shape instead of using the default decode schedule.
 Measured 4096 × 4096, weights L2-resident (8 MB < 24 MB L2): op ≈ 52–61 µs per call (eager or

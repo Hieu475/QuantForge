@@ -173,6 +173,34 @@ class Compiled:
     lib_path: Path
     lowered_mlir: Path
     ptx: dict[str, str]
+    cached: bool = False  # True: taken from the persistent kernel cache, nothing was compiled
+
+
+# Persistent cache of compiled kernels: ~/.cache/quantforge/kernels/<key>/ (QUANTFORGE_KERNEL_CACHE
+# relocates it, QUANTFORGE_NO_KERNEL_CACHE=1 disables it). The key hashes everything the result
+# depends on: the IR, the target and pipeline options, the exact tools (path, size, mtime) and the
+# source of the CUDA shim, so a rebuilt compiler never serves a stale kernel.
+_CACHED_FILES = ("libqf_kernel.so", "lowered.mlir")
+
+
+def _kernel_cache_dir() -> Path | None:
+    if os.environ.get("QUANTFORGE_NO_KERNEL_CACHE"):
+        return None
+    return Path(os.environ.get("QUANTFORGE_KERNEL_CACHE",
+                               Path.home() / ".cache" / "quantforge" / "kernels"))
+
+
+def _toolchain_fingerprint() -> str:
+    h = hashlib.sha256()
+    for tool in (_find_quantforge_opt(), _find_llvm_tool("mlir-translate"), _find_llvm_tool("llc")):
+        st = os.stat(tool)
+        h.update(f"{os.path.realpath(tool)}:{st.st_size}:{st.st_mtime_ns};".encode())
+    h.update(RUNTIME_SRC.read_bytes())
+    return h.hexdigest()
+
+
+def _cache_key(ir: str, chip: str, opts: str) -> str:
+    return hashlib.sha256(f"{_toolchain_fingerprint()}\0{chip}\0{opts}\0{ir}".encode()).hexdigest()[:32]
 
 
 def compile_ir(
@@ -182,12 +210,36 @@ def compile_ir(
     pipeline_opts: str = "",
 ) -> Compiled:
     """Run the full pipeline on `ir` and return the shared library + PTX."""
+    opts = f"chip={chip}" + (f" {pipeline_opts}" if pipeline_opts else "")
+    cache_root = _kernel_cache_dir()
+    entry = None
+    if cache_root is not None:
+        entry = cache_root / _cache_key(ir, chip, opts)
+        if all((entry / f).exists() for f in _CACHED_FILES):
+            text = (entry / "lowered.mlir").read_text()
+            return Compiled(entry / "libqf_kernel.so", entry / "lowered.mlir", extract_ptx(text), True)
+    compiled = _compile_ir_uncached(ir, workdir, chip, opts)
+    if entry is not None:
+        try:  # publish atomically: concurrent processes see a complete entry or none
+            tmp = cache_root / f".tmp-{entry.name}-{os.getpid()}"
+            tmp.mkdir(parents=True, exist_ok=True)
+            for f in _CACHED_FILES:
+                shutil.copy2(Path(workdir) / f, tmp / f)
+            try:
+                tmp.rename(entry)
+            except OSError:  # somebody else published the same entry first
+                shutil.rmtree(tmp, ignore_errors=True)
+        except OSError:
+            pass  # a read-only home must not break compilation
+    return compiled
+
+
+def _compile_ir_uncached(ir: str, workdir, chip: str, opts: str) -> Compiled:
     work = Path(workdir)
     work.mkdir(parents=True, exist_ok=True)
     src, lowered = work / "input.mlir", work / "lowered.mlir"
     src.write_text(ir)
 
-    opts = f"chip={chip}" + (f" {pipeline_opts}" if pipeline_opts else "")
     _run([_find_quantforge_opt(), str(src), f"--quantforge-gpu-pipeline={opts}", "-o", str(lowered)])
 
     ll, obj, lib = work / "host.ll", work / "host.o", work / "libqf_kernel.so"

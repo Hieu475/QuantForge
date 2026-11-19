@@ -11,7 +11,9 @@
   graphs: the kernel is launched on the current stream with no synchronisation or allocation of
   its own. Compile / JIT-load happens on the first call of each shape, so **warm every shape up
   once before capturing a graph** (a module load is not allowed during capture).
-* Kernels are built per (M, K, N, group size) and cached; ``M <= 16`` uses the decode schedule.
+* Kernels are built per (row bucket, K, N, group size) and cached (``bucket_rows``: <= 16, 64, 128,
+  256, 384, 512, ... 4096, then multiples of 1024; the call's activations are zero-padded to the bucket);
+  ``M <= 16`` uses the decode schedule, ``M <= 64`` a 64-row tile.
   ``set_autotune(True)`` measures the tile options once per shape (``quantforge.autotune``, cached
   on disk) instead of using the default schedule.
 """
@@ -26,7 +28,7 @@ import torch
 
 from .e2e import W4A16Gemm
 
-__all__ = ["w4a16_linear", "set_autotune", "clear_cache", "CPP_RUNTIME"]
+__all__ = ["w4a16_linear", "set_autotune", "clear_cache", "bucket_rows", "CPP_RUNTIME"]
 
 _DECODE_OPTS = "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1"
 _lock = threading.Lock()
@@ -47,9 +49,28 @@ def clear_cache() -> None:
         _cpp.clear_kernels()
 
 
+# A kernel is compiled for a bucket of row counts, not for every M: a request with M rows runs the
+# kernel of its bucket (activations zero-padded, extra rows dropped), so a server that sees prompt
+# lengths 1..4096 compiles at most len(_BUCKETS) kernels per layer shape instead of one per length.
+# M <= 16 is one decode kernel; the buckets above are multiples of the 64 / 128-row block tiles.
+_BUCKETS = (16, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+_SKINNY_OPTS = ("block-tile-m=64 block-tile-n=128 warp-tile-m=32 warp-tile-n=64 "
+                "block-tile-k=64 smem-stages=1")
+
+
+def bucket_rows(M: int) -> int:
+    """Row count of the kernel that serves a call with M activation rows."""
+    for b in _BUCKETS:
+        if M <= b:
+            return b
+    return -(-M // 1024) * 1024
+
+
 def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
             activation: str = "none", overwrite: bool = False) -> W4A16Gemm:
-    """`overwrite`: a kernel that writes C = A @ W without reading C (no bias; implied by swiglu)."""
+    """The kernel serving M rows (see `bucket_rows`). `overwrite`: a kernel that writes
+    C = A @ W without reading C (no bias; implied by swiglu)."""
+    M = bucket_rows(M)
     key = (M, K, N, group_size, device_index, _autotune, activation, overwrite)
     k = _kernels.get(key)
     if k is not None:
@@ -63,7 +84,7 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
 
                 k = autotune(M, K, N, group_size=g, epilogue=activation, accumulate=not overwrite)
             else:
-                opts = _DECODE_OPTS if M <= 16 else ""
+                opts = _DECODE_OPTS if M <= 16 else _SKINNY_OPTS if M <= 64 else ""
                 k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
                                     epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k
@@ -103,7 +124,9 @@ def _python_impl(
             acc = bias.float().expand(kern.Mp, N).contiguous()
         kern.launch(act, packed, scale, zero_point, acc)
         return acc[:M, :cols].to(x.dtype).reshape(*x.shape[:-1], cols)
-    out = kern.run(x2, packed, scale, zero_point, bias=bias.float() if bias is not None else None)
+    xk = x2 if kern.M == M else torch.nn.functional.pad(x2, (0, 0, 0, kern.M - M))   # rows of its bucket
+    out = kern.run(xk, packed, scale, zero_point,
+                   bias=bias.float() if bias is not None else None)[:M]
     return out.to(x.dtype).reshape(*x.shape[:-1], cols)
 
 

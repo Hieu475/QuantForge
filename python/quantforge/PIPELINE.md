@@ -170,3 +170,13 @@ stream is neither created nor synchronised per call, so a call is an ordinary as
 ordered after the caller's pending work. Per-call wall time of `run` (1 × 4096 × 4096, group-wise):
 211–272 µs before, ~45–50 µs now (kernel 38 µs). An M < 16 call only pads the activations and the
 output (the weights, scales and zero points are not copied).
+
+## Compile cache and row buckets
+
+`compile_ir` publishes `libqf_kernel.so` + `lowered.mlir` under `~/.cache/quantforge/kernels/<key>/`
+(atomic rename, safe for concurrent processes); the key hashes the IR, the target and pipeline
+options, the path / size / mtime of `quantforge-opt`, `mlir-translate` and `llc`, and the source of the
+CUDA shim, so a rebuilt compiler never serves a stale kernel. A compile takes ~0.3 s for a decode kernel
+(more for large prefill tiles); a hit costs a file read. `torch_ops` additionally maps the row count of
+a call to a bucket (`bucket_rows`) so that a server sees a handful of kernels per layer shape, not one
+per prompt length; rows above the real M are zero activations and are dropped.
