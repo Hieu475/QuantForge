@@ -137,12 +137,14 @@ gaps between the dequantisation and the HMMA stream (no software pipelining of t
 by 7 are an f16 whose exponent / mantissa fields are the E4M3 ones, i.e. exactly 2^-8 times the FP8 value
 (subnormals too; LLVM 18's NVPTX has no e4m3 type or `cvt` and none is needed); the sign bit moves to bit 15;
 `x 256` is exact (|w| <= 448) and the group scale is the one rounding. `zero_point` is not read (its loads
-are dead). `W4A16Gemm.build(bits=8, fp8=True)`; the torch op selects it from a `float8_e4m3fn` weight. The
-tree is scalar (no packed f16x2 form yet, ~9 instructions / weight): kernels are memory-bound at decode, so
-1 x 4096 x 4096 is 97 vs 100 us for int8, 1 x 4096 x 11008 278 vs 272 us, prefill 512 x 4096 x 4096 6 % slower;
-in a whole model (Qwen2.5-0.5B, RTN group 128, `hf_quantize_and_run.py --weights fp8`) the small layers are
-instruction-bound: ppl 20.10 (int8 19.91, fp16 19.93), CUDA-graph decode 155 tok/s (int8 165, fp16 129, INT4 ~220 with an
-INT8 head). FP8 is therefore the format for quality / FP8 checkpoints, INT4 for speed.
+are dead). `W4A16Gemm.build(bits=8, fp8=True)`; the torch op selects it from a `float8_e4m3fn` weight.
+`quantforge-vectorize-dequant` recognises the tree and emits the packed form (bytes spread over the two halves of
+an i32, shifts / masks on both halves at once, two f16x2 multiplies; bit-identical to the scalar tree, guarded by
+`gpu_pipeline_fp8.mlir`: no `shl.b16` left, the scalar form has 128 of them in the decode kernel). Speed: decode
+1 x 4096 x 4096 99 vs 101 us for int8, 1 x 4096 x 11008 271 vs 272 us, prefill 512 x 4096 x 4096 4 % slower
+(584 vs 564 us); whole model (Qwen2.5-0.5B, RTN group 128, `hf_quantize_and_run.py --weights fp8`): ppl 20.10
+(int8 19.91, fp16 19.93), CUDA-graph decode 165.5 tok/s (int8 165, fp16 129; the scalar tree gave 155). FP8 and INT8
+cost the same; INT4 is still the speed format (~220 tok/s with an INT8 head).
 
 ## Group-wise quantization
 

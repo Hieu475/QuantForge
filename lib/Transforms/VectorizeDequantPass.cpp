@@ -26,6 +26,12 @@
 //
 // int8 weights (W8A16) use the same form with the weight byte instead of a
 // nibble ((w ^ 0x80) | 0x6400 = 1152 + w).
+//
+// FP8 E4M3 weights (`qf.dequant {fp8}`, lowered by lower-dequant-to-arith to
+//   w = mulf(mulf(bitcast(((b & 0x7F) << 7) | ((b & 0x80) << 8)), 256), s) )
+// are recognised too: two bytes are spread over the halves of an i32, the
+// shifts / masks run on both halves at once, and the two multiplies are
+// f16x2 (the x256 is exact, so the result is bit-identical).
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "quantforge-vectorize-dequant"
@@ -184,6 +190,79 @@ static std::optional<Match> matchTrees(ArrayRef<Value> elems) {
   return m;
 }
 
+/// FP8 trees: elems[j] = mulf(mulf(bitcast(ori(shli(andi(E, 0x7F), 7),
+/// shli(andi(E, 0x80), 8))), 256.0), s_j) with E = extui(W[j]).
+struct Fp8Match {
+  Value bytes; // vector<8xi8>
+  LaneSource scale;
+};
+
+static bool isConstF(Value v, double c) {
+  llvm::APFloat f(0.0);
+  return matchPattern(v, m_ConstantFloat(&f)) && f.convertToDouble() == c;
+}
+
+static std::optional<Fp8Match> matchFp8Trees(ArrayRef<Value> elems) {
+  Value bytes;
+  SmallVector<Value> scales(kLanes);
+  for (int64_t j = 0; j < kLanes; ++j) {
+    Value inner, s;
+    auto isMul = [](Value v) { return v.getDefiningOp<arith::MulFOp>() != nullptr; };
+    if (!matchCommutative<arith::MulFOp>(elems[j], inner, s, isMul))
+      return std::nullopt;
+    auto m256 = inner.getDefiningOp<arith::MulFOp>();
+    Value f;
+    if (isConstF(m256.getRhs(), 256.0))
+      f = m256.getLhs();
+    else if (isConstF(m256.getLhs(), 256.0))
+      f = m256.getRhs();
+    else
+      return std::nullopt;
+    auto bc = f.getDefiningOp<arith::BitcastOp>();
+    if (!bc || !bc.getType().isF16())
+      return std::nullopt;
+    auto orr = bc.getIn().getDefiningOp<arith::OrIOp>();
+    if (!orr)
+      return std::nullopt;
+    // one operand: shli(andi(E, 0x7F), 7), the other shli(andi(E, 0x80), 8)
+    Value e;
+    auto side = [&](Value v, int64_t mask, int64_t sh) {
+      auto shl = v.getDefiningOp<arith::ShLIOp>();
+      if (!shl || !isConst(shl.getRhs(), sh))
+        return false;
+      auto an = shl.getLhs().getDefiningOp<arith::AndIOp>();
+      if (!an)
+        return false;
+      Value x = an.getLhs(), m = an.getRhs();
+      if (!isConst(m, mask))
+        std::swap(x, m);
+      if (!isConst(m, mask))
+        return false;
+      if (e && e != x)
+        return false;
+      e = x;
+      return true;
+    };
+    bool ok = (side(orr.getLhs(), 0x7F, 7) && side(orr.getRhs(), 0x80, 8)) ||
+              (side(orr.getRhs(), 0x7F, 7) && side(orr.getLhs(), 0x80, 8));
+    if (!ok)
+      return std::nullopt;
+    auto ext = e.getDefiningOp<arith::ExtUIOp>();
+    if (!ext || !matchExtract(ext.getIn(), j, bytes))
+      return std::nullopt;
+    scales[j] = s;
+  }
+  auto ty = dyn_cast<VectorType>(bytes.getType());
+  if (!ty || ty.getNumElements() != kLanes || !ty.getElementType().isInteger(8))
+    return std::nullopt;
+  Fp8Match m;
+  m.bytes = bytes;
+  m.scale = collectLanes(scales);
+  if (!m.scale.valid)
+    return std::nullopt;
+  return m;
+}
+
 //===----------------------------------------------------------------------===//
 // Emission
 //===----------------------------------------------------------------------===//
@@ -249,6 +328,22 @@ struct Emitter {
     return asF16x8(pairs);
   }
 
+  /// FP8 E4M3 bytes (vector<8xi8>) -> vector<8xf16> holding 2^-8 x the value (see the header).
+  Value fp8Raw(Value bytes) {
+    SmallVector<Value> pairs;
+    for (Value w : words(bytes)) {
+      for (int h = 0; h < 2; ++h) {
+        // spread bytes (2h, 2h+1) of the word over the two halves: x = b0 | b1 << 16
+        Value ws = shr(w, 16 * h);
+        Value x = ori(andi(ws, 0xFF), andi(shl(ws, 8), 0x00FF0000));
+        Value mag = andi(shl(x, 7), 0x3F803F80);
+        Value sgn = andi(shl(x, 8), 0x80008000);
+        pairs.push_back(ori(mag, sgn));
+      }
+    }
+    return asF16x8(pairs);
+  }
+
   /// Uniform i8 scalar -> splat vector<8xf16> of 1152 + v.
   Value uniformByteMagic(Value z) {
     Value z32 = b.create<arith::ExtUIOp>(loc, i32, z);
@@ -291,6 +386,19 @@ struct VectorizeDequantPass
         return false;
       elems[j] = ins.getSource();
       cur = ins.getDest();
+    }
+    if (std::optional<Fp8Match> f = matchFp8Trees(elems)) {
+      OpBuilder b(store);
+      Emitter e{b, store.getLoc()};
+      Value raw = e.fp8Raw(f->bytes);
+      Value k256 = b.create<arith::ConstantOp>(
+          store.getLoc(),
+          DenseElementsAttr::get(VectorType::get({kLanes}, b.getF16Type()),
+                                 FloatAttr::get(b.getF16Type(), 256.0)));
+      Value exact = b.create<arith::MulFOp>(store.getLoc(), raw, k256);
+      Value w = b.create<arith::MulFOp>(store.getLoc(), exact, e.scaleVec(f->scale));
+      store.getValueToStoreMutable().assign(w);
+      return true;
     }
     std::optional<Match> m = matchTrees(elems);
     if (!m)
