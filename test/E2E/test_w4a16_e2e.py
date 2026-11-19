@@ -373,6 +373,7 @@ def test_persistent_kernel_cache(monkeypatch=None):
     with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as w1, \
             tempfile.TemporaryDirectory() as w2, tempfile.TemporaryDirectory() as w3:
         old = os.environ.get("QUANTFORGE_KERNEL_CACHE")
+        old_off = os.environ.pop("QUANTFORGE_NO_KERNEL_CACHE", None)   # the test needs the cache on
         os.environ["QUANTFORGE_KERNEL_CACHE"] = cache
         try:
             ir = w4a16_gemm_ir(128, 128, 128)
@@ -392,6 +393,8 @@ def test_persistent_kernel_cache(monkeypatch=None):
             assert (out - ref).abs().max().item() < 1e-4 * ref.abs().max().item() + 1e-3
         finally:
             os.environ.pop("QUANTFORGE_NO_KERNEL_CACHE", None)
+            if old_off is not None:
+                os.environ["QUANTFORGE_NO_KERNEL_CACHE"] = old_off
             if old is None:
                 os.environ.pop("QUANTFORGE_KERNEL_CACHE", None)
             else:
