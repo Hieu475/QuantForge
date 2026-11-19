@@ -193,3 +193,15 @@ gate/up already cut the number of Linears per layer from 7 to 4) and costly: no 
 to read only M activation rows (cp.async with a source size of 0 for the missing rows, one kernel per
 M; reading them unpadded faults with `illegal address`), and no convert needs an f16 output memref
 with an f32 accumulator, which the tensor-level IR cannot express without a temporary.
+
+## Profile of a 7B decode step (Mistral-7B-Instruct, RTX 4050)
+
+`torch.profiler` + the Chrome trace (kernel name, grid, duration) of one batch-1 decode step: grid 224
+= the fused gate/up GEMM (N = 28672, 32 calls), 32 = o_proj and down_proj (alternating 54 / 180 us), 48 =
+the fused q/k/v. Per call the kernels reach 165-175 GB/s when measured alone and ~150 GB/s in the model; the
+step is 22 ms of ideal weight traffic, 29 ms measured. The default K tile (64) was the main loss for the
+wide layers (gate/up 447 us vs 364 us with 128, via the torch op); `torch_ops._decode_opts` picks the
+tile by N. In the model the large kernel runs ~8 % slower than alone (385-395 us vs 353-364 us) and shows
+rare 0.5-1.4 ms outliers (another process using the GPU), not clock throttling (sm clock 2565 MHz, no
+throttle flags during the run). Remaining: fp16 `lm_head` (7 % of the step; RTN-quantising it costs
+2.2 perplexity on Qwen2.5-0.5B, a GPTQ-quantised head would not), the 1400 unfused HF kernels (10 %).

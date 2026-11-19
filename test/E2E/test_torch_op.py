@@ -269,6 +269,19 @@ def test_stale_padding_rows_do_not_leak_into_results():
         assert _close(out, ref), M
 
 
+def test_default_decode_schedule_depends_on_width_and_is_correct():
+    """The default M <= 16 schedule uses a 128-wide K tile for wide outputs (N >= 8192) and 64 below;
+    both must be right on a real call."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+
+    assert "block-tile-k=128" in qt._decode_opts(28672) and "block-tile-k=128" in qt._decode_opts(8192)
+    assert "block-tile-k=64" in qt._decode_opts(6144) and "block-tile-k=64" in qt._decode_opts(896)
+    for (K, N, G) in [(256, 8192, 128), (256, 256, 128)]:
+        act, packed, scale, zp, ref = _case(3, K, N, G)
+        assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), (K, N)
+
+
 def _unpack(packed):
     lo, hi = packed & 0xF, (packed >> 4) & 0xF
     q = torch.stack((lo, hi), dim=-1).reshape(packed.shape[0], -1)

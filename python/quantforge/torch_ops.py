@@ -30,7 +30,13 @@ from .e2e import W4A16Gemm
 
 __all__ = ["w4a16_linear", "set_autotune", "clear_cache", "bucket_rows", "CPP_RUNTIME"]
 
-_DECODE_OPTS = "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1"
+def _decode_opts(N: int) -> str:
+    """Default schedule of an M <= 16 call. The K tile is the only knob that matters across LLM layer
+    shapes: 128 wins clearly for wide outputs (N = 14336: +18 %, the fused gate/up N = 28672: +28 %,
+    N = 8192..11008: +2..7 %), 64 for narrow ones (N = 2048: +15 %, N = 6144: +10 %); measured on the
+    RTX 4050 (benchmarks in the commit message). `set_autotune(True)` replaces the rule by a search."""
+    bk = 128 if N >= 8192 else 64
+    return f"decode=true block-tile-n=128 warp-tile-n=16 block-tile-k={bk} smem-stages=1 prefetch-distance=1"
 _lock = threading.Lock()
 _kernels: dict[tuple, W4A16Gemm] = {}
 _autotune = False
@@ -84,7 +90,7 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
 
                 k = autotune(M, K, N, group_size=g, epilogue=activation, accumulate=not overwrite)
             else:
-                opts = _DECODE_OPTS if M <= 16 else _SKINNY_OPTS if M <= 64 else ""
+                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else ""
                 k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
                                     epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k

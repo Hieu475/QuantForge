@@ -226,9 +226,13 @@ A 7 B model fits the 6 GB card too, from a bitsandbytes NF4 checkpoint (`benchma
 dequantises each Linear and re-quantises it to uniform INT4, layer by layer in place, since NF4's
 non-uniform code cannot be fed to an INT4 GEMM): `Mistral-7B-Instruct-v0.3` has wikitext-2 perplexity
 8.366 under bitsandbytes and 8.506 under QuantForge (the extra 0.14 is the second quantisation), 4.2 GB of
-GPU memory (4.8 GB peak), coherent generation. Its batch-1 decode is *slower* than bitsandbytes' own NF4
-kernel: 33 vs 38 tokens/s (CUDA graph: 32), i.e. the kernels sustain ~130 GB/s on the 4096 × 14336 layers
-where bitsandbytes reaches ~155 GB/s.
+GPU memory (4.8 GB peak), coherent generation. Its batch-1 decode matches bitsandbytes' own NF4 kernel:
+37 vs 38 tokens/s with HF `generate` (CUDA graph: 36). One decode step is 29 ms of GPU time: the
+fused gate/up GEMM (4096 → 28672) 13.8 ms, o_proj + down_proj 7.6 ms, q/k/v 2.7 ms, the fp16 `lm_head` 2.1 ms
+and 1400 small non-GEMM kernels 2.9 ms; at 180 GB/s the weights alone would take 22 ms. Profiling that step
+found that the K tile of the default decode schedule matters for wide layers (128 beats 64 by 18 % at
+N = 14336 and 28 % at N = 28672, loses by 10–15 % at N <= 6144), now chosen by the output width
+(32 → 36 tokens/s); an occasional 1.4 ms outlier in a 0.4 ms kernel is another process sharing the GPU.
 
 The kernels reproduce the dense INT4 reference to 0.004 perplexity (logits top-1 agreement 99.6–100 %); the
 gap to fp16 is the round-to-nearest quantiser's. The 3 B and 3.8 B models only run quantised on this
