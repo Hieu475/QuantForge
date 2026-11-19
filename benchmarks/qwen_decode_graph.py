@@ -19,8 +19,11 @@ from qwen_end_to_end import build_variants  # noqa: E402
 
 
 @torch.no_grad()
-def run(model, tok, prompt, steps, max_len=256):
+def run(model, tok, prompt, steps, max_len=256, compile=False):
     from transformers import StaticCache
+
+    if compile:       # inductor fuses the norms / rotary / elementwise kernels of the HF graph (+~10 %)
+        model = torch.compile(model)
 
     ids = tok(prompt, return_tensors="pt").input_ids.cuda()
     T = ids.shape[1]

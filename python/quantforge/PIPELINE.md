@@ -104,8 +104,9 @@ Measured with `ncu` and a micro-kernel that only reads the packed weights (RTX 4
   same kernel). `compare_marlin.py` now re-touches the activations after the flush for every
   kernel.
 
-Untried: stream-K / persistent scheduling for the tail wave; Marlin-style offline repacking (contiguous 16-byte-per-thread reads, dequantisation
-straight into the MMA fragment layout, no shared-memory round trip for B).
+Untried: stream-K / persistent scheduling for the tail wave. Marlin-style offline repacking (contiguous 16-byte-per-thread
+reads, dequantisation straight into the MMA fragment layout, no shared-memory round trip for B) was only prototyped by
+hand in CUDA, see "Small batch" below.
 
 ## Small batch (16 < M ≤ 256)
 
@@ -118,8 +119,21 @@ cache key now carries a candidates version). 16-row block tiles (more blocks, 4x
 and more resident blocks do not help (64 x 1024 x 16384 with 256 blocks takes as long as 64 x 4096 x 4096 with 64): at
 M = 64 `ncu` shows the Tensor pipe 51 % active, issue slots 36 %, DRAM 52 %, stalls spread over `mio_throttle`,
 `math_pipe_throttle`, `wait`, `long_scoreboard`, `barrier` (1.0-1.4 each): the kernel is bound by the shared-memory /
-`ldmatrix` / MMA issue path, not by the weight stream -- Marlin keeps B in registers (dequantised straight into the MMA
-fragments), which is the repacking work listed under "Untried". M = 128 / 256 sweeps (64 / 128-row tiles, warp tiles up to
+`ldmatrix` / MMA issue path, not by the weight stream -- A Marlin-style nibble layout (pair nibble p with p + 4 so that one SHF + one LOP3 unpacks a pair, ~7 instead of ~16
+integer ops per 8 weights; dequantisation is ~60 % of the executed instructions at M = 64) was ablated by emitting
+it with the wrong (but timed) layout: only 3 % at M = 64, 2.6 % at 512 and 1.2 % at 2048 x 4096 x 4096, so the
+integer work of the dequantisation is not what limits these kernels. Marlin keeps B in registers (dequantised straight into the MMA
+fragments), which is the repacking work listed under "Untried".
+
+**Prototype of that design** (`benchmarks/proto/bir_w4a16.cu`, hand-written CUDA, verified against an f32
+reference, RTX 4050, cold weights, 4096 x 4096, group 128): offline repack so that each thread loads 16 B = its
+B fragments of a 64-column strip per k16 step, dequantisation (lop3 + sub.f16x2 + mul.f16x2) straight into the
+`mma.m16n8k16` operands, A through cp.async + ldmatrix, K slices accumulated with atomics. Best of a sweep over
+warps per block (2 / 4 / 8), K slices (1-8), A stages (2-4) and B prefetch distance (2-8): **M = 32: 57.3 us, M = 64:
+75.8 us** -- against the compiler's 58 / 87 us and Marlin's 51 / 59 us. So keeping B in registers is worth ~13 % at
+M = 64 and nothing at M = 32 in a straightforward implementation (254 registers, one warp per scheduler, Tensor-pipe
+bound at ~60 % of its 47 us floor); closing the rest of the gap to Marlin is occupancy / scheduling tuning of a
+hand-written kernel, not something a rewrite of the MLIR smem path would deliver by itself. Not pursued.. M = 128 / 256 sweeps (64 / 128-row tiles, warp tiles up to
 64 x 64) improve only 3 %.
 
 ## Prefill (M ≥ 256)
@@ -169,7 +183,7 @@ staging the B tile, so the scale / zero point of a thread's 8 columns are one
 16-byte + one 8-byte load per work item (`vectorize-loads`). Cost relative to
 per-tensor parameters at 4096³: ~12 % (2048³: ~10 %), decode ~15–20 %.
 Checkpoints in AWQ / GPTQ layout are repacked by `quantforge.quant.from_awq` /
-`from_gptq` (act-order GPTQ is rejected).
+`from_gptq`; act-order (`desc_act`) GPTQ goes through `quant.from_gptq_act_order`, which permutes the rows offline and returns the activation permutation (`perm=` in the torch op).
 
 ## Decode (M ≤ 16)
 

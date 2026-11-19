@@ -106,3 +106,84 @@ def test_quantized_model_under_torch_compile_and_chunked_quantisation():
     from quantforge import quant
     q, s, z = quant.quantize_groupwise(lin.weight.data.t().float().cuda().contiguous(), 128)
     assert torch.equal(a.packed, quant.pack_int4(q)) and torch.equal(a.scale, s) and torch.equal(a.zero, z)
+
+
+def _fake_checkpoint(model, method, act_order, G=64, seed=1):
+    """Quantise every decoder Linear with RTN, write the result in GPTQ / AWQ checkpoint layout (with a
+    scattered g_idx for the layers selected by act_order) and return (tensors, dense reference model)."""
+    from quantforge import quant
+
+    g = torch.Generator().manual_seed(seed)
+    tensors, ref = {}, copy.deepcopy(model)
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear) or name == "lm_head":
+            continue
+        w = mod.weight.data.t().float().contiguous()                 # [K, N]
+        K, N = w.shape
+        q, scale, zero = quant.quantize_groupwise(w, G)
+        deq = (q.float() - zero.float().repeat_interleave(G, 0)) * scale.float().repeat_interleave(G, 0)
+        if method == "awq":
+            qw, qz, sc = quant.to_awq(q, scale, zero)
+        else:
+            if act_order(name):
+                perm = torch.randperm(K, generator=g)                # row perm[i] of the file holds row i
+                q_file, deq_file = torch.empty_like(q), torch.empty_like(deq)
+                q_file[perm], deq_file[perm] = q, deq
+                gi = torch.empty(K, dtype=torch.int32)
+                gi[perm] = (torch.arange(K) // G).to(torch.int32)
+                tensors[f"{name}.g_idx"] = gi
+                q, deq = q_file, deq_file
+            else:
+                tensors[f"{name}.g_idx"] = (torch.arange(K) // G).to(torch.int32)
+            qw, qz, sc = quant.to_gptq(q, scale, zero)
+        tensors.update({f"{name}.qweight": qw, f"{name}.qzeros": qz, f"{name}.scales": sc})
+        if mod.bias is not None:
+            tensors[f"{name}.bias"] = mod.bias.data.clone()
+        ref.get_submodule(name).weight.data = deq.half().t().contiguous()
+    return tensors, ref
+
+
+@pytest.mark.parametrize("method,act_order", [("gptq", False), ("gptq", True), ("awq", False)])
+def test_load_gptq_awq_checkpoint(method, act_order):
+    _require_gpu()
+    import quantforge.nn as qnn
+
+    model = _tiny("qwen2")                                           # with q / k / v biases
+    tensors, ref = _fake_checkpoint(model, method, lambda n: act_order and "down_proj" in n or
+                                    act_order and "q_proj" in n)
+    st = qnn.load_quantized_checkpoint(model, tensors, method)
+    assert st["quantized"] == 2 * 7
+    assert st["act_order"] == (4 if act_order else 0)               # q_proj and down_proj of 2 layers
+    # the q / k / v of a block with an act-order q_proj stay unfused (different input permutations)
+    assert st["fused_qkv"] == (0 if act_order else 2)
+    ids = torch.randint(0, 512, (2, 24), device="cuda")
+    with torch.no_grad():
+        r, f = ref.cuda()(ids).logits.float(), model(ids).logits.float()
+    assert (f - r).abs().max().item() < 5e-3 * r.abs().max().item() + 5e-3
+    if act_order:
+        lin = model.model.layers[0].mlp
+        assert any(isinstance(m, qnn.QuantLinear) and m.perm is not None for m in model.modules())
+    with pytest.raises(ValueError):
+        qnn.load_quantized_checkpoint(_tiny("qwen2"), {"nothing": torch.zeros(1)}, method)
+
+
+@pytest.mark.parametrize("fmt", ["int4", "fp8"])
+def test_phi3_style_stacked_gate_up_is_fused(fmt):
+    transformers = pytest.importorskip("transformers")
+    _require_gpu()
+    import quantforge.nn as qnn
+
+    torch.manual_seed(0)
+    cfg = transformers.Phi3Config(vocab_size=512, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                                  num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=128,
+                                  original_max_position_embeddings=128, pad_token_id=0)
+    model = transformers.Phi3ForCausalLM(cfg).half().eval()
+    ids = torch.randint(0, 512, (2, 24), device="cuda")
+    unfused = copy.deepcopy(model)
+    qnn.quantize_model(unfused, fmt, 64, fuse=False)
+    fused = copy.deepcopy(model)
+    st = qnn.quantize_model(fused, fmt, 64, fuse=True)
+    assert st["fused_mlp"] == 2 and not hasattr(fused.model.layers[0].mlp, "gate_up_proj")
+    with torch.no_grad():
+        u, f = unfused(ids).logits.float(), fused(ids).logits.float()
+    assert (f - u).abs().max().item() < 5e-3 * u.abs().max().item() + 5e-3

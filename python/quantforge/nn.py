@@ -29,7 +29,7 @@ import torch.nn as nn
 from . import quant
 from . import torch_ops as _ops
 
-__all__ = ["QuantLinear", "quantize_model", "FORMATS"]
+__all__ = ["QuantLinear", "quantize_model", "load_quantized_checkpoint", "FORMATS"]
 
 FORMATS = ("int4", "int8", "fp8")
 
@@ -48,7 +48,7 @@ class QuantLinear(nn.Module):
     Buffers: ``packed`` (int8 ``[K, N/2]`` for int4, int8 ``[K, N]`` for int8, ``float8_e4m3fn`` ``[K, N]``
     for fp8), ``scale`` (f16 ``[K/G, N]``), ``zero`` (int8 ``[K/G, N]``) and an optional f16 ``bias``."""
 
-    def __init__(self, packed, scale, zero, bias, group_size: int, fmt: str):
+    def __init__(self, packed, scale, zero, bias, group_size: int, fmt: str, perm=None):
         super().__init__()
         if fmt not in FORMATS:
             raise ValueError(f"fmt must be one of {FORMATS}")
@@ -58,6 +58,7 @@ class QuantLinear(nn.Module):
         self.register_buffer("scale", scale)
         self.register_buffer("zero", zero)
         self.register_buffer("bias", bias)
+        self.register_buffer("perm", perm)      # GPTQ act-order: input columns are gathered with it
 
     @classmethod
     @torch.no_grad()
@@ -94,15 +95,16 @@ class QuantLinear(nn.Module):
 
     @classmethod
     def from_quantized(cls, packed, scale, zero, bias=None, group_size: int | None = None,
-                       fmt: str = "int4") -> "QuantLinear":
-        """Wrap tensors already in QuantForge layout (e.g. from ``quant.from_gptq`` / ``from_awq``)."""
+                       fmt: str = "int4", perm=None) -> "QuantLinear":
+        """Wrap tensors already in QuantForge layout (e.g. from ``quant.from_gptq`` / ``from_awq``;
+        ``perm`` from ``quant.from_gptq_act_order``)."""
         g = group_size or packed.shape[0] // scale.shape[0]
-        return cls(packed, scale, zero, bias, g, fmt)
+        return cls(packed, scale, zero, bias, g, fmt, perm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = x.dtype
         y = _ops.w4a16_linear(x if dt == torch.float16 else x.half(), self.packed, self.scale,
-                              self.zero, self.group_size, self.bias)
+                              self.zero, self.group_size, self.bias, perm=self.perm)
         return y if dt == torch.float16 else y.to(dt)
 
     def dequantized_weight(self) -> torch.Tensor:
@@ -115,11 +117,14 @@ class QuantLinear(nn.Module):
         else:
             q, zero = quant.unpack_int4(self.packed).float(), self.zero
         w = (q - zero.float().repeat_interleave(g, 0)) * self.scale.float().repeat_interleave(g, 0)
-        return w.half().t().contiguous()
+        w = w.half().t().contiguous()                                     # [out, in] in permuted order
+        if self.perm is not None:                                         # back to the original input order
+            w = w[:, torch.argsort(self.perm)]
+        return w
 
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, out_features={self.out_features}, fmt={self.fmt}, "
-                f"group_size={self.group_size}, bias={self.bias is not None}")
+                f"group_size={self.group_size}, bias={self.bias is not None}, act_order={self.perm is not None}")
 
 
 # --------------------------------------------------------------------------- fusion
@@ -202,7 +207,7 @@ class _QuantGatedMLP(nn.Module):
 
 
 def _is_silu(module: nn.Module) -> bool:
-    act = getattr(module, "act_fn", None)
+    act = getattr(module, "act_fn", None) or getattr(module, "activation_fn", None)
     return act is not None and "silu" in type(act).__name__.lower()
 
 
@@ -213,18 +218,34 @@ def _fuse(model: nn.Module) -> tuple[int, int]:
         names = ("q_proj", "k_proj", "v_proj")
         if all(isinstance(getattr(module, n, None), QuantLinear) for n in names):
             ql = [getattr(module, n) for n in names]
-            if len({(m.fmt, m.group_size, m.in_features) for m in ql}) == 1:
+            if len({(m.fmt, m.group_size, m.in_features) for m in ql}) == 1 \
+                    and all(m.perm is None for m in ql):
                 fused = _QuantQKV(*ql)
                 for i, n in enumerate(names):
                     setattr(module, n, _QKVPart(fused, i))
                 n_qkv += 1
+        # Phi-3 style: gate and up stacked in ONE Linear (outputs [gate | up]) -> split, then fuse as below
+        gu = getattr(module, "gate_up_proj", None)
+        if isinstance(gu, QuantLinear) and hasattr(module, "down_proj") and _is_silu(module) \
+                and gu.out_features % 2 == 0 and gu.perm is None and gu.bias is None:
+            half = gu.out_features // 2
+            cols = (half // 2, half // 2) if gu.fmt == "int4" else (half, half)     # packed columns per half
+            parts = [QuantLinear(gu.packed[:, a:a + c].contiguous(), gu.scale[:, h * half:(h + 1) * half].contiguous(),
+                                 gu.zero[:, h * half:(h + 1) * half].contiguous(), None, gu.group_size, gu.fmt)
+                     for h, (a, c) in enumerate(((0, cols[0]), (cols[0], cols[1])))]
+            module.forward = _QuantGatedMLP(parts[0], parts[1], module.down_proj).forward
+            module._qf_mlp = module.forward.__self__
+            del module.gate_up_proj
+            n_mlp += 1
+            continue
         names = ("gate_proj", "up_proj", "down_proj")
         if all(hasattr(module, n) for n in names) and _is_silu(module) \
                 and isinstance(module.gate_proj, QuantLinear) and isinstance(module.up_proj, QuantLinear):
             g, u = module.gate_proj, module.up_proj
             if (g.fmt, g.group_size, g.in_features, g.out_features) == \
                     (u.fmt, u.group_size, u.in_features, u.out_features) \
-                    and not (g.fmt == "int4" and (g.bias is not None or u.bias is not None)):
+                    and not (g.fmt == "int4" and (g.bias is not None or u.bias is not None)) \
+                    and g.perm is None and u.perm is None:
                 module.forward = _QuantGatedMLP(g, u, module.down_proj).forward
                 module._qf_mlp = module.forward.__self__          # keep the fused module's buffers alive
                 del module.gate_proj, module.up_proj
@@ -288,3 +309,71 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
     gc.collect()
     torch.cuda.empty_cache()
     return stats
+
+
+@torch.no_grad()
+def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", fuse: bool = True,
+                              device="cuda", zeros_offset: int = 1, verbose: bool = False) -> dict:
+    """Turn the Linear layers of `model` into :class:`QuantLinear` from an AWQ / GPTQ checkpoint.
+
+    `model` is any (dense) instance of the architecture, e.g. ``AutoModelForCausalLM.from_pretrained(base)``;
+    `tensors` is the checkpoint (a ``.safetensors`` path or a ``{name: tensor}`` dict) with
+    ``<layer>.qweight / qzeros / scales`` (and ``g_idx`` for GPTQ, ``bias`` if the layer has one).
+    ``method``: ``"gptq"`` (4-bit, ``desc_act`` act-order supported through a row permutation) or ``"awq"``
+    (GEMM version, 4-bit). ``zeros_offset``: 1 for classic GPTQ ``checkpoint_format: gptq`` files, 0 for
+    ``gptq_v2``. Non-Linear tensors that exist in both the checkpoint and the model (embeddings, norms)
+    are copied; unquantised Linear layers keep their weights. Returns ``{"quantized": n, "act_order": n,
+    "fused_qkv": n, "fused_mlp": n}``."""
+    if method not in ("gptq", "awq"):
+        raise ValueError("method must be 'gptq' or 'awq'")
+    if isinstance(tensors, (str, bytes)) or hasattr(tensors, "__fspath__"):
+        from safetensors import safe_open
+        f = safe_open(str(tensors), framework="pt", device="cpu")
+        get, keys = f.get_tensor, set(f.keys())
+    else:
+        get, keys = tensors.__getitem__, set(tensors.keys())
+    stats = {"quantized": 0, "act_order": 0}
+    quantised_names = set()
+    for name, mod in list(model.named_modules()):
+        for cname, child in list(mod.named_children()):
+            if not isinstance(child, nn.Linear):
+                continue
+            full = f"{name}.{cname}" if name else cname
+            if f"{full}.qweight" not in keys:
+                continue
+            qw, qz, sc = (get(f"{full}.{k}").to(device) for k in ("qweight", "qzeros", "scales"))
+            perm = None
+            if method == "awq":
+                packed, scale, zero = quant.from_awq(qw, qz, sc)
+            else:
+                gi = get(f"{full}.g_idx").to(device) if f"{full}.g_idx" in keys else None
+                K = qw.shape[0] * 8
+                G = K // sc.shape[0]
+                if gi is not None and not torch.equal(gi.long(), torch.arange(K, device=device) // G):
+                    packed, scale, zero, perm = quant.from_gptq_act_order(qw, qz, sc, gi, zeros_offset)
+                    stats["act_order"] += 1
+                else:
+                    packed, scale, zero = quant.from_gptq(qw, qz, sc, None, zeros_offset)
+            bias = get(f"{full}.bias").to(device, torch.float16) if f"{full}.bias" in keys else (
+                None if child.bias is None else child.bias.data.to(device, torch.float16))
+            setattr(mod, cname, QuantLinear.from_quantized(
+                packed.contiguous(), scale.contiguous(), zero.contiguous(), bias, None, "int4", perm))
+            quantised_names.add(full)
+            stats["quantized"] += 1
+            if verbose:
+                print(f"  {full}: {method} int4 g{packed.shape[0] // scale.shape[0]}")
+            del qw, qz, sc
+    if not stats["quantized"]:
+        raise ValueError("no <layer>.qweight tensors in the checkpoint match a Linear layer of the model")
+    own = model.state_dict()
+    for k in keys:
+        if k in own and not any(k.startswith(q + ".") for q in quantised_names) \
+                and own[k].shape == get(k).shape:
+            own[k].copy_(get(k))
+    stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
+    model.to(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    return stats
+
+

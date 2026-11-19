@@ -152,6 +152,19 @@ out = model.generate(ids.cuda(), max_new_tokens=64)             # the Linears ar
 epilogue) for Llama / Qwen / Mistral style blocks, and works under `torch.compile` and CUDA graphs.
 Layers whose `in_features` is not a multiple of the group size fall back to 64 / 32 / 16 (else stay dense).
 `QuantLinear.from_quantized(packed, scale, zero, ...)` wraps GPTQ / AWQ tensors converted with `quantforge.quant`.
+
+Real AWQ / GPTQ checkpoints go through `load_quantized_checkpoint` (4-bit, group-wise; `desc_act` act-order GPTQ is
+handled with a row permutation, `zeros_offset=0` for `gptq_v2`):
+
+```python
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float16)   # the architecture
+qnn.load_quantized_checkpoint(model, "Qwen2.5-0.5B-Instruct-GPTQ-Int4/model.safetensors", method="gptq")
+```
+
+The embeddings and norms are copied from the checkpoint as well (AWQ folds its activation scales into the norms, so
+the dense base model's norms are *not* the right ones). Checked against a dense twin (same dequantised weights in
+`nn.Linear`) with `benchmarks/hf_load_checkpoint.py`, Qwen2.5-0.5B-Instruct, wikitext-2 16 x 512: GPTQ-Int4 ppl 26.336
+vs 26.335, 59/59 greedy tokens identical, 182 tok/s CUDA-graph decode; AWQ ppl 26.689 vs 26.689, 59/59, 184 tok/s.
 Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (RTN, group 128, wikitext-2 8 x 512,
 CUDA-graph decode on the 6 GB RTX 4050):
 
@@ -160,6 +173,14 @@ CUDA-graph decode on the 6 GB RTX 4050):
 | Qwen2.5-0.5B-Instruct | ppl 19.93, 129 tok/s | 24.09, 183 tok/s | 24.08, 209 tok/s |
 | Qwen2.5-1.5B-Instruct | 13.48, 49 tok/s (3.1 GB) | - | 15.31, 97 tok/s (1.5 GB) |
 | Qwen2.5-3B-Instruct | does not fit in 6 GB | - | 14.29, 61 tok/s (2.5 GB) |
+| Llama-3.2-1B-Instruct | 20.15, 63 tok/s (2.5 GB) | - | 24.42, 142 tok/s (1.3 GB) |
+| OLMo-2-0425-1B-Instruct | 19.32, 60 tok/s (3.0 GB) | - | 21.31, 138 tok/s (1.2 GB) |
+| Phi-3.5-mini-instruct (3.8B) | does not fit in 6 GB | - | 9.62, 2.2 GB (gate_up_proj fused into swiglu; CUDA-graph capture fails inside HF's LongRoPE) |
+
+`--compile` (`torch.compile` of the quantised model before the CUDA-graph capture, which fuses HF's norm / rotary /
+elementwise kernels) adds ~10 % on the 0.5B model (206 -> 226 tok/s, 86 of 96 greedy tokens identical: fp16 rounding
+differs), 4 % on Qwen2.5-1.5B (97 -> 101) and 3 % on Llama-3.2-1B (142 -> 146); the share of those kernels shrinks as
+the GEMMs grow.
 
 (RTN INT4 costs 1-4 perplexity points; quantise with GPTQ / AWQ and wrap the result with
 `QuantLinear.from_quantized` for a better quality.) Layers are quantised in row chunks, so the 150k-row
@@ -284,12 +305,14 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 
 ## Limitations
 
-* **Speed:** 0.85–1.30× Marlin on the RTX 4050 (see above); prefill GEMMs and
-  16 × 4096 × 11008 are at 0.85–0.86×. Not done: stream-K / persistent scheduling (the
-  decode grid is bigger than the resident-block count, see `PIPELINE.md`), Marlin-style
-  offline weight repacking.
-* No split-K (1 × 11008 × 4096 leaves only 64 blocks), no stream-K; the decode schedule
-  uses one 16-row tile (M ≤ 16; larger M uses the 128-row schedule).
+* **Speed:** 0.85–1.30× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050, but only **0.67–0.88× at
+  M = 32 … 256** (see the table above). The gap is not DRAM, tile choice or dequantisation arithmetic (ablated:
+  1–3 %); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 75.8 µs at M = 64 (compiler
+  87, Marlin 59), see `PIPELINE.md` -- closing it needs tuning of a hand-written kernel, which is not done.
+  Also not done: stream-K / persistent scheduling and split-K (the decode grid can exceed the resident-block
+  count, `PIPELINE.md`).
+* Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row
+  tiles (the torch op buckets M and picks them; `autotune` searches them).
 * W4A16, W8A16 and FP8 (E4M3) weights with f16 activations (the torch op picks the kernel from the
   weight: packed INT4 `[K, N/2]`, plain int8 `[K, N]`, or a `torch.float8_e4m3fn` `[K, N]` from
   `quant.quantize_fp8`; 8-bit weights are group-wise only and have no fused swiglu, FP8 ignores the zero

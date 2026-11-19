@@ -24,6 +24,14 @@ from qwen_decode_graph import run as graph_run  # noqa: E402
 from qwen_end_to_end import perplexity  # noqa: E402
 
 
+def graph_speed(m, tok, prompt, compile=False):
+    try:
+        return graph_run(m, tok, prompt, 48, compile=compile)[0]
+    except Exception as e:  # noqa: BLE001 - e.g. Phi-3 LongRoPE reads a GPU scalar during capture (HF, not ours)
+        print(f"  (CUDA-graph decode unavailable: {type(e).__name__})")
+        return float("nan")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -33,6 +41,7 @@ def main():
     ap.add_argument("--head", choices=("none",) + qnn.FORMATS, default="none",
                     help="also quantise the lm_head with this format (group size from --group-size)")
     ap.add_argument("--no-fp16", action="store_true", help="skip the fp16 baseline (does not fit the GPU)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the quantised model before the CUDA-graph decode")
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--seqlen", type=int, default=512)
     ns = ap.parse_args()
@@ -49,7 +58,7 @@ def main():
     res = {}
     if not ns.no_fp16:
         m = load().cuda()
-        res["fp16"] = (perplexity(m, ids, ns.seqlen), graph_run(m, tok, prompt, 48)[0], torch.cuda.memory_allocated())
+        res["fp16"] = (perplexity(m, ids, ns.seqlen), graph_speed(m, tok, prompt), torch.cuda.memory_allocated())
         del m; gc.collect(); torch.cuda.empty_cache()
 
     m = load()
@@ -60,7 +69,7 @@ def main():
     print(f"quantised {st['quantized']} layers to {ns.fmt} in {time.time() - t:.1f} s "
           f"(weights {st['bytes_before'] / 1e9:.2f} -> {st['bytes_after'] / 1e9:.2f} GB; fused qkv {st['fused_qkv']}, "
           f"mlp {st['fused_mlp']}; skipped {len(st['skipped'])})")
-    res[f"quantforge {ns.fmt}"] = (perplexity(m, ids, ns.seqlen), graph_run(m, tok, prompt, 48)[0],
+    res[f"quantforge {ns.fmt}"] = (perplexity(m, ids, ns.seqlen), graph_speed(m, tok, prompt, ns.compile),
                                    torch.cuda.memory_allocated())
     for k, (ppl, tps, mem) in res.items():
         print(f"  {k:16s} ppl {ppl:7.3f}   CUDA-graph decode {tps:6.1f} tok/s   GPU {mem / 1e9:.2f} GB")
