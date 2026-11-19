@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantforge"
+version = "0.0.1"
+description = "MLIR-based generator of W4A16 (INT4 weight) GPU GEMM kernels"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0 WITH LLVM-exception" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest", "torch", "lit"]
+
+[tool.setuptools]
+packages = ["quantforge", "quantforge.runtime"]
+
+[tool.setuptools.package-data]
+"quantforge.runtime" = ["*.c", "*.cpp"]

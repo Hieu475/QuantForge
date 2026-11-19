@@ -1,0 +1,3 @@
+# LLVM/MLIR style. Not enforced in CI yet (existing files predate it):
+#   git clang-format <base>      formats only the lines you changed
+BasedOnStyle: LLVM

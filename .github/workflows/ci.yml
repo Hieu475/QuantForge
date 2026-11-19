@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"   # nightly: GPU job also runs the benchmark regression check
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: 18
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CPU only: build quantforge-opt against the apt LLVM/MLIR 18 and run every
+  # FileCheck test (passes, pipeline structure, PTX text assertions).
+  # ---------------------------------------------------------------------------
+  build-and-lit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3-venv \
+            llvm-${LLVM_VERSION}-dev libmlir-${LLVM_VERSION}-dev mlir-${LLVM_VERSION}-tools
+
+      - name: Install lit
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install lit
+
+      - name: Configure
+        run: PATH="$PWD/.venv/bin:$PATH" cmake --preset ci
+
+      - name: Build
+        run: cmake --build --preset ci
+
+      - name: Test (lit)
+        run: PATH="$PWD/.venv/bin:$PATH" cmake --build build-ci --target check-quantforge
+
+  # ---------------------------------------------------------------------------
+  # Self-hosted runner with an NVIDIA GPU (labels: self-hosted, linux, gpu),
+  # CUDA toolkit in /usr/local/cuda and a Python env with torch + pytest.
+  # Compiles real kernels, runs them, compares with PyTorch, runs the
+  # sanitizers, and (nightly) checks performance against the recorded baseline.
+  # ---------------------------------------------------------------------------
+  gpu:
+    runs-on: [self-hosted, linux, gpu]
+    needs: build-and-lit
+    timeout-minutes: 120
+    env:
+      QUANTFORGE_BUILD_DIR: ${{ github.workspace }}/build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake --preset default
+          cmake --build --preset default
+
+      - name: GPU end-to-end tests
+        run: python3 -m pytest -v
+
+      - name: compute-sanitizer (memcheck + racecheck)
+        run: scripts/sanitize.sh
+
+      - name: Performance regression check (nightly)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          python3 python/quantforge/benchmark.py 1024 2048 4096 "" \
+            --json bench-result.json \
+            --compare benchmarks/baseline_rtx4050_sm89.json --tolerance 0.15
+          python3 python/quantforge/benchmark.py --group-size 128 \
+            --shape 1024x1024x1024 --shape 2048x2048x2048 --shape 4096x4096x4096 "" \
+            --json bench-groupwise.json \
+            --compare benchmarks/baseline_groupwise_rtx4050_sm89.json --tolerance 0.15
+          # decode: --cold flushes the L2 before every call (weights read from DRAM, as in a model)
+          python3 python/quantforge/benchmark.py --cold --group-size 128 \
+            --shape 1x4096x4096 --shape 16x4096x4096 --shape 1x4096x11008 --shape 1x11008x4096 \
+            "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1" \
+            --json bench-decode.json \
+            --compare benchmarks/baseline_decode_rtx4050_sm89.json --tolerance 0.15
+
+      - name: Upload benchmark result
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-result
+          path: |
+            bench-result.json
+            bench-groupwise.json
+            bench-decode.json
+          if-no-files-found: ignore

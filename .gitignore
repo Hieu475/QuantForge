@@ -55,5 +55,13 @@ fix.patch
 compile_commands.json
 
 /out
-README.md
 ROADMAP.md
+
+# lit / test artifacts
+.lit_test_times.txt
+.pytest_cache/
+*.pyc
+__pycache__/
+
+# local build directories (CMake presets use build/)
+/build*/
