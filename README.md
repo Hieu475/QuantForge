@@ -72,7 +72,7 @@ For another LLVM 18 install pass `-DMLIR_DIR=<prefix>/lib/cmake/mlir -DLLVM_DIR=
 ## Test
 
 ```bash
-cmake --build build --target check-quantforge     # 34 FileCheck tests, CPU only
+cmake --build build --target check-quantforge     # 35 FileCheck tests, CPU only
 ctest --test-dir build -L lit                     # same, via CTest
 
 # GPU end-to-end (needs an NVIDIA GPU, CUDA toolkit in /usr/local/cuda or $CUDA_HOME,
