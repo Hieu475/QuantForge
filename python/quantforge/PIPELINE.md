@@ -119,7 +119,11 @@ cache now keys M in finer buckets (≤ 16, 32, …, 4096). Large weights (K x N 
 (`block-tile-k=32 smem-stages=3`) is 8-12 % faster there (and 4 % slower at 4096 x 4096, 10 % slower at
 256 x 11008 x 4096): `torch_ops._prefill_opts` uses it for M >= 512 and K x N >= 2**25, the autotuner has
 it as a candidate. `prefetch-distance=1` does nothing for prefill (0.464 vs 0.467 ms at 512 x 4096 x 4096), and
-64 x 64 / 128 x 64 block tiles, 4 stages and 64-deep K tiles are all slower. Remaining gap to cuBLAS / Marlin: MMA issue
+64 x 64 / 128 x 64 block tiles, 4 stages and 64-deep K tiles are all slower. The cause is L2 locality of the
+plain 2-D grid: `block-swizzle=16` gives the same gain on the large weights (2048 x 4096 x 11008: 5.80 -> 5.19 ms, vs
+5.14 with 3 stages; not additive) and costs 8-14 % at 4096 x 4096. Decode: wider block tiles to fit the grid in one
+wave (`block-tile-n=256`, 43 blocks for N = 11008) do not help (1 x 4096 x 11008: 149 -> 169 us; 1 x 11008 x 4096:
+132 -> 129 us, noise level), 192-wide tiles are 2-4x slower. Remaining gap to cuBLAS / Marlin: MMA issue
 gaps between the dequantisation and the HMMA stream (no software pipelining of the two).
 
 ## Group-wise quantization
