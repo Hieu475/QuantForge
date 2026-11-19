@@ -34,6 +34,7 @@ import quantforge.torch_ops as qt  # noqa: E402
 from qwen_end_to_end import QFMLP, QFQKV, QFQKVPart, perplexity  # noqa: E402
 
 G = 128
+WEIGHTS = "int4"      # decoder weight format: int4 | int8 | fp8 (set from --weights)
 
 
 class QLinear(nn.Module):
@@ -80,16 +81,27 @@ def quantize_linear(lin):
         w = lin.weight.data.to("cuda", torch.float32).t().contiguous()       # [K, N]
     if w.shape[0] % G:
         raise ValueError(f"in_features {w.shape[0]} is not a multiple of the group size {G}")
-    q, scale, zero = quant.quantize_groupwise(w, G)
-    out = (quant.pack_int4(q).cpu(), scale.cpu(), zero.cpu(),
+    if WEIGHTS == "fp8":
+        packed, scale, zero = quant.quantize_fp8(w, G)
+    elif WEIGHTS == "int8":
+        packed, scale, zero = quant.quantize_groupwise_int8(w, G)
+    else:
+        q, scale, zero = quant.quantize_groupwise(w, G)
+        packed = quant.pack_int4(q)
+    out = (packed.cpu(), scale.cpu(), zero.cpu(),
            None if lin.bias is None else lin.bias.data.half().cpu())
-    del w, q
+    del w, packed
     return out
 
 
 def dequantize(packed, scale, zero):
     """Dense fp16 [N, K] weight of a quantised Linear (what the ref variant multiplies with)."""
-    q = quant.unpack_int4(packed).float()
+    if packed.dtype == torch.float8_e4m3fn:
+        q, zero = packed.float(), torch.zeros_like(zero)
+    elif packed.shape[1] == scale.shape[1]:
+        q = packed.float()                              # int8
+    else:
+        q = quant.unpack_int4(packed).float()
     w = (q - zero.float().repeat_interleave(G, 0)) * scale.float().repeat_interleave(G, 0)
     return w.half().t().contiguous()
 
@@ -97,11 +109,13 @@ def dequantize(packed, scale, zero):
 def split_columns(triple, sizes):
     """Split a (packed, scale, zero) triple along N into consecutive column blocks."""
     packed, scale, zero = triple
-    q = quant.unpack_int4(packed)
+    int4 = packed.shape[1] * 2 == scale.shape[1]
+    q = quant.unpack_int4(packed) if int4 else packed
     out, a = [], 0
     for n in sizes:
-        out.append((quant.pack_int4(q[:, a:a + n]).contiguous(), scale[:, a:a + n].contiguous(),
-                    zero[:, a:a + n].contiguous()))
+        part = q[:, a:a + n]
+        out.append((quant.pack_int4(part).contiguous() if int4 else part.contiguous(),
+                    scale[:, a:a + n].contiguous(), zero[:, a:a + n].contiguous()))
         a += n
     return out
 
@@ -194,6 +208,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF id or path of an fp16 causal LM")
     ap.add_argument("--text", required=True, help="wikitext-2 test parquet (column `text`)")
+    ap.add_argument("--weights", choices=("int4", "int8", "fp8"), default="int4",
+                    help="decoder weight format (RTN, group 128); int8 / fp8 use the W8A16 kernels")
     ap.add_argument("--quant-head", type=int, default=0, metavar="GROUP",
                     help="also RTN-quantise the lm_head to INT4 with this group size (0 = keep fp16)")
     ap.add_argument("--head-bits", type=int, choices=(4, 8), default=4,
@@ -205,6 +221,8 @@ def main():
     ap.add_argument("--no-ref", action="store_true", help="skip the dense dequantised reference")
     ap.add_argument("--no-graph", action="store_true", help="skip the CUDA-graph decode speed")
     ns = ap.parse_args()
+    global WEIGHTS
+    WEIGHTS = ns.weights
 
     import pandas as pd
     from transformers import AutoTokenizer

@@ -130,7 +130,10 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
   // INT4: packed [K, N/2]. INT8 (group-wise only): plain int8 [K, N], i.e. as wide as `scale`.
   TORCH_CHECK(group_size == 0 || scale.dim() == 2, "group-wise scale must be [K/G, N]");
   const int64_t N = group_size > 0 ? scale.size(1) : packed.size(1) * 2;
-  const int bits = (group_size > 0 && packed.size(1) == N) ? 8 : 4;
+  // weight kind: 4 = INT4, 8 = int8, 9 = FP8 E4M3 (the kernels read FP8 as raw int8 bytes)
+  const bool fp8 = packed.scalar_type() == at::kFloat8_e4m3fn;
+  const int bits = fp8 ? 9 : ((group_size > 0 && packed.size(1) == N) ? 8 : 4);
+  TORCH_CHECK(!fp8 || group_size > 0, "FP8 weights need group-wise scales");
   const int64_t K = x.size(-1);
   const int64_t M = x.numel() / K;
   c10::cuda::CUDAGuard guard(x.device());
@@ -142,15 +145,16 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
   Kernel k = lookup(M, K, N, group_size, x.device().index(), activation, overwrite, bits);
 
   at::Tensor x2 = x.reshape({M, K}).contiguous();
-  if (!k.hot || !aligned16(x2) || !aligned16(packed) || !aligned16(scale) || !aligned16(zero) ||
-      !packed.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
+  const at::Tensor pk = fp8 ? packed.view(at::kChar) : packed;
+  if (!k.hot || !aligned16(x2) || !aligned16(pk) || !aligned16(scale) || !aligned16(zero) ||
+      !pk.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
     return call_fallback(x, packed, scale, zero, group_size, bias, activation);
 
   at::Tensor act = (k.Mp == M) ? x2 : padded_activations(x2, k.Mp);
   at::Tensor acc = overwrite
                        ? at::empty({k.Mp, N}, x.options().dtype(at::kFloat))
                        : bias->to(at::kFloat).expand({k.Mp, N}).contiguous();
-  Desc2 d0 = describe(act), d1 = describe(packed), d2 = describe(scale), d3 = describe(zero),
+  Desc2 d0 = describe(act), d1 = describe(pk), d2 = describe(scale), d3 = describe(zero),
         d4 = describe(acc), result{};
   k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
   k.fn(&result, &d0, &d1, &d2, &d3, &d4);

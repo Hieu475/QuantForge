@@ -56,6 +56,10 @@ def QF_DequantOp : QF_Op<"dequant", [Pure]> {
     `[i, j]` of a `tensor<KxN>` input with `tensor<(K/G)xN>` parameters uses
     parameter `[i / G, j]`.
 
+    With the `fp8` unit attribute the i8 input holds FP8 E4M3 bit patterns (sign, 4 exponent
+    bits with bias 7, 3 mantissa bits; no infinities, 0x7F / 0xFF are NaN and are read as 480):
+    output = fp8_to_f16(input) * scale. `zero_point` is not used (it must still be passed).
+
     Example:
     ```mlir
     %fp = qf.dequant %int, %scale, %zp : tensor<4096x4096xi8>, tensor<f16>, tensor<i8> -> tensor<4096x4096xf16>
@@ -67,7 +71,8 @@ def QF_DequantOp : QF_Op<"dequant", [Pure]> {
   let arguments = (ins
     AnyTensor:$input,
     AnyTensor:$scale,
-    AnyTensor:$zero_point
+    AnyTensor:$zero_point,
+    UnitAttr:$fp8
   );
   let results = (outs AnyTensor:$output);
   let hasVerifier = 1;

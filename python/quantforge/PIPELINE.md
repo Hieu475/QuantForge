@@ -131,6 +131,19 @@ then all multiply), i.e. at most ~1.2x of headroom (79 % -> ~95 % tensor activit
 cuBLAS at 0.89 / 0.84 of our time. Remaining gap to cuBLAS / Marlin: MMA issue
 gaps between the dequantisation and the HMMA stream (no software pipelining of the two).
 
+## FP8 (E4M3) weights
+
+`qf.dequant %w, %scale, %zp {fp8}` reads the i8 tensor as E4M3 bit patterns: the 7 magnitude bits shifted left
+by 7 are an f16 whose exponent / mantissa fields are the E4M3 ones, i.e. exactly 2^-8 times the FP8 value
+(subnormals too; LLVM 18's NVPTX has no e4m3 type or `cvt` and none is needed); the sign bit moves to bit 15;
+`x 256` is exact (|w| <= 448) and the group scale is the one rounding. `zero_point` is not read (its loads
+are dead). `W4A16Gemm.build(bits=8, fp8=True)`; the torch op selects it from a `float8_e4m3fn` weight. The
+tree is scalar (no packed f16x2 form yet, ~9 instructions / weight): kernels are memory-bound at decode, so
+1 x 4096 x 4096 is 97 vs 100 us for int8, 1 x 4096 x 11008 278 vs 272 us, prefill 512 x 4096 x 4096 6 % slower;
+in a whole model (Qwen2.5-0.5B, RTN group 128, `hf_quantize_and_run.py --weights fp8`) the small layers are
+instruction-bound: ppl 20.10 (int8 19.91, fp16 19.93), CUDA-graph decode 155 tok/s (int8 165, fp16 129, INT4 ~220 with an
+INT8 head). FP8 is therefore the format for quality / FP8 checkpoints, INT4 for speed.
+
 ## Group-wise quantization
 
 `qf.dequant %w, %scale, %zp` with `scale`, `zp : tensor<(K/G) x N>`: element `[k, n]`

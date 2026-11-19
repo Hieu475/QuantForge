@@ -332,7 +332,7 @@ def test_int8_weights_through_the_op_eager_compile_graph():
     w = torch.randn(K, N, generator=g) * 0.05
     q8, scale, zero = quant.quantize_groupwise_int8(w, G)
     q8, scale, zero = q8.cuda(), scale.cuda(), zero.cuda()
-    assert qt.weight_bits(q8, scale, G) == 8
+    assert qt.weight_kind(q8, scale, G) == 8
     deq = (q8.float() - zero.float().repeat_interleave(G, 0)) * scale.float().repeat_interleave(G, 0)
     for M in (1, 7, 40):
         x = torch.randn(M, K, generator=g).half().cuda()
@@ -370,3 +370,45 @@ def test_prefill_default_schedule_for_large_weights_is_correct():
     act, packed, scale, zp, ref = _case(512, 4096, 11008, 128)
     out = qt.w4a16_linear(act, packed, scale, zp, 128)
     assert _close(out, ref)
+
+
+def test_fp8_weights_through_the_op_eager_compile_graph():
+    """FP8 E4M3 weights (torch.float8_e4m3fn [K, N]) select the FP8 kernel."""
+    _require_gpu()
+    import pytest
+    import quantforge.torch_ops as qt
+    from quantforge import quant
+
+    K, N, G = 512, 384, 128
+    g = torch.Generator().manual_seed(7)
+    w = torch.randn(K, N, generator=g) * 0.05
+    w8, scale, zero = quant.quantize_fp8(w, G)
+    # the quantiser is good: FP8 keeps ~2 significant digits (3 mantissa bits)
+    err = ((w8.float() * scale.float().repeat_interleave(G, 0)) - w).abs().max()
+    assert err < 0.07 * w.abs().max()
+    w8, scale, zero = w8.cuda(), scale.cuda(), zero.cuda()
+    assert qt.weight_kind(w8, scale, G) == 9
+    deq = w8.float() * scale.float().repeat_interleave(G, 0)
+    for M in (1, 7, 40, 512):
+        x = torch.randn(M, K, generator=g).half().cuda()
+        ref = x.float() @ deq
+        out = qt.w4a16_linear(x, w8, scale, zero, G)
+        assert out.shape == (M, N) and _close(out, ref), M
+    bias = torch.randn(N, device="cuda", dtype=torch.float16)
+    x = torch.randn(3, K, generator=g).half().cuda()
+    assert _close(qt.w4a16_linear(x, w8, scale, zero, G, bias), x.float() @ deq + bias.float()), "bias"
+    # FP8 and INT8 weights of the same shape must not share a kernel
+    q8, s8, z8 = quant.quantize_groupwise_int8(w, G)
+    deq8 = (q8.float() - z8.float().repeat_interleave(G, 0)) * s8.float().repeat_interleave(G, 0)
+    assert _close(qt.w4a16_linear(x, q8.cuda(), s8.cuda(), z8.cuda(), G), x.float() @ deq8.cuda())
+    assert _close(qt.w4a16_linear(x, w8, scale, zero, G), x.float() @ deq)
+    f = torch.compile(lambda a: qt.w4a16_linear(a, w8, scale, zero, G), fullgraph=True)
+    assert _close(f(x), x.float() @ deq)
+    graph = torch.cuda.CUDAGraph()
+    qt.w4a16_linear(x, w8, scale, zero, G)
+    with torch.cuda.graph(graph):
+        y = qt.w4a16_linear(x, w8, scale, zero, G)
+    graph.replay(); torch.cuda.synchronize()
+    assert _close(y, x.float() @ deq)
+    with pytest.raises(Exception):
+        qt.w4a16_linear(x, w8, scale, zero, G, activation="swiglu")

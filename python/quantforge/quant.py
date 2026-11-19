@@ -84,6 +84,21 @@ def quantize_groupwise_int8(w: torch.Tensor, group_size: int = 128):
     return q.reshape(K, N).to(torch.int8), scale, torch.zeros_like(scale, dtype=torch.int8)
 
 
+def quantize_fp8(w: torch.Tensor, group_size: int = 128):
+    """FP8 (E4M3) quantization of w[K, N] with one f16 scale per group of `group_size` rows of every
+    column: ``w ~ w8.float() * scale`` with the group's absolute maximum mapped to 448.
+
+    Returns (w8 ``torch.float8_e4m3fn`` [K, N], scale f16 [K/G, N], zero int8 [K/G, N] == 0). The zero
+    point is only there to keep the operand list of the GEMM; FP8 dequantisation ignores it."""
+    K, N = w.shape
+    if K % group_size:
+        raise ValueError(f"group_size {group_size} must divide K={K}")
+    g = w.float().reshape(K // group_size, group_size, N)
+    scale = (g.abs().amax(dim=1) / 448.0).clamp(min=1e-8).half()
+    w8 = (g / scale.float().unsqueeze(1)).clamp(-448, 448).reshape(K, N).to(torch.float8_e4m3fn)
+    return w8, scale, torch.zeros_like(scale, dtype=torch.int8)
+
+
 def _unpack_words_along_last(words: torch.Tensor, order=None) -> torch.Tensor:
     """int32 [A, B] -> int32 [A, 8*B]: nibble i of word b is logical column 8*b + order[i]^-1."""
     w = words.to(torch.int64) & 0xFFFFFFFF
@@ -195,7 +210,7 @@ def interleave_gate_up(gate, up):
 
 def concat_columns(*parts):
     """Fuse several projections of the SAME input into one GEMM (e.g. attention q / k / v): the
-    weights are concatenated along N. Each part is (packed [K, N_i/2] int8, scale f16 [K/G, N_i],
+    weights are concatenated along N (INT4, INT8 and FP8 alike). Each part is (packed [K, N_i/2] int8, scale f16 [K/G, N_i],
     zero int8 [K/G, N_i]) in QuantForge layout with the same K and group size, N_i even. Returns
     the same triple for N = sum(N_i); the output of the fused GEMM is the concatenation of the
     outputs (split it with ``out.split([N_1, N_2, ...], -1)``; concatenate the biases the same way).
@@ -204,8 +219,9 @@ def concat_columns(*parts):
         raise ValueError("nothing to concatenate")
     k, g = parts[0][0].shape[0], parts[0][1].shape[0]
     for packed, scale, zero in parts:
+        # INT4 weights are packed two per byte ([K, N/2]); INT8 / FP8 weights are [K, N]
         if packed.shape[0] != k or scale.shape[0] != g or zero.shape != scale.shape \
-                or packed.shape[1] * 2 != scale.shape[1]:
+                or packed.shape[1] * 2 != scale.shape[1] and packed.shape[1] != scale.shape[1]:
             raise ValueError("parts must share K and the group size and have consistent shapes")
     return (torch.cat([p[0] for p in parts], dim=1).contiguous(),
             torch.cat([p[1] for p in parts], dim=1).contiguous(),

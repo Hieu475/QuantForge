@@ -131,24 +131,24 @@ def _m_bucket(M: int) -> str:
     return ">4096"
 
 
-def cache_key(M, K, N, group_size, bits, gpu, acc):
-    return f"{gpu}|w{bits}|g{group_size}|{acc}|M{_m_bucket(M)}|K{K}|N{N}"
+def cache_key(M, K, N, group_size, bits, gpu, acc, fp8=False):
+    return f"{gpu}|w{bits}{'f' if fp8 else ''}|g{group_size}|{acc}|M{_m_bucket(M)}|K{K}|N{N}"
 
 
 def autotune(M: int, K: int, N: int, group_size: int | None = None, bits: int = 4, acc: str = "f32",
              chip: str = "sm_80", retune: bool = False, verbose: bool = False,
              max_candidates: int | None = None, epilogue: str = "none",
-             accumulate: bool = True) -> W4A16Gemm:
+             accumulate: bool = True, fp8: bool = False) -> W4A16Gemm:
     """Best-known kernel for this problem, tuning (and caching) on first use."""
     import torch
 
     gpu = torch.cuda.get_device_name(0)
-    key = cache_key(M, K, N, group_size, bits, gpu, acc)
+    key = cache_key(M, K, N, group_size, bits, gpu, acc, fp8)
     cache = _load()
     if not retune and key in cache:
         return W4A16Gemm.build(M, K, N, group_size=group_size, bits=bits, acc=acc, chip=chip,
                                pad=True, pipeline_opts=cache[key]["opts"], epilogue=epilogue,
-                               accumulate=accumulate)
+                               accumulate=accumulate, fp8=fp8)
 
     g = torch.Generator(device="cuda").manual_seed(0)
     act = (torch.rand(M, K, device="cuda", generator=g) * 2 - 1).half()
@@ -170,7 +170,7 @@ def autotune(M: int, K: int, N: int, group_size: int | None = None, bits: int = 
     for opts in cands:
         try:
             kern = W4A16Gemm.build(M, K, N, group_size=group_size, bits=bits, acc=acc, chip=chip, pad=True,
-                                   pipeline_opts=opts, workdir=tempfile.mkdtemp(prefix="qf_tune_"))
+                                   fp8=fp8, pipeline_opts=opts, workdir=tempfile.mkdtemp(prefix="qf_tune_"))
 
             def call(kern=kern):
                 out.zero_()
@@ -192,4 +192,4 @@ def autotune(M: int, K: int, N: int, group_size: int | None = None, bits: int = 
     cache[key] = {"opts": best, "us": best_t * 1e6, "tried": len(results)}
     _store(cache)
     return W4A16Gemm.build(M, K, N, group_size=group_size, bits=bits, acc=acc, chip=chip, pad=True,
-                           pipeline_opts=best, epilogue=epilogue, accumulate=accumulate)
+                           pipeline_opts=best, epilogue=epilogue, accumulate=accumulate, fp8=fp8)

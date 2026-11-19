@@ -6,7 +6,7 @@ shared-memory staging, cp.async, Tensor Core and barrier logic.
 
     python python/quantforge/smoke.py ["<pipeline options>"] [M K N [group_size [bits]]]
 
-group_size 0 / omitted = per-tensor scale; bits 4 (default) or 8.
+group_size 0 / omitted = per-tensor scale; bits 4 (default), 8, or 9 = FP8 E4M3 weights (group-wise only).
 """
 import re
 import sys
@@ -28,6 +28,11 @@ def main(argv):
     bits = int(argv[6]) if len(argv) > 6 else 4
     lo, hi = (0, 16) if bits == 4 else (-128, 128)
     q = torch.randint(lo, hi, (K, N), device="cuda", dtype=torch.int8, generator=g)
+    fp8 = bits == 9
+    if fp8:   # random E4M3 values (NaN patterns excluded): the bytes are what the kernel reads
+        w8 = ((torch.rand(K, N, device="cuda", generator=g) * 2 - 1) * 400).to(torch.float8_e4m3fn)
+        q = w8.view(torch.int8)
+        assert G, "FP8 weights need group-wise scales"
     if G:
         scale = (torch.rand(K // G, N, device="cuda", generator=g) * 0.1 + 0.01).half()
         zp = torch.randint(0, 16, (K // G, N), device="cuda", dtype=torch.int8, generator=g)
@@ -35,9 +40,12 @@ def main(argv):
         scale = torch.tensor(0.05, device="cuda", dtype=torch.float16)
         zp = torch.tensor(8, device="cuda", dtype=torch.int8)
     kern = W4A16Gemm.build(M, K, N, workdir=tempfile.mkdtemp(), pipeline_opts=opts,
-                           group_size=G, bits=bits, pad=True)
+                           group_size=G, bits=8 if fp8 else bits, fp8=fp8, pad=True)
     out = kern.run(act, pack_int4(q) if bits == 4 else q.contiguous(), scale, zp)
-    ref = reference_gemm(act, q, scale, zp)
+    if fp8:
+        ref = act.float() @ (w8.float() * scale.float().repeat_interleave(G, 0)).half().float()  # f16 weights, as the kernel
+    else:
+        ref = reference_gemm(act, q, scale, zp)
     if "epilogue=swiglu" in opts:
         # the columns of q are gate_0, up_0, gate_1, up_1, ...: the kernel writes silu(gate_j) * up_j
         import torch.nn.functional as F

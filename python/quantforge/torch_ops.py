@@ -8,7 +8,9 @@
   ``zero_point`` int8, either ``[K/G, N]`` (group-wise) or scalars (``group_size=0``, per tensor).
   **W8A16**: a group-wise weight whose ``packed`` is a plain int8 ``[K, N]`` tensor (signed values,
   same scale / zero point layout; ``quant.quantize_groupwise_int8``) selects the 8-bit kernel -- the
-  width is inferred from ``packed.shape[1] == scale.shape[1]``. No swiglu / per-tensor for 8 bit.
+  width is inferred from ``packed.shape[1] == scale.shape[1]``. A ``torch.float8_e4m3fn`` ``[K, N]``
+  weight (``quant.quantize_fp8``) selects the FP8 kernel: ``fp8_to_f16(w) * scale``, the
+  ``zero_point`` argument is ignored (pass zeros). No swiglu / per-tensor for 8 bit.
 * Returns ``act(x @ dequant(W) (+ bias))`` (``activation`` = none | relu | silu | gelu | swiglu, fused) with the dtype of ``x`` (f16); accumulation is f32.
 * Works under ``torch.compile`` (a fake implementation provides the output shape) and in CUDA
   graphs: the kernel is launched on the current stream with no synchronisation or allocation of
@@ -84,8 +86,11 @@ def bucket_rows(M: int) -> int:
     return -(-M // 1024) * 1024
 
 
-def weight_bits(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> int:
-    """4 for packed INT4 [K, N/2], 8 for plain int8 [K, N] (group-wise only)."""
+def weight_kind(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> int:
+    """Weight format: 4 = packed INT4 [K, N/2], 8 = plain int8 [K, N], 9 = FP8 E4M3 ``float8_e4m3fn``
+    [K, N] (the 8 / 9 formats are group-wise only)."""
+    if packed.dtype == torch.float8_e4m3fn:
+        return 9
     return 8 if group_size and packed.shape[1] == scale.shape[1] else 4
 
 
@@ -94,11 +99,11 @@ def _out_cols(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> int
 
 
 def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
-            activation: str = "none", overwrite: bool = False, bits: int = 4) -> W4A16Gemm:
+            activation: str = "none", overwrite: bool = False, kind: int = 4) -> W4A16Gemm:
     """The kernel serving M rows (see `bucket_rows`). `overwrite`: a kernel that writes
     C = A @ W without reading C (no bias; implied by swiglu)."""
     M = bucket_rows(M)
-    key = (M, K, N, group_size, device_index, _autotune, activation, overwrite, bits)
+    key = (M, K, N, group_size, device_index, _autotune, activation, overwrite, kind)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -109,11 +114,12 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
             if _autotune:
                 from .autotune import autotune
 
-                k = autotune(M, K, N, group_size=g, bits=bits, epilogue=activation, accumulate=not overwrite)
+                k = autotune(M, K, N, group_size=g, bits=4 if kind == 4 else 8, fp8=kind == 9,
+                              epilogue=activation, accumulate=not overwrite)
             else:
                 opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS if M <= 64 else _prefill_opts(M, K, N)
-                k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts, bits=bits,
-                                    epilogue=activation, accumulate=not overwrite)
+                k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
+                                    bits=4 if kind == 4 else 8, fp8=kind == 9, epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k
     return k
 
@@ -129,18 +135,20 @@ def _python_impl(
 ) -> torch.Tensor:
     """Reference / fallback implementation (also the hot path when the C++ runtime is unavailable)."""
     K = x.shape[-1]
-    bits = weight_bits(packed, scale, group_size)
+    kind = weight_kind(packed, scale, group_size)
+    if kind == 9:   # the kernels see FP8 as raw bytes
+        packed = packed.view(torch.int8)
     N = _out_cols(packed, scale, group_size)
     swiglu = activation == "swiglu"
     cols = N // 2 if swiglu else N
     if swiglu and bias is not None:
         raise ValueError("activation='swiglu' does not take a bias")
-    if swiglu and bits != 4:
+    if swiglu and kind != 4:
         raise ValueError("activation='swiglu' needs an INT4 weight")
     overwrite = swiglu or bias is None
     x2 = x.reshape(-1, K).contiguous()
     M = x2.shape[0]
-    kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite, bits)
+    kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite, kind)
     if group_size and (kern.Kp, kern.Np) == (K, N) and x2.is_cuda and not (
             x2.data_ptr() % 16 or packed.data_ptr() % 16 or scale.data_ptr() % 16
             or zero_point.data_ptr() % 16) and packed.is_contiguous() and scale.is_contiguous() \
@@ -179,8 +187,8 @@ def _load_cpp_runtime():
         ext = cpp_extension.load(name="quantforge_rt", sources=[str(src)], with_cuda=True,
                                  extra_include_paths=[f"{cuda}/include"], verbose=False)
 
-        def builder(M, K, N, group_size, device_index, activation, overwrite, bits):
-            k = _kernel(M, K, N, group_size, device_index, activation, overwrite, bits)
+        def builder(M, K, N, group_size, device_index, activation, overwrite, kind):
+            k = _kernel(M, K, N, group_size, device_index, activation, overwrite, kind)
             addr = lambda f: ctypes.cast(f, ctypes.c_void_p).value  # noqa: E731
             return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
 

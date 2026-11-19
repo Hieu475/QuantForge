@@ -82,3 +82,29 @@ def test_quantize_groupwise_error_is_small(symmetric):
     assert q.min() >= 0 and q.max() <= 15
     deq = (q.float() - zero.float().repeat_interleave(64, 0)) * scale.float().repeat_interleave(64, 0)
     assert (deq - w).abs().max() <= scale.float().repeat_interleave(64, 0).max() * 0.51 + 1e-3
+
+
+def test_quantize_fp8_roundtrip_and_concat_of_wide_weights():
+    w = torch.randn(256, 64)
+    w8, scale, zero = quant.quantize_fp8(w, 64)
+    assert w8.dtype == torch.float8_e4m3fn and w8.shape == (256, 64) and not zero.any()
+    deq = w8.float() * scale.float().repeat_interleave(64, 0)
+    assert (deq - w).abs().max() <= 0.07 * w.abs().max()          # 3 mantissa bits: <= 2^-4 relative
+    # q / k / v style concatenation works for 8-bit weights ([K, N]) as for INT4 ([K, N/2])
+    parts = [quant.quantize_fp8(torch.randn(256, n), 64) for n in (64, 32, 32)]
+    p, s, z = quant.concat_columns(*parts)
+    assert p.shape == (256, 128) and s.shape == (4, 128) and p.dtype == torch.float8_e4m3fn
+    q8 = [quant.quantize_groupwise_int8(torch.randn(256, n), 64) for n in (64, 32)]
+    assert quant.concat_columns(*q8)[0].shape == (256, 96)
+
+
+def test_fp8_decode_bit_trick_matches_torch_for_all_256_bytes():
+    """The kernel's E4M3 -> f16 conversion (7 magnitude bits << 7, sign to bit 15, x256) equals
+    torch's float8_e4m3fn conversion for every non-NaN byte (0x7F / 0xFF, NaN in E4M3, read as 480)."""
+    b = torch.arange(256, dtype=torch.int32)
+    bits = ((b & 0x7F) << 7) | ((b & 0x80) << 8)
+    f16 = bits.to(torch.int16).view(torch.float16) * torch.tensor(256.0, dtype=torch.float16)
+    ref = b.to(torch.uint8).view(torch.float8_e4m3fn).float()
+    ok = ~torch.isnan(ref)
+    assert torch.equal(f16.float()[ok], ref[ok])
+    assert f16.float()[0x7F].item() == 480.0

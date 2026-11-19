@@ -24,6 +24,10 @@ CASES=(
   "decode=true smem-stages=2|16 256 128 64 4"
   "|128 256 128 64 8"
   "decode=true|16 256 128 0 8"
+  # FP8 E4M3 weights (kind 9)
+  "|128 256 128 64 9"
+  "decode=true|16 512 256 128 9"
+  "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1|16 512 256 128 9"
   # multi-tile weight-load look-ahead (rotating registers; reads past the last tile are clamped,
   # also when the K loop is shorter than the distance), small K tile, fused activations
   "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=2|16 512 256 128 4"

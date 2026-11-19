@@ -5,6 +5,8 @@
 #ifndef QUANTFORGE_DIALECT_QUANTFORGE_QUANTFORGEOPS_H
 #define QUANTFORGE_DIALECT_QUANTFORGE_QUANTFORGEOPS_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"

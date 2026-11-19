@@ -149,6 +149,34 @@ namespace
                     Value scaleVal = args[1]; // f16
                     Value zpVal = args[2];    // i8
 
+                    if (dequantOp.getFp8())
+                    {
+                        // E4M3 -> f16 without a lookup table: the 7 magnitude bits shifted
+                        // left by 7 are an f16 whose exponent field is the E4M3 one (bias 7
+                        // instead of 15) and whose mantissa is the E4M3 one, so the f16 value
+                        // is exactly 2^-8 times the FP8 value (subnormals included); the
+                        // sign bit moves to bit 15. Multiplying by 256 is exact (max 448).
+                        auto i16Ty = b.getI16Type();
+                        Value w = b.create<arith::ExtUIOp>(bodyLoc, i16Ty, intVal);
+                        auto c = [&](int64_t v) {
+                            return b.create<arith::ConstantOp>(
+                                bodyLoc, b.getIntegerAttr(i16Ty, v));
+                        };
+                        Value mag = b.create<arith::ShLIOp>(
+                            bodyLoc, b.create<arith::AndIOp>(bodyLoc, w, c(0x7F)), c(7));
+                        Value sign = b.create<arith::ShLIOp>(
+                            bodyLoc, b.create<arith::AndIOp>(bodyLoc, w, c(0x80)), c(8));
+                        Value bits = b.create<arith::OrIOp>(bodyLoc, mag, sign);
+                        Value f = b.create<arith::BitcastOp>(bodyLoc, f16Ty, bits);
+                        Value k256 = b.create<arith::ConstantOp>(
+                            bodyLoc, b.getFloatAttr(f16Ty, 256.0));
+                        Value exact = b.create<arith::MulFOp>(bodyLoc, f, k256);
+                        b.create<linalg::YieldOp>(
+                            bodyLoc, b.create<arith::MulFOp>(bodyLoc, exact, scaleVal)
+                                         .getResult());
+                        return;
+                    }
+
                     // sitofp i8 → f16
                     Value intFP =
                         b.create<arith::SIToFPOp>(bodyLoc, f16Ty, intVal);

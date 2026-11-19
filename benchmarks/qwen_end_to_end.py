@@ -72,7 +72,7 @@ class QFQKV(nn.Module):
         super().__init__()
         self.packed, self.scale, self.zero = quant.concat_columns(
             *((m.packed, m.scale, m.zero) for m in (q, k, v)))
-        self.sizes = [m.packed.shape[1] * 2 for m in (q, k, v)]
+        self.sizes = [m.scale.shape[1] for m in (q, k, v)]
         biases = [m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=q.packed.device)
                   for m, n in zip((q, k, v), self.sizes)]
         self.bias = torch.cat(biases)
@@ -95,16 +95,24 @@ class QFQKVPart(nn.Module):
 
 
 class QFMLP(nn.Module):
-    """down(silu(gate(x)) * up(x)) as ONE fused GEMM (gate / up weights interleaved by column,
-    silu * up in the epilogue) followed by down_proj."""
+    """down(silu(gate(x)) * up(x)). INT4: ONE fused GEMM (gate / up weights interleaved by column,
+    silu * up in the epilogue) followed by down_proj. INT8 / FP8 weights have no fused-swiglu kernel:
+    gate (with a fused silu epilogue) and up are two GEMMs."""
     def __init__(self, gate, up, down):
         super().__init__()
-        self.packed, self.scale, self.zero = quant.interleave_gate_up(
-            (gate.packed, gate.scale, gate.zero), (up.packed, up.scale, up.zero))
+        self.fused = gate.packed.shape[1] * 2 == gate.scale.shape[1]            # INT4
+        if self.fused:
+            self.packed, self.scale, self.zero = quant.interleave_gate_up(
+                (gate.packed, gate.scale, gate.zero), (up.packed, up.scale, up.zero))
+        else:
+            self.gate, self.up = gate, up
         self.down_proj = down
 
     def forward(self, x):
-        return self.down_proj(qt.w4a16_linear(x, self.packed, self.scale, self.zero, G, None, "swiglu"))
+        if self.fused:
+            return self.down_proj(qt.w4a16_linear(x, self.packed, self.scale, self.zero, G, None, "swiglu"))
+        g = qt.w4a16_linear(x, self.gate.packed, self.gate.scale, self.gate.zero, G, None, "silu")
+        return self.down_proj(g * self.up(x))
 
 
 def load_model(base, device):

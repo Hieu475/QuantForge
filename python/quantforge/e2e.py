@@ -62,7 +62,8 @@ def tile_sizes(pipeline_opts: str = "") -> tuple[int, int, int]:
 
 
 def w4a16_gemm_ir(M: int, K: int, N: int, name: str = "w4a16_gemm", acc: str = "f32",
-                  group_size: int | None = None, pipeline_opts: str = "", bits: int = 4) -> str:
+                  group_size: int | None = None, pipeline_opts: str = "", bits: int = 4,
+                  fp8: bool = False) -> str:
     """qf-dialect IR for  C[M,N] += A[M,K](f16) @ dequant(unpack(Wp[K,N/2])).
 
     `bits`=8: the weights are plain int8 [K,N] (W8A16, no unpack): C += A @ dequant(W).
@@ -82,6 +83,8 @@ def w4a16_gemm_ir(M: int, K: int, N: int, name: str = "w4a16_gemm", acc: str = "
         st, zt = f"tensor<{K // group_size}x{N}xf16>", f"tensor<{K // group_size}x{N}xi8>"
     if bits not in (4, 8):
         raise ValueError("bits must be 4 or 8")
+    if fp8 and bits != 8:
+        raise ValueError("fp8 weights are 8-bit")
     wcols = N // 2 if bits == 4 else N
     unpack = (f"%w = qf.unpack %wp : tensor<{K}x{wcols}xi8> -> tensor<{K}x{N}xi8>"
               if bits == 4 else "")
@@ -90,7 +93,7 @@ def w4a16_gemm_ir(M: int, K: int, N: int, name: str = "w4a16_gemm", acc: str = "
                       %scale: {st}, %zp: {zt},
                       %c: tensor<{M}x{N}x{acc}>) -> tensor<{M}x{N}x{acc}> {{
   {unpack}
-  %wf = qf.dequant {wsrc}, %scale, %zp : tensor<{K}x{N}xi8>, {st}, {zt} -> tensor<{K}x{N}xf16>
+  %wf = qf.dequant {wsrc}, %scale, %zp {"{fp8}" if fp8 else ""} : tensor<{K}x{N}xi8>, {st}, {zt} -> tensor<{K}x{N}xf16>
   %r = linalg.matmul ins(%act, %wf : tensor<{M}x{K}xf16>, tensor<{K}x{N}xf16>) outs(%c : tensor<{M}x{N}x{acc}>) -> tensor<{M}x{N}x{acc}>
   return %r : tensor<{M}x{N}x{acc}>
 }}
@@ -351,7 +354,8 @@ class W4A16Gemm:
     def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80",
               acc: str = "f32", pipeline_opts: str = "", pad: bool = False,
               group_size: int | None = None, decode: bool = False,
-              bits: int = 4, epilogue: str = "none", accumulate: bool = True) -> "W4A16Gemm":
+              bits: int = 4, epilogue: str = "none", accumulate: bool = True,
+              fp8: bool = False) -> "W4A16Gemm":
         """`decode=True` selects the skinny-M schedule (M <= 16 per tile, see PIPELINE.md);
         use it with pad=True for M = 1..16.
 
@@ -364,6 +368,9 @@ class W4A16Gemm:
         bias / residual). `epilogue="swiglu"` (implies accumulate=False): the fused MLP gate/up:
         the weights hold gate and up interleaved by column (`quant.interleave_gate_up`) and the
         result is silu(A @ W_gate) * (A @ W_up), shape [M, N/2].
+
+        `fp8`=True (with bits=8): the weights are FP8 E4M3 bit patterns held in an int8 [K, N] tensor;
+        dequantisation is fp8_to_f16(w) * scale (the zero point operand is ignored).
 
         `group_size` None: per-tensor scale / zero point; G: group-wise along K
         (scale f16[K/G, N], zero point i8[K/G, N]; G must divide K)."""
@@ -389,10 +396,10 @@ class W4A16Gemm:
         if group_size is not None and K % group_size:
             raise ValueError(f"group_size {group_size} must divide K={K}")
         Mp, Kp, Np = padded_shape(M, K, N, group_size, pipeline_opts) if pad else (M, K, N)
-        ir = w4a16_gemm_ir(Mp, Kp, Np, f"w{bits}a16_gemm", acc, group_size, pipeline_opts, bits)
+        ir = w4a16_gemm_ir(Mp, Kp, Np, f"w{bits}a16_gemm", acc, group_size, pipeline_opts, bits, fp8)
         if workdir is None:
             key = hashlib.sha1(
-                f"{Mp}x{Kp}x{Np}:{chip}:{acc}:{pipeline_opts}:g{group_size}:b{bits}".encode()
+                f"{Mp}x{Kp}x{Np}:{chip}:{acc}:{pipeline_opts}:g{group_size}:b{bits}{'f8' if fp8 else ''}".encode()
             ).hexdigest()[:10]
             workdir = Path(tempfile.gettempdir()) / f"quantforge_e2e_{key}"
         kern = cls(M, K, N, compile_ir(ir, workdir, chip, pipeline_opts), acc, (Mp, Kp, Np),

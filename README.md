@@ -72,7 +72,7 @@ For another LLVM 18 install pass `-DMLIR_DIR=<prefix>/lib/cmake/mlir -DLLVM_DIR=
 ## Test
 
 ```bash
-cmake --build build --target check-quantforge     # 35 FileCheck tests, CPU only
+cmake --build build --target check-quantforge     # 36 FileCheck tests, CPU only
 ctest --test-dir build -L lit                     # same, via CTest
 
 # GPU end-to-end (needs an NVIDIA GPU, CUDA toolkit in /usr/local/cuda or $CUDA_HOME,
@@ -249,7 +249,10 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   offline weight repacking.
 * No split-K (1 × 11008 × 4096 leaves only 64 blocks), no stream-K; the decode schedule
   uses one 16-row tile (M ≤ 16; larger M uses the 128-row schedule).
-* W4A16 and W8A16 (the torch op picks the 8-bit kernel when `packed` is a plain int8 `[K, N]`; no swiglu / per-tensor for 8 bit); no FP8, NF4, activation quantization. Act-order GPTQ (`desc_act=True`)
+* W4A16, W8A16 and FP8 (E4M3) weights with f16 activations (the torch op picks the kernel from the
+  weight: packed INT4 `[K, N/2]`, plain int8 `[K, N]`, or a `torch.float8_e4m3fn` `[K, N]` from
+  `quant.quantize_fp8`; 8-bit weights are group-wise only and have no fused swiglu, FP8 ignores the zero
+  point). No NF4, no activation quantization (FP8 *activations* / FP8 tensor cores are not used). Act-order GPTQ (`desc_act=True`)
   works through `quant.from_gptq_act_order` (rows permuted offline, `perm=` in `w4a16_linear`
   gathers the activations: one extra small kernel per call).
   Zero points are stored unpacked (`int8 [K/G, N]`); AWQ / GPTQ checkpoints are repacked
