@@ -48,7 +48,12 @@ class QLinear(nn.Module):
 
 def quantize_linear(lin):
     """(packed, scale, zero, bias) of an nn.Linear, quantised on the GPU, results kept on the CPU."""
-    w = lin.weight.data.to("cuda", torch.float32).t().contiguous()           # [K, N]
+    state = getattr(lin.weight, "quant_state", None)
+    if state is not None:                      # bitsandbytes NF4 / FP4 weight: dequantise first
+        import bitsandbytes as bnb
+        w = bnb.functional.dequantize_4bit(lin.weight.data, state).to("cuda", torch.float32).t().contiguous()
+    else:
+        w = lin.weight.data.to("cuda", torch.float32).t().contiguous()       # [K, N]
     if w.shape[0] % G:
         raise ValueError(f"in_features {w.shape[0]} is not a multiple of the group size {G}")
     q, scale, zero = quant.quantize_groupwise(w, G)
@@ -130,7 +135,9 @@ def apply_qf(model, qp, fuse_qkv=True):
         else:
             gate, up = mods["mlp.gate_proj"], mods["mlp.up_proj"]
         layer.mlp = QFMLP(gate, up, mods["mlp.down_proj"])
-        torch.cuda.empty_cache()
+        del cuda, mods, gate, up
+        gc.collect()          # the replaced modules sit in reference cycles: free their weights NOW,
+        torch.cuda.empty_cache()   # not at some later collection (a 7B NF4 model leaves no VRAM to spare)
 
 
 def load(name, dtype=torch.float16):

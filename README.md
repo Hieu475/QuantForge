@@ -222,6 +222,14 @@ tokens, RTX 4050 laptop (6 GB):
 | Llama-3.2-3B-Instruct | does not fit | – | 18.544 | – | – → 55 |
 | Phi-3.5-mini-instruct (3.8 B) | does not fit | – | 9.618 | – | – (HF generate: 54) |
 
+A 7 B model fits the 6 GB card too, from a bitsandbytes NF4 checkpoint (`benchmarks/hf_bnb_to_quantforge.py`
+dequantises each Linear and re-quantises it to uniform INT4, layer by layer in place, since NF4's
+non-uniform code cannot be fed to an INT4 GEMM): `Mistral-7B-Instruct-v0.3` has wikitext-2 perplexity
+8.366 under bitsandbytes and 8.506 under QuantForge (the extra 0.14 is the second quantisation), 4.2 GB of
+GPU memory (4.8 GB peak), coherent generation. Its batch-1 decode is *slower* than bitsandbytes' own NF4
+kernel: 33 vs 38 tokens/s (CUDA graph: 32), i.e. the kernels sustain ~130 GB/s on the 4096 × 14336 layers
+where bitsandbytes reaches ~155 GB/s.
+
 The kernels reproduce the dense INT4 reference to 0.004 perplexity (logits top-1 agreement 99.6–100 %); the
 gap to fp16 is the round-to-nearest quantiser's. The 3 B and 3.8 B models only run quantised on this
 card: 3.1 / 3.2 / 2.6 GB of GPU memory at peak (their fp16 weights are 5.6 – 7.3 GB). Phi-3.5's CUDA-graph
