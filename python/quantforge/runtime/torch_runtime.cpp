@@ -1,0 +1,152 @@
+// C++ hot path of `torch.ops.quantforge.w4a16_gemm`.
+//
+// The Python version of the op costs ~60 us of interpreter time per call (custom_op machinery,
+// shape checks, memref descriptors), which is more than the kernel itself for the small layers of
+// a 0.5B model. This extension registers the same op in the dispatcher and keeps the whole hot
+// path in C++: look the compiled kernel up by shape, pad the activations, start the accumulator,
+// build the five memref descriptors on the stack, call the generated `_mlir_ciface_*` function on
+// the current stream, slice + convert the result.
+//
+// Python is called back only to (a) build / load a kernel for a shape seen for the first time
+// (`builder`) and (b) for the cases the hot path does not cover (`fallback`: K or N needing
+// padding, per-tensor parameters, unaligned tensors).
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+
+namespace py = pybind11;
+
+namespace {
+
+struct Kernel {
+  void (*fn)(void *, void *, void *, void *, void *, void *) = nullptr;
+  void (*set_stream)(void *) = nullptr;
+  int64_t Mp = 0, Kp = 0, Np = 0;
+  bool hot = false; // K and N need no padding
+};
+
+using Key = std::tuple<int64_t, int64_t, int64_t, int64_t, int, std::string, bool>;
+struct KeyHash {
+  size_t operator()(const Key &k) const {
+    size_t h = std::hash<std::string>()(std::get<5>(k));
+    auto mix = [&](int64_t v) { h = h * 1000003u ^ std::hash<int64_t>()(v); };
+    mix(std::get<0>(k)); mix(std::get<1>(k)); mix(std::get<2>(k));
+    mix(std::get<3>(k)); mix(std::get<4>(k)); mix(std::get<6>(k) ? 1 : 0);
+    return h;
+  }
+};
+
+std::mutex g_mutex;
+std::unordered_map<Key, Kernel, KeyHash> g_kernels;
+py::object *g_builder = nullptr;  // (M, K, N, group, device, activation) -> (fn, set_stream, Mp, Kp, Np)
+py::object *g_fallback = nullptr; // the Python implementation
+
+struct Desc2 { // MLIR memref descriptor, rank 2
+  void *allocated;
+  void *aligned;
+  int64_t offset;
+  int64_t sizes[2];
+  int64_t strides[2];
+};
+
+inline Desc2 describe(const at::Tensor &t) {
+  return {t.data_ptr(), t.data_ptr(), 0, {t.size(0), t.size(1)}, {t.stride(0), t.stride(1)}};
+}
+
+inline bool aligned16(const at::Tensor &t) { return (reinterpret_cast<uintptr_t>(t.data_ptr()) & 15) == 0; }
+
+Kernel lookup(int64_t M, int64_t K, int64_t N, int64_t group, int device, const std::string &act,
+              bool overwrite) {
+  Key key{M, K, N, group, device, act, overwrite};
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_kernels.find(key);
+    if (it != g_kernels.end())
+      return it->second;
+  }
+  py::gil_scoped_acquire gil; // first use of this shape: compile / load it in Python
+  py::tuple r = (*g_builder)(M, K, N, group, device, act, overwrite);
+  Kernel k;
+  k.fn = reinterpret_cast<decltype(k.fn)>(r[0].cast<uintptr_t>());
+  k.set_stream = reinterpret_cast<decltype(k.set_stream)>(r[1].cast<uintptr_t>());
+  k.Mp = r[2].cast<int64_t>();
+  k.Kp = r[3].cast<int64_t>();
+  k.Np = r[4].cast<int64_t>();
+  k.hot = group > 0 && k.Kp == K && k.Np == N;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_kernels[key] = k;
+  return k;
+}
+
+at::Tensor call_fallback(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
+                         const at::Tensor &zero, int64_t group, const c10::optional<at::Tensor> &bias,
+                         const std::string &act) {
+  py::gil_scoped_acquire gil;
+  py::object out = (*g_fallback)(x, packed, scale, zero, group, bias, act);
+  return out.cast<at::Tensor>();
+}
+
+at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
+                      const at::Tensor &zero, int64_t group_size, const c10::optional<at::Tensor> &bias,
+                      std::string activation) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "x must be a float16 CUDA tensor");
+  TORCH_CHECK(x.dim() >= 1 && packed.dim() == 2, "bad shapes");
+  const int64_t K = x.size(-1), N = packed.size(1) * 2;
+  const int64_t M = x.numel() / K;
+  c10::cuda::CUDAGuard guard(x.device());
+  const bool swiglu = activation == "swiglu";
+  TORCH_CHECK(!(swiglu && bias.has_value()), "activation='swiglu' does not take a bias");
+  const bool overwrite = swiglu || !bias.has_value(); // the kernel need not read C
+  const int64_t cols = swiglu ? N / 2 : N;
+  Kernel k = lookup(M, K, N, group_size, x.device().index(), activation, overwrite);
+
+  at::Tensor x2 = x.reshape({M, K}).contiguous();
+  if (!k.hot || !aligned16(x2) || !aligned16(packed) || !aligned16(scale) || !aligned16(zero) ||
+      !packed.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
+    return call_fallback(x, packed, scale, zero, group_size, bias, activation);
+
+  at::Tensor act = (k.Mp == M) ? x2 : at::constant_pad_nd(x2, {0, 0, 0, k.Mp - M});
+  at::Tensor acc = overwrite
+                       ? at::empty({k.Mp, N}, x.options().dtype(at::kFloat))
+                       : bias->to(at::kFloat).expand({k.Mp, N}).contiguous();
+  Desc2 d0 = describe(act), d1 = describe(packed), d2 = describe(scale), d3 = describe(zero),
+        d4 = describe(acc), result{};
+  k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
+  k.fn(&result, &d0, &d1, &d2, &d3, &d4);
+
+  std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
+  shape.back() = cols;
+  return acc.narrow(0, 0, M).narrow(1, 0, cols).to(x.scalar_type()).reshape(shape);
+}
+
+void set_python_hooks(py::object builder, py::object fallback) {
+  delete g_builder;
+  delete g_fallback;
+  g_builder = new py::object(std::move(builder));   // intentionally leaked at exit
+  g_fallback = new py::object(std::move(fallback));
+}
+
+void clear_kernels() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_kernels.clear();
+}
+
+} // namespace
+
+TORCH_LIBRARY(quantforge, m) {
+  m.def("w4a16_gemm(Tensor x, Tensor packed, Tensor scale, Tensor zero_point, int group_size, "
+        "Tensor? bias=None, str activation=\"none\") -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(quantforge, CUDA, m) { m.impl("w4a16_gemm", &w4a16_gemm); }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("set_python_hooks", &set_python_hooks);
+  m.def("clear_kernels", &clear_kernels);
+}
