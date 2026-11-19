@@ -135,6 +135,26 @@ kern = W4A16Gemm.build(M=1, K=4096, N=11008, group_size=128, decode=True, pad=Tr
 kern = autotune.autotune(M=1, K=4096, N=11008, group_size=128)
 ```
 
+### Quantise a whole model
+
+```python
+import torch, quantforge.nn as qnn
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", dtype=torch.float16)
+stats = qnn.quantize_model(model, fmt="int4", group_size=128)   # int4 | int8 | fp8, RTN, layer by layer on the GPU
+qnn.quantize_model(model, "int8", only=("lm_head",), fuse=False)  # optional: a lossless INT8 head (+2-16 % decode)
+out = model.generate(ids.cuda(), max_new_tokens=64)             # the Linears are QuantLinear modules now
+```
+
+`quantize_model` replaces every `nn.Linear` (the `lm_head` stays dense unless asked) with
+`quantforge.nn.QuantLinear`, fuses q / k / v into one GEMM and a SiLU-gated MLP into gate + up (swiglu
+epilogue) for Llama / Qwen / Mistral style blocks, and works under `torch.compile` and CUDA graphs.
+Layers whose `in_features` is not a multiple of the group size fall back to 64 / 32 / 16 (else stay dense).
+`QuantLinear.from_quantized(packed, scale, zero, ...)` wraps GPTQ / AWQ tensors converted with `quantforge.quant`.
+Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (Qwen2.5-0.5B, RTN: int4 ppl 24.09,
+183 tok/s CUDA-graph decode vs fp16 19.93 / 129; with an INT8 head 24.08 / 209).
+
 ### As a PyTorch op
 
 ```python
