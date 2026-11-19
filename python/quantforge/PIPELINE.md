@@ -123,7 +123,12 @@ it as a candidate. `prefetch-distance=1` does nothing for prefill (0.464 vs 0.46
 plain 2-D grid: `block-swizzle=16` gives the same gain on the large weights (2048 x 4096 x 11008: 5.80 -> 5.19 ms, vs
 5.14 with 3 stages; not additive) and costs 8-14 % at 4096 x 4096. Decode: wider block tiles to fit the grid in one
 wave (`block-tile-n=256`, 43 blocks for N = 11008) do not help (1 x 4096 x 11008: 149 -> 169 us; 1 x 11008 x 4096:
-132 -> 129 us, noise level), 192-wide tiles are 2-4x slower. Remaining gap to cuBLAS / Marlin: MMA issue
+132 -> 129 us, noise level), 192-wide tiles are 2-4x slower. ncu at 2048 x 4096 x 4096 (default schedule, block 32 x 16 threads = 16 warps): Tensor pipe 79 % of peak
+active, 16.8 M HMMA of 74 M warp instructions (23 %), issue slots 22 % busy, 1 resident block per SM (512 threads x
+<= 128 registers) -- the dequantisation is already the packed f16x2 form (no I2F), so the instruction count is
+not the problem; what is left is barrier-synchronised phases of a single block per SM (all 16 warps dequantise,
+then all multiply), i.e. at most ~1.2x of headroom (79 % -> ~95 % tensor activity), consistent with Marlin /
+cuBLAS at 0.89 / 0.84 of our time. Remaining gap to cuBLAS / Marlin: MMA issue
 gaps between the dequantisation and the HMMA stream (no software pipelining of the two).
 
 ## Group-wise quantization
