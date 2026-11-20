@@ -20,8 +20,14 @@
 <li><a href="#runtime">Runtime</a></li>
 </ul>
 </li>
-<li><a href="#ket-qua-kernel-so-voi-marlin">Kết quả: kernel so với Marlin</a></li>
-<li><a href="#ket-qua-toan-bo-model">Kết quả: toàn bộ model</a></li>
+<li><a href="#ket-qua-kernel-so-voi-marlin">Kết quả: kernel so với Marlin</a><ul>
+<li><a href="#so-voi-cac-kernel-khac">So với các kernel khác</a></li>
+</ul>
+</li>
+<li><a href="#ket-qua-toan-bo-model">Kết quả: toàn bộ model</a><ul>
+<li><a href="#au-cuoi-so-voi-vllm">Đầu-cuối so với vLLM</a></li>
+</ul>
+</li>
 <li><a href="#bang-chung-ve-o-ung">Bằng chứng về độ đúng</a></li>
 <li><a href="#cach-dung">Cách dùng</a></li>
 <li><a href="#han-che-noi-thang">Hạn chế, nói thẳng</a></li>
@@ -232,8 +238,119 @@
 <li><strong>Prefill (M từ 512 trở lên)</strong>: 85 đến 86 phần trăm của Marlin, chậm hơn cuBLAS fp16 khoảng 20 đến 25 phần trăm, trong khi cuBLAS đọc nhiều gấp bốn lần byte nhưng không phải dequantise: ở đây kernel bị giới hạn bởi tính toán và dequantisation tranh slot issue với Tensor Core.</li>
 <li><strong>M từ 32 đến 256</strong> là điểm yếu, chậm hơn 13 đến 33 phần trăm. <a href="04-mid-batch-postmortem.html">Một bài riêng</a> điều tra chi tiết.</li>
 </ul>
+<h3 id="so-voi-cac-kernel-khac">So với các kernel khác<a class="headerlink" href="#so-voi-cac-kernel-khac" title="Permanent link">#</a></h3>
+<p>Marlin có phải là thước đo công bằng duy nhất? Cùng phương pháp (L2 đã flush, thời gian device, các vòng xen kẽ) được áp dụng cho <strong>gemlite</strong>, một kernel W4A16 viết bằng Triton có autotuner riêng (phiên bản 0.6.0, cùng weight INT4 và scale), cho <strong>bitsandbytes NF4</strong> (bảng mã 4 bit riêng trên cùng ma trận fp16, nên là quantiser khác: chỉ để so tốc độ) và cho cuBLAS fp16. Thời gian kernel tính bằng micro giây, kernel INT4 nhanh nhất in đậm:</p>
+<table>
+<thead>
+<tr>
+<th>M x K x N</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">gemlite (Triton)</th>
+<th style="text-align: right;">bitsandbytes NF4</th>
+<th style="text-align: right;">cuBLAS fp16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 x 4096 x 4096</td>
+<td style="text-align: right;">49.9</td>
+<td style="text-align: right;">49.3</td>
+<td style="text-align: right;"><strong>49.3</strong></td>
+<td style="text-align: right;">55.9</td>
+<td style="text-align: right;">180.8</td>
+</tr>
+<tr>
+<td>4 x 4096 x 4096</td>
+<td style="text-align: right;">50.1</td>
+<td style="text-align: right;"><strong>49.3</strong></td>
+<td style="text-align: right;">100.0</td>
+<td style="text-align: right;">155.1</td>
+<td style="text-align: right;">181.7</td>
+</tr>
+<tr>
+<td>16 x 4096 x 4096</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;"><strong>50.0</strong></td>
+<td style="text-align: right;">61.4</td>
+<td style="text-align: right;">156.8</td>
+<td style="text-align: right;">182.6</td>
+</tr>
+<tr>
+<td>32 x 4096 x 4096</td>
+<td style="text-align: right;">58.7</td>
+<td style="text-align: right;"><strong>50.9</strong></td>
+<td style="text-align: right;">71.0</td>
+<td style="text-align: right;">160.0</td>
+<td style="text-align: right;">180.9</td>
+</tr>
+<tr>
+<td>64 x 4096 x 4096</td>
+<td style="text-align: right;">87.7</td>
+<td style="text-align: right;"><strong>57.8</strong></td>
+<td style="text-align: right;">89.8</td>
+<td style="text-align: right;">194.3</td>
+<td style="text-align: right;">181.5</td>
+</tr>
+<tr>
+<td>128 x 4096 x 4096</td>
+<td style="text-align: right;">151.4</td>
+<td style="text-align: right;"><strong>104.4</strong></td>
+<td style="text-align: right;">159.2</td>
+<td style="text-align: right;">241.0</td>
+<td style="text-align: right;">188.3</td>
+</tr>
+<tr>
+<td>256 x 4096 x 4096</td>
+<td style="text-align: right;">262.5</td>
+<td style="text-align: right;"><strong>199.6</strong></td>
+<td style="text-align: right;">300.3</td>
+<td style="text-align: right;">457.6</td>
+<td style="text-align: right;">207.6</td>
+</tr>
+<tr>
+<td>512 x 4096 x 4096</td>
+<td style="text-align: right;">459.8</td>
+<td style="text-align: right;"><strong>388.9</strong></td>
+<td style="text-align: right;">529.9</td>
+<td style="text-align: right;">600.9</td>
+<td style="text-align: right;">371.1</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">1768.1</td>
+<td style="text-align: right;"><strong>1527.5</strong></td>
+<td style="text-align: right;">2002.7</td>
+<td style="text-align: right;">1711.1</td>
+<td style="text-align: right;">1457.4</td>
+</tr>
+<tr>
+<td>1 x 4096 x 11008</td>
+<td style="text-align: right;">149.5</td>
+<td style="text-align: right;"><strong>126.8</strong></td>
+<td style="text-align: right;">129.3</td>
+<td style="text-align: right;">139.6</td>
+<td style="text-align: right;">482.4</td>
+</tr>
+<tr>
+<td>1 x 11008 x 4096</td>
+<td style="text-align: right;">131.1</td>
+<td style="text-align: right;"><strong>127.1</strong></td>
+<td style="text-align: right;">129.2</td>
+<td style="text-align: right;">146.4</td>
+<td style="text-align: right;">484.2</td>
+</tr>
+</tbody>
+</table>
+<p>Đọc bảng:</p>
+<ul>
+<li><strong>QuantForge ngang gemlite ở batch 1</strong> (49.9 so với 49.3 micro giây) và <strong>hơn rõ rệt từ batch 4 trở lên</strong>: gemlite cần 100 micro giây ở M = 4 và 61 ở M = 16, trong khi QuantForge cần 50. Kernel prefill của nó chậm hơn của QuantForge khoảng 15 phần trăm.</li>
+<li>gemlite <strong>nhanh hơn ở shape decode rộng</strong> 1 x 4096 x 11008 (129 so với 150 micro giây): điểm yếu của kernel decode QuantForge là hành vi lưới / wave trên layer rộng, không phải trường hợp 4096 x 4096.</li>
+<li>Marlin là kernel nhanh nhất từ M = 32 trở lên, như trước; đường NF4 của bitsandbytes chậm hơn ở mọi nơi trừ các shape decode rộng, nơi nó nằm trong 8 đến 15 phần trăm.</li>
+<li>Cả ba kernel INT4 chạm cùng giới hạn DRAM khoảng 50 micro giây ở 4096 x 4096 batch 1, đúng là kết quả cần có cho một kernel bị giới hạn bộ nhớ.</li>
+</ul>
 <h2 id="ket-qua-toan-bo-model">Kết quả: toàn bộ model<a class="headerlink" href="#ket-qua-toan-bo-model" title="Permanent link">#</a></h2>
-<p>Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. <code>quantforge.nn.quantize_model</code> thay các layer <code>nn.Linear</code> của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp <code>silu(gate) * up</code>. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token của tập test Wikitext-2, INT4 round-to-nearest đơn giản (group 128) với head INT8.</p>
+<p>Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. <code>quantforge.nn.quantize_model</code> thay các layer <code>nn.Linear</code> của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp <code>silu(gate) * up</code>. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token đầu của tập test Wikitext-2 (chỉ 8 cửa sổ: các giá trị trên toàn tập, thấp hơn 1 đến 2 điểm ở mọi model, nằm trong <a href="05-gptq-and-checkpoints.html">bài về GPTQ</a>), INT4 round-to-nearest đơn giản (group 128) với head INT8.</p>
 <figure class="viz"><div class="viz-title">Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>fp16 (Hugging Face)</span><span class="lg"><i class="sw s2"></i>QuantForge INT4 + head INT8</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">48</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">96</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">144</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">192</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">240</text><path class="s1" d="M104.2 268 V138.7 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
 0.5B - fp16 (Hugging Face): 129</title></path><text class="val" x="121.2" y="129.7" text-anchor="middle">129</text><path class="s2" d="M140.2 268 V56.0 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
 0.5B - QuantForge INT4 + head INT8: 209</title></path><text class="val" x="157.2" y="47.0" text-anchor="middle">209</text><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V221.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
@@ -314,6 +431,9 @@
 </tbody>
 </table>
 <p>Một model 3B và một model 7B chạy được trên card 6 GB vốn không chứa nổi chúng ở fp16. Cái giá về perplexity của 4 bit round-to-nearest là có thật (1 đến 4 điểm); <a href="05-gptq-and-checkpoints.html">bài về GPTQ</a> cho thấy một quantiser thông minh hơn lấy lại được bao nhiêu. Mức tăng tốc giảm khi model lớn lên, vì lm_head, attention và khoảng 1400 kernel nhỏ của đồ thị Hugging Face chiếm phần lớn hơn của mỗi bước.</p>
+<h3 id="au-cuoi-so-voi-vllm">Đầu-cuối so với vLLM<a class="headerlink" href="#au-cuoi-so-voi-vllm" title="Permanent link">#</a></h3>
+<p>vLLM 0.25.1 (engine offline, CUDA graph, một request, 256 token mới, tốt nhất trong 3 lần) trên Qwen2.5-0.5B-Instruct: fp16 <strong>165 token/s</strong>, checkpoint GPTQ-Int4 chính thức với kernel Marlin <strong>310 token/s</strong> (nhanh hơn fp16 của chính nó 1.88 lần). QuantForge trong một model Hugging Face thường với static cache và CUDA graph: fp16 129, INT4 với head INT8 209 token/s (1.62 lần), 226 khi dùng <code>torch.compile</code> (1.75 lần).</p>
+<p><strong>Về giá trị tuyệt đối vLLM nhanh hơn rõ rệt</strong>, và lý do không nằm ở kernel GEMM (bảng ở trên cho thấy QuantForge ngang Marlin ở batch 1) mà ở phần còn lại của model: vLLM gộp norm, rotary embedding, phép cộng residual và sampling, còn đồ thị Hugging Face phát khoảng 1400 kernel nhỏ mỗi bước decode. Với model 0.5B chúng chiếm phần lớn. Phép so sánh đầu-cuối công bằng là chạy kernel QuantForge <em>bên trong</em> vLLM (một plugin lượng tử hóa); đó là việc tương lai.</p>
 <h2 id="bang-chung-ve-o-ung">Bằng chứng về độ đúng<a class="headerlink" href="#bang-chung-ve-o-ung" title="Permanent link">#</a></h2>
 <p>Số tốc độ vô giá trị nếu kernel sai tinh vi, nên dự án dựa nhiều vào kiểm tra:</p>
 <ul>
@@ -334,7 +454,7 @@ out = model.generate(ids.cuda(), max_new_tokens=64)            # chạy trên c�
 <h2 id="han-che-noi-thang">Hạn chế, nói thẳng<a class="headerlink" href="#han-che-noi-thang" title="Permanent link">#</a></h2>
 <ul>
 <li>Mọi số đo đến từ <strong>một GPU laptop</strong> với xung nhịp dao động; chưa có kết quả trên GPU data-center.</li>
-<li>Baseline duy nhất là Marlin và cuBLAS. Machete, kernel Triton như gemlite, torchao và vLLM đầu-cuối chưa được so sánh.</li>
+<li>Baseline: Marlin, gemlite (Triton), bitsandbytes và cuBLAS ở mức kernel, và vLLM đầu-cuối trên một model. Machete và torchao chưa được so sánh, và QuantForge chưa được chạy <em>bên trong</em> vLLM.</li>
 <li>Kernel là PTX dựng bằng backend NVPTX của LLVM 18: không có Hopper <code>wgmma</code> hay TMA, không có activation FP8.</li>
 <li>M từ 32 đến 256 và prefill vẫn thua Marlin; các bài tiếp theo giải thích những gì đã thử.</li>
 </ul></article>

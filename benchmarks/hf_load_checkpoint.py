@@ -28,7 +28,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True, help="HF id of the dense architecture / embeddings")
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--method", choices=("gptq", "awq"), required=True)
+    ap.add_argument("--method", choices=("gptq", "awq", "fp8"), required=True)
+    ap.add_argument("--from-config", action="store_true",
+                    help="build the architecture from the config of --base (random init) instead of loading dense weights: "
+                         "for repositories that only hold the quantised weights; all tensors then come from the checkpoint")
     ap.add_argument("--text", required=True)
     ap.add_argument("--zeros-offset", type=int, default=1, help="1 for gptq, 0 for gptq_v2")
     ap.add_argument("--nseq", type=int, default=16)
@@ -41,7 +44,14 @@ def main():
     ids = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: ns.nseq * ns.seqlen]
     prompt = "Explain in one paragraph why the sky is blue."
 
-    dense = AutoModelForCausalLM.from_pretrained(ns.base, dtype=torch.float16, low_cpu_mem_usage=True).eval()
+    if ns.from_config:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(ns.base)
+        if hasattr(cfg, "quantization_config"):
+            del cfg.quantization_config
+        dense = AutoModelForCausalLM.from_config(cfg, dtype=torch.float16).eval()
+    else:
+        dense = AutoModelForCausalLM.from_pretrained(ns.base, dtype=torch.float16, low_cpu_mem_usage=True).eval()
     twin = copy.deepcopy(dense)
     st = qnn.load_quantized_checkpoint(twin, ns.ckpt, ns.method, fuse=False, zeros_offset=ns.zeros_offset)
     # dense twin: every QuantLinear becomes a plain nn.Linear holding the dequantised weight (the embeddings

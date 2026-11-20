@@ -95,7 +95,7 @@ w     = (half2 * 256.h2) * scale.h2     // hai mul.f16x2
 <p>Trên model này INT8 và FP8 tương đương về tốc độ và gần nhau về chất lượng, cả hai nhanh hơn fp16 khoảng 28 phần trăm (165 so với 129 token/s) trên một model cỡ này. Chúng giảm một nửa byte weight của fp16 thay vì giảm còn một phần tư như INT4, nên INT4 vẫn là định dạng cho tốc độ. FP8 là định dạng cho các checkpoint đã phát hành sẵn ở đó, hoặc khi mất chất lượng của INT4 là không chấp nhận được.</p>
 <h2 id="nhung-gi-no-khong-lam">Những gì nó không làm<a class="headerlink" href="#nhung-gi-no-khong-lam" title="Permanent link">#</a></h2>
 <p>Chỉ <em>weight</em> là FP8. Activation vẫn là fp16 và phép nhân-cộng chạy trên đường Tensor Core fp16. Dùng Tensor Core FP8 của Ada (<code>mma</code> với toán hạng <code>e4m3</code>) để nhân đôi tốc độ số học là một dự án khác: nó cần activation FP8, scale activation theo tensor và cách phát các lệnh đó từ LLVM 18. Chưa làm.</p>
-<p>Các số FP8 cũng đến từ lượng tử hóa round-to-nearest checkpoint fp16; chưa có checkpoint FP8 nào ngoài đời được chạy qua nó.</p></article>
+<p>Các số FP8 trong bảng đến từ lượng tử hóa round-to-nearest checkpoint fp16. Một checkpoint FP8 thật (<code>RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic</code>, scale theo kênh, chỉ weight) sau đó được nạp bằng <code>load_quantized_checkpoint(method="fp8")</code>: perplexity 22.543 so với 22.441 của model fp16 gốc trên cùng 16 cửa sổ test, giống hệt bản sinh đôi dequantise đến ba chữ số thập phân.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

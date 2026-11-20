@@ -20,6 +20,7 @@ Llama / Qwen / Mistral style decoders can additionally be *fused* (``fuse=True``
 from __future__ import annotations
 
 import gc
+import math
 import warnings
 from typing import Iterable, Optional
 
@@ -319,13 +320,14 @@ def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", f
     `model` is any (dense) instance of the architecture, e.g. ``AutoModelForCausalLM.from_pretrained(base)``;
     `tensors` is the checkpoint (a ``.safetensors`` path or a ``{name: tensor}`` dict) with
     ``<layer>.qweight / qzeros / scales`` (and ``g_idx`` for GPTQ, ``bias`` if the layer has one).
-    ``method``: ``"gptq"`` (4-bit, ``desc_act`` act-order supported through a row permutation) or ``"awq"``
-    (GEMM version, 4-bit). ``zeros_offset``: 1 for classic GPTQ ``checkpoint_format: gptq`` files, 0 for
+    ``method``: ``"gptq"`` (4-bit, ``desc_act`` act-order supported through a row permutation), ``"awq"``
+    (GEMM version, 4-bit) or ``"fp8"`` (an FP8 E4M3 checkpoint with per-output-channel ``<layer>.weight_scale``, e.g.
+    the ``compressed-tensors`` "FP8-dynamic" models: only the *weights* are used, the activations stay fp16). ``zeros_offset``: 1 for classic GPTQ ``checkpoint_format: gptq`` files, 0 for
     ``gptq_v2``. Non-Linear tensors that exist in both the checkpoint and the model (embeddings, norms)
     are copied; unquantised Linear layers keep their weights. Returns ``{"quantized": n, "act_order": n,
     "fused_qkv": n, "fused_mlp": n}``."""
-    if method not in ("gptq", "awq"):
-        raise ValueError("method must be 'gptq' or 'awq'")
+    if method not in ("gptq", "awq", "fp8"):
+        raise ValueError("method must be 'gptq', 'awq' or 'fp8'")
     if isinstance(tensors, (str, bytes)) or hasattr(tensors, "__fspath__"):
         from safetensors import safe_open
         f = safe_open(str(tensors), framework="pt", device="cpu")
@@ -339,6 +341,24 @@ def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", f
             if not isinstance(child, nn.Linear):
                 continue
             full = f"{name}.{cname}" if name else cname
+            if method == "fp8":
+                if f"{full}.weight_scale" not in keys or f"{full}.weight" not in keys:
+                    continue
+                w8 = get(f"{full}.weight")
+                if w8.dtype != torch.float8_e4m3fn:
+                    continue
+                w8 = w8.to(device).t().contiguous()                              # [K, N]
+                K_, N_ = w8.shape
+                G_ = 128 if K_ % 128 == 0 else math.gcd(K_, 128)
+                scale = get(f"{full}.weight_scale").to(device, torch.float16).reshape(1, N_)   # per output channel
+                scale = scale.expand(K_ // G_, N_).contiguous()
+                zero = torch.zeros_like(scale, dtype=torch.int8)
+                bias = get(f"{full}.bias").to(device, torch.float16) if f"{full}.bias" in keys else (
+                    None if child.bias is None else child.bias.data.to(device, torch.float16))
+                setattr(mod, cname, QuantLinear.from_quantized(w8, scale, zero, bias, G_, "fp8"))
+                quantised_names.add(full)
+                stats["quantized"] += 1
+                continue
             if f"{full}.qweight" not in keys:
                 continue
             qw, qz, sc = (get(f"{full}.{k}").to(device) for k in ("qweight", "qzeros", "scales"))
@@ -364,7 +384,8 @@ def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", f
                 print(f"  {full}: {method} int4 g{packed.shape[0] // scale.shape[0]}")
             del qw, qz, sc
     if not stats["quantized"]:
-        raise ValueError("no <layer>.qweight tensors in the checkpoint match a Linear layer of the model")
+        raise ValueError("no quantised tensors (<layer>.qweight, or <layer>.weight + weight_scale for fp8) in the "
+                         "checkpoint match a Linear layer of the model")
     own = model.state_dict()
     for k in keys:
         if k in own and not any(k.startswith(q + ".") for q in quantised_names) \

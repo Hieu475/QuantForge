@@ -141,11 +141,21 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
 @torch.no_grad()
 def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: int = 128,
                         damp: float = 0.01, act_order: bool = False, blocksize: int = 128, clip: bool = False,
-                        fuse: bool = True, device="cuda", verbose: bool = True) -> dict:
+                        fuse: bool = True, device="cuda", verbose: bool = True, rtn: tuple = (),
+                        token_clip: float = 30.0) -> dict:
     """GPTQ-quantise every Linear inside the decoder layers of `model` (fp16, e.g. loaded on the CPU) to
     INT4 and replace them with :class:`QuantLinear`. ``calib_ids`` is ``[nsamples, seqlen]`` token ids
     (see :func:`calibration_ids`); the ``lm_head`` / embeddings are left alone (use
     ``quantize_model(model, 'int8', only=('lm_head',), fuse=False)`` for the head afterwards).
+    ``token_clip`` (default 30, 0 = off): before a calibration token enters the Hessian its norm is capped at
+    ``token_clip`` times the median token norm. A few "massive activation" tokens (the attention sink; the inputs of the
+    ``down_proj`` of one early layer have a token 300 to 800 times the median norm in Llama-3.2 and Qwen2.5) otherwise
+    dominate the Hessian, and the compensation then ruins other tokens: without the cap GPTQ was *worse than
+    round-to-nearest* on the whole Wikitext-2 test set for Llama-3.2-1B (24.08 against 22.28; with the cap 20.12) and gave
+    half of the possible gain on Qwen2.5-1.5B (13.91; with the cap 13.38).
+
+    ``rtn``: exact names ``"<layer index>.<module path>"`` (e.g. ``"1.mlp.down_proj"``) of Linears that are quantised
+    with plain round-to-nearest instead of GPTQ (see the note on massive-activation layers in the blog / README).
     Returns ``{"quantized": n, "seconds": s, "fused_qkv": n, "fused_mlp": n, "act_order": n}``."""
     t0 = time.time()
     model.config.use_cache = False
@@ -181,17 +191,26 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
     kwargs = {k: v for k, v in kwargs.items() if k not in ("past_key_values", "past_key_value")}
     kwargs["use_cache"] = False
     n_tokens = len(inps) * inps[0].shape[1]
-    stats = {"quantized": 0, "act_order": 0}
+    stats = {"quantized": 0, "act_order": 0, "outlier_ratio": {}}
 
     for li, layer in enumerate(layers):
         layer.to(device)
         targets = {name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)}
         hess = {n: torch.zeros(m.in_features, m.in_features, device=device) for n, m in targets.items()}
 
+        ratio = {}                              # largest token norm / median token norm seen at each Linear input
+
         def make_hook(n):
             def hook(_, args):
                 x = args[0].reshape(-1, args[0].shape[-1]).float()
-                hess[n].addmm_(x.t(), x, alpha=2.0 / n_tokens)
+                nrm = x.norm(dim=1)
+                ratio[n] = max(ratio.get(n, 0.0), (nrm.max() / nrm.median().clamp(min=1e-6)).item())
+                if token_clip > 0:
+                    cap = token_clip * nrm.median().clamp(min=1e-6)
+                    xh = x * (cap / nrm.clamp(min=1e-6)).clamp(max=1.0).unsqueeze(1)
+                else:
+                    xh = x
+                hess[n].addmm_(xh.t(), xh, alpha=2.0 / n_tokens)
             return hook
 
         handles = [m.register_forward_pre_hook(make_hook(n)) for n, m in targets.items()]
@@ -199,9 +218,14 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
             layer(x, **kwargs)
         for h in handles:
             h.remove()
+        rtn_set = set(rtn)
         for n, m in targets.items():
-            q, scale, zero, perm = gptq_quantize_weight(m.weight.data.to(device), hess[n], group_size,
-                                                        blocksize, damp, act_order, clip=clip)
+            if f"{li}.{n}" in rtn_set:
+                q, scale, zero = quant.quantize_groupwise(m.weight.data.to(device).float().t().contiguous(), group_size)
+                perm = None
+            else:
+                q, scale, zero, perm = gptq_quantize_weight(m.weight.data.to(device), hess[n], group_size,
+                                                            blocksize, damp, act_order, clip=clip)
             bias = None if m.bias is None else m.bias.data.to(device, torch.float16)
             ql = QuantLinear.from_quantized(quant.pack_int4(q), scale, zero, bias, group_size, "int4",
                                             None if perm is None else perm.to(device))
@@ -209,6 +233,8 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
             setattr(parent, n.rsplit(".", 1)[-1], ql)
             stats["quantized"] += 1
             stats["act_order"] += perm is not None
+        for n, r in ratio.items():
+            stats["outlier_ratio"][f"{li}.{n}"] = r
         del hess
         # the next layer sees the outputs of the quantised one
         new_inps = []

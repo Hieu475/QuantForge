@@ -70,4 +70,4 @@ On this model INT8 and FP8 are equivalent in speed and close in quality, both ab
 
 Only the *weights* are FP8. The activations stay fp16 and the multiply-accumulate runs on the fp16 Tensor Core path. Using the FP8 Tensor Core of Ada (`mma` with `e4m3` operands) to double the arithmetic rate is a different project: it needs FP8 activations, per-tensor activation scales and a way to emit those instructions from LLVM 18. It is not done.
 
-The FP8 numbers also come from round-to-nearest quantisation of fp16 checkpoints; no FP8 checkpoint from the wild has been run through it yet.
+The FP8 numbers in the table come from round-to-nearest quantisation of fp16 checkpoints. A real FP8 checkpoint (`RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic`, per-channel scales, weights only) was later loaded with `load_quantized_checkpoint(method="fp8")`: perplexity 22.543 against 22.441 for the fp16 base model on the same 16 test windows, identical to its dequantised twin to three decimals.

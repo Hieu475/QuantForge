@@ -56,6 +56,9 @@ jobs:
   gpu:
     runs-on: [self-hosted, linux, gpu]
     needs: build-and-lit
+    # A self-hosted runner executes whatever a pull request contains: never run it for code from a fork
+    # (this repository is public). Pushes, the nightly schedule, manual runs and PRs from this repo's own branches are fine.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 120
     env:
       QUANTFORGE_BUILD_DIR: ${{ github.workspace }}/build

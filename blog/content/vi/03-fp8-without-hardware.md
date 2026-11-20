@@ -70,4 +70,4 @@ Trên model này INT8 và FP8 tương đương về tốc độ và gần nhau v
 
 Chỉ *weight* là FP8. Activation vẫn là fp16 và phép nhân-cộng chạy trên đường Tensor Core fp16. Dùng Tensor Core FP8 của Ada (`mma` với toán hạng `e4m3`) để nhân đôi tốc độ số học là một dự án khác: nó cần activation FP8, scale activation theo tensor và cách phát các lệnh đó từ LLVM 18. Chưa làm.
 
-Các số FP8 cũng đến từ lượng tử hóa round-to-nearest checkpoint fp16; chưa có checkpoint FP8 nào ngoài đời được chạy qua nó.
+Các số FP8 trong bảng đến từ lượng tử hóa round-to-nearest checkpoint fp16. Một checkpoint FP8 thật (`RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic`, scale theo kênh, chỉ weight) sau đó được nạp bằng `load_quantized_checkpoint(method="fp8")`: perplexity 22.543 so với 22.441 của model fp16 gốc trên cùng 16 cửa sổ test, giống hệt bản sinh đôi dequantise đến ba chữ số thập phân.

@@ -65,3 +65,9 @@ __pycache__/
 
 # local build directories (CMake presets use build/)
 /build*/
+
+# Python packaging
+*.egg-info/
+python/build/
+dist/
+*.whl

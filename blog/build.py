@@ -132,9 +132,9 @@ T = {
     },
     "gptq_ppl": {
         "en": ("Wikitext-2 perplexity of the quantised models (lower is better)",
-               "8 x 512 test tokens; GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants."),
+               "Whole Wikitext-2 test split (564-584 windows of 512 tokens); GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants."),
         "vi": ("Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)",
-               "8 x 512 token test; GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể."),
+               "Toàn bộ tập test Wikitext-2 (564-584 cửa sổ 512 token); GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể."),
     },
 }
 LEG = {"en": {"fp16": "fp16 (Hugging Face)", "qf": "QuantForge INT4 + INT8 head", "ref": "fp16 reference", "rtn": "RTN INT4", "gptq": "GPTQ INT4"},
@@ -156,8 +156,8 @@ def chart(name):
                              [(lg["fp16"], [129, 49, 63, 60]), (lg["qf"], [209, 97, 142, 138])], 240, decimals=0, note=note)
     if name == "gptq_ppl":
         return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
-                             [(lg["rtn"], [24.08, 15.31, 24.42, 21.31]), (lg["gptq"], [21.38, 15.00, 23.39, 20.62])],
-                             30, decimals=2, markers=[19.93, 13.48, 20.15, 19.32], marker_label=lg["ref"], note=note)
+                             [(lg["rtn"], [22.91, 14.30, 22.28, 19.02]), (lg["gptq"], [20.20, 13.38, 20.12, 18.35])],
+                             25, decimals=2, markers=[18.79, 12.66, 17.91, 17.24], marker_label=lg["ref"], note=note)
     raise KeyError(name)
 
 

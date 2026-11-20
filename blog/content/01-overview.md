@@ -91,9 +91,34 @@ What the table says:
 * **Prefill (M of 512 and more)**: 85 to 86 percent of Marlin, about 20 to 25 percent slower than cuBLAS fp16, which reads four times the bytes but has no dequantisation to do: the kernel is compute-bound there and the dequantisation competes with the Tensor Cores for issue slots.
 * **M between 32 and 256** is the weak spot, 13 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail.
 
+### Against other kernels
+
+Is Marlin the only fair yardstick? The same method (L2 flushed, device time, interleaved rounds) was applied to **gemlite**, a Triton W4A16 kernel with its own autotuner (version 0.6.0, the same INT4 weights and scales), to **bitsandbytes NF4** (its own 4-bit code book on the same fp16 matrix, so a different quantiser: speed only) and to cuBLAS fp16. Kernel time in microseconds, the fastest INT4 kernel in bold:
+
+| M x K x N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
+|---|--:|--:|--:|--:|--:|
+| 1 x 4096 x 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 x 4096 x 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 x 4096 x 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
+| 32 x 4096 x 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 x 4096 x 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 x 4096 x 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 x 4096 x 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 x 4096 x 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 x 4096 x 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 x 4096 x 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 x 11008 x 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
+
+Reading it:
+
+* **QuantForge is on par with gemlite at batch 1** (49.9 against 49.3 microseconds) and **clearly ahead from batch 4 up**: gemlite needs 100 microseconds at M = 4 and 61 at M = 16, where QuantForge needs 50. Its prefill kernel is about 15 percent slower than QuantForge's.
+* gemlite is **faster on the wide decode shape** 1 x 4096 x 11008 (129 against 150 microseconds): the weak point of QuantForge's decode kernel is the grid / wave behaviour on wide layers, not the 4096 x 4096 case.
+* Marlin is the fastest kernel from M = 32 up, as before; bitsandbytes' NF4 path is slower everywhere except the wide decode shapes, where it is within 8 to 15 percent.
+* All three INT4 kernels hit the same ~50 microsecond DRAM limit at 4096 x 4096 batch 1, which is the correct outcome for a memory-bound kernel.
+
 ## Results: whole models
 
-The kernels are only useful if a real model runs correctly and faster. `quantforge.nn.quantize_model` replaces the `nn.Linear` layers of any Hugging Face causal LM, fuses the q/k/v projections into one GEMM and the gate/up projections of a SiLU-gated MLP into one GEMM with a fused `silu(gate) * up` epilogue. The table is batch-1 decode with a CUDA graph, perplexity on 8 x 512 tokens of the Wikitext-2 test split, simple round-to-nearest INT4 (group 128) with an INT8 head.
+The kernels are only useful if a real model runs correctly and faster. `quantforge.nn.quantize_model` replaces the `nn.Linear` layers of any Hugging Face causal LM, fuses the q/k/v projections into one GEMM and the gate/up projections of a SiLU-gated MLP into one GEMM with a fused `silu(gate) * up` epilogue. The table is batch-1 decode with a CUDA graph, perplexity on the first 8 x 512 tokens of the Wikitext-2 test split (only 8 windows: the whole-split values, 1 to 2 points lower for every model, are in [the GPTQ post](05-gptq-and-checkpoints.html)), simple round-to-nearest INT4 (group 128) with an INT8 head.
 
 {{chart:e2e_speed}}
 
@@ -108,6 +133,12 @@ The kernels are only useful if a real model runs correctly and faster. `quantfor
 | Mistral-7B-Instruct-v0.3 (from an NF4 checkpoint) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | 4.65 GB peak |
 
 A 3B and a 7B model run on a 6 GB card that cannot even hold them in fp16. The perplexity cost of round-to-nearest 4-bit is real (1 to 4 points); [the GPTQ post](05-gptq-and-checkpoints.html) shows how much of it a smarter quantiser recovers. The speed-up shrinks as the model grows because the lm_head, attention and the roughly 1400 small kernels of the Hugging Face graph take a larger share of each step.
+
+### End to end against vLLM
+
+vLLM 0.25.1 (offline engine, CUDA graphs, one request, 256 new tokens, best of 3) on Qwen2.5-0.5B-Instruct: fp16 **165 tokens/s**, the official GPTQ-Int4 checkpoint with Marlin kernels **310 tokens/s** (1.88x faster than its own fp16). QuantForge inside a plain Hugging Face model with a static cache and a CUDA graph: fp16 129, INT4 with an INT8 head 209 tokens/s (1.62x), 226 with `torch.compile` (1.75x).
+
+**In absolute terms vLLM is clearly faster**, and the reason is not the GEMM kernels (the table above shows QuantForge on par with Marlin at batch 1) but the rest of the model: vLLM's implementation fuses norms, rotary embeddings, residual adds and sampling, while the Hugging Face graph launches about 1400 small kernels per decode step. For a 0.5B model those dominate. The fair end-to-end comparison would run the QuantForge kernels *inside* vLLM (a quantisation plugin); that is future work.
 
 ## Correctness evidence
 
@@ -133,6 +164,6 @@ out = model.generate(ids.cuda(), max_new_tokens=64)            # runs on the gen
 ## Limitations, stated plainly
 
 * All measurements come from **one laptop GPU** with drifting clocks; there is no data-centre GPU result yet.
-* The only baselines are Marlin and cuBLAS. Machete, Triton kernels such as gemlite, torchao and end-to-end vLLM are not compared.
+* Baselines: Marlin, gemlite (Triton), bitsandbytes and cuBLAS at the kernel level, and vLLM end to end on one model. Machete and torchao are not compared, and QuantForge has not been run *inside* vLLM.
 * Kernels are PTX built with LLVM 18's NVPTX backend: no Hopper `wgmma` or TMA, no FP8 *activations*.
 * M between 32 and 256 and prefill stay behind Marlin; the next posts explain what was tried.

@@ -45,6 +45,10 @@ license (Apache-2.0 with LLVM Exceptions, see `LICENSE`).
 
 ## Setting up the GPU CI runner
 
+> **Security:** a self-hosted runner runs the code of whatever it is asked to build. The `gpu` job is therefore skipped for pull
+> requests from forks (see the `if:` in `ci.yml`); keep it that way for a public repository, and in the repository settings
+> (Actions -> General) require approval for all outside contributors' workflows. Run the runner as an unprivileged user.
+
 The `gpu` job of `.github/workflows/ci.yml` runs on a self-hosted runner with the labels
 `self-hosted, linux, gpu`. A machine is ready when `scripts/ci_gpu_preflight.sh` prints
 `preflight: all good`; it checks, and names the missing package for:

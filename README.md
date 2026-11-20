@@ -47,6 +47,42 @@ come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop 
 | 512 × 4096 × 4096 | 391.5 | 461.6 | 373.4 | 0.85× |
 | 2048 × 4096 × 4096 | 1532.1 | 1775.8 | 1453.0 | 0.86× |
 
+### Against other kernels (gemlite, bitsandbytes)
+
+Same method as above (`benchmarks/compare_baselines.py`, [`benchmarks/baselines_rtx4050_sm89.json`](benchmarks/baselines_rtx4050_sm89.json)),
+kernel time in µs, the fastest of the three INT4 kernels in bold. gemlite is a Triton W4A16 kernel (0.6.0, its own autotuner,
+same INT4 weights and scales); bitsandbytes uses its NF4 code book on the same fp16 matrix (a different quantiser, listed for speed
+only); cuBLAS reads the pre-dequantised fp16 weights (4× the bytes).
+
+| M × K × N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
+|---|--:|--:|--:|--:|--:|
+| 1 × 4096 × 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 × 4096 × 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 × 4096 × 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
+| 32 × 4096 × 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 × 4096 × 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 × 4096 × 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 × 4096 × 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 × 4096 × 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 × 4096 × 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 × 4096 × 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 × 11008 × 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
+
+QuantForge is on par with gemlite at M = 1 (49.9 / 49.3 µs), ahead of it for M = 4 … 2048 (gemlite needs 100 µs at M = 4 and
+61 µs at M = 16 where QuantForge needs 50), and behind it on the wide decode shape 1 × 4096 × 11008 (149.5 against 129.3 µs). Marlin is
+the fastest kernel from M = 32 up. The Triton kernel's strength is its autotuned decode path; its prefill kernel is ~15 % slower than
+QuantForge's.
+
+### End to end against vLLM
+
+vLLM 0.25.1 (offline engine, CUDA graphs, one request, 256 new tokens, best of 3; `benchmarks/vllm_e2e.py`) on Qwen2.5-0.5B-Instruct:
+fp16 **165 tokens/s**, the official GPTQ-Int4 checkpoint with Marlin kernels **310 tokens/s** (1.88× faster). QuantForge inside a plain
+Hugging Face model with a static cache and a CUDA graph: fp16 129, INT4 (+ INT8 head) 209 tokens/s (1.62×), 226 with
+`torch.compile` (1.75×). In absolute terms vLLM is faster, because its model implementation is fully fused (norms, rotary, residuals,
+sampling) while the Hugging Face graph launches ~1400 small kernels per step; for the GEMMs themselves the table above shows
+QuantForge on par with Marlin at batch 1. Running the QuantForge kernels *inside* vLLM (a plugin) would be the fair end-to-end
+comparison and is not done.
+
 QuantForge is 3.2–3.7× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of the bytes) and
 0.67–1.01× of Marlin. **The "≥ 90 % of Marlin" goal is reached for decode (M ≤ 16) at 4096 × 4096 (0.99–1.01×) and for
 1 × 11008 × 4096 (0.97×); it is not reached for 1 × 4096 × 11008 and 16 × 4096 × 11008 (0.85×), for M = 32 … 256 (0.67–0.87×;
@@ -66,6 +102,15 @@ compute-bound kernel is ~25 % slower than cuBLAS fp16 with group-wise parameters
 Without group-wise parameters (per-tensor scale), TFLOP/s, 4096³: 36.9 (cuBLAS fp16
 43.6); 1 × 4096 × 4096 decode: ~49 µs with the weights L2-resident (the kernel is latency-bound there, 3.7× faster than cuBLAS). Numbers from a
 laptop GPU are only meaningful relative to the same machine and clock state.
+
+## Install the Python package
+
+```bash
+# 1. build the C++ tool once (see Build below), 2. install the Python part, 3. check
+pip install ./python[hf]                      # needs a CUDA build of torch; [hf] adds transformers / safetensors / pandas
+export QUANTFORGE_BUILD_DIR=$PWD/build        # the CMake build directory containing tools/quantforge-opt
+quantforge-doctor                             # GPU, nvcc / ptxas, quantforge-opt, and one small kernel against a reference
+```
 
 ## Build
 
@@ -166,8 +211,12 @@ qnn.load_quantized_checkpoint(model, "Qwen2.5-0.5B-Instruct-GPTQ-Int4/model.safe
 
 The embeddings and norms are copied from the checkpoint as well (AWQ folds its activation scales into the norms, so
 the dense base model's norms are *not* the right ones). Checked against a dense twin (same dequantised weights in
-`nn.Linear`) with `benchmarks/hf_load_checkpoint.py`, Qwen2.5-0.5B-Instruct, wikitext-2 16 x 512: GPTQ-Int4 ppl 26.336
-vs 26.335, 59/59 greedy tokens identical, 182 tok/s CUDA-graph decode; AWQ ppl 26.689 vs 26.689, 59/59, 184 tok/s.
+`nn.Linear`) with `benchmarks/hf_load_checkpoint.py`, wikitext-2 16 x 512: Qwen2.5-0.5B GPTQ-Int4 ppl 26.336
+vs 26.335, 59/59 greedy tokens identical, 182 tok/s CUDA-graph decode; AWQ ppl 26.689 vs 26.689, 59/59, 184 tok/s;
+**TinyLlama-1.1B-Chat GPTQ with `desc_act=True`** (TheBloke; all 154 layers act-ordered) ppl 17.259 vs 17.259, 60/60 greedy tokens;
+**a real FP8 checkpoint** (`RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic`, `method="fp8"`, per-channel scales expanded to group 128)
+ppl 22.543 vs 22.543 for its twin and 22.441 for the fp16 base model (greedy decoding diverges after 28 of 59 tokens: near-ties
+flip under the different fp16 rounding of the twin's matmul; the logits agree to 99.4 % top-1).
 Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (RTN, group 128, wikitext-2 8 x 512,
 CUDA-graph decode on the 6 GB RTX 4050):
 
@@ -199,21 +248,31 @@ qnn.quantize_model(model, "int8", only=("lm_head",), fuse=False)                
 ```
 
 Sequential GPTQ (Hessian of every Linear input from the already quantised blocks, column-wise error compensation
-through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated). 43 s for Qwen2.5-0.5B,
-125 s for 1.5B on the RTX 4050. Wikitext-2 perplexity (8 x 512 test tokens; calibration: 128 x 512 tokens of the *train*
-split; INT8 head; `benchmarks/hf_gptq.py`):
+through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated). 42 s for Qwen2.5-0.5B,
+121 s for 1.5B on the RTX 4050. Wikitext-2 perplexity on the **whole test split** (564-584 windows of 512 tokens;
+calibration: 128 x 512 tokens of the *train* split; INT8 head; `benchmarks/hf_gptq.py --nseq 0 --fp16`):
 
 | model | fp16 | RTN INT4 | GPTQ INT4 | share of the RTN loss recovered |
 |---|--:|--:|--:|--:|
-| Qwen2.5-0.5B-Instruct | 19.93 | 24.08 | **21.38** (group 64: 21.26) | 65 % |
-| Qwen2.5-1.5B-Instruct | 13.48 | 15.31 | **15.00** | 17 % |
-| Llama-3.2-1B-Instruct | 20.15 | 24.42 | **23.39** | 24 % |
-| OLMo-2-0425-1B-Instruct | 19.32 | 21.31 | **20.62** | 34 % |
+| Qwen2.5-0.5B-Instruct | 18.79 | 22.91 | **20.20** | 66 % |
+| Qwen2.5-1.5B-Instruct | 12.66 | 14.30 | **13.38** | 56 % |
+| Llama-3.2-1B-Instruct | 17.91 | 22.28 | **20.12** | 49 % |
+| OLMo-2-0425-1B-Instruct | 17.24 | 19.02 | **18.35** | 38 % |
 
-The speed of the kernels does not change (same layout). Options that did *not* help consistently, hence off by
-default: `clip=True` (per-group range shrinking: 1.5B 15.00 -> 14.40, OLMo 20.62 -> 19.77 but 0.5B 21.38 -> 21.66 and
-Llama-1B 23.39 -> 30.87), `act_order=True` (0.5B 21.74, and the layers lose the q/k/v fusion: 169 vs 226 tok/s), a
-larger damping (0.1: 21.54; 0.03: 21.61) or more calibration windows (256: 21.44).
+The speed of the kernels does not change (same layout).
+
+**A pitfall that the first version of this table hid.** On 8 test windows GPTQ looked better than RTN everywhere; on the
+whole test split it was *worse than RTN on Llama-3.2-1B* (24.08 against 22.28) and recovered only 24 % on Qwen2.5-1.5B.
+`benchmarks/ppl_per_window.py` showed GPTQ better than RTN in 83 % of the windows but with a few windows completely broken
+(loss 9-10 per token instead of ~3), and a layer-by-layer comparison traced it to `layers.1.mlp.down_proj`: the layer that
+creates the "massive activation" of the attention-sink token (its input has a token 675x the median norm in Llama-3.2,
+790x in Qwen2.5-1.5B). That token dominates the Hessian and the error compensation then damages other tokens. Capping every
+calibration token's norm at 30x the median before it enters the Hessian (`token_clip=30`, the default) fixes it without
+touching the models that were fine: Llama 24.08 -> 20.12, Qwen-1.5B 13.91 -> 13.38, Qwen-0.5B 20.21 -> 20.20. (Quantising just
+that one layer with RTN also fixes Llama, 20.26, and Qwen-1.5B, 13.47, but *hurts* Qwen-0.5B, 20.83, so a fixed list of layers does
+not work.) Options that did not help consistently, hence off by default: `clip=True` (per-group range shrinking: helps
+OLMo and Qwen-1.5B, ruins Llama), `act_order=True` (the layers lose the q/k/v fusion), larger damping (0.1 turns Llama into 58 ppl
+before the cap) and more calibration windows.
 
 ### As a PyTorch op
 
@@ -354,8 +413,8 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   shape 896 → 4864, 4864 → 896, 896 → 128, 896 → 896) are run through the kernels and compared
   with vLLM's AWQ dequantisation and an f32 reference built from the GPTQ file format
   (`test/E2E/test_real_checkpoints.py`: downloads a few MB with HTTP Range requests, skips offline).
-  Real checkpoints are covered for `desc_act=False` GPTQ and `zero_point=True` AWQ (GEMM version);
-  act-order is tested against a synthetic g_idx only.
+  Real checkpoints are covered for `desc_act=False` and `desc_act=True` GPTQ, `zero_point=True` AWQ (GEMM version) and
+  FP8-dynamic (weights only: 0.55 % of its bf16 scales are subnormal in f16).
 * Epilogue: bias and residual are fused by initializing the accumulator
   (`run(bias=, residual=)`); `relu` / `silu` / `gelu` (tanh form) are applied to the f32
   accumulator before the store (`build(epilogue="silu")`, `activation=` in the torch op), i.e.

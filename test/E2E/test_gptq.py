@@ -68,3 +68,26 @@ def test_gptq_on_a_tiny_llama_end_to_end():
     assert st2["act_order"] == 14 and st2["fused_qkv"] == 0
     with torch.no_grad():
         assert torch.isfinite(model2(x).logits).all()
+
+
+def test_token_clip_keeps_a_massive_token_from_dominating_the_hessian():
+    """One token 500x the median norm: without the cap its outer product swamps H; with it, the layer is fitted to the rest."""
+    _require_gpu()
+    import quantforge.gptq as qg
+
+    w, x, _ = _layer_problem(seed=3)
+    x = x.clone()
+    x[0] *= 500.0                                                  # the "attention sink" token
+
+    def hessian(clip):
+        nrm = x.norm(dim=1)
+        xs = x * (clip * nrm.median() / nrm).clamp(max=1.0).unsqueeze(1) if clip else x
+        return 2.0 * xs.t() @ xs / x.shape[0]
+
+    typical = x[1:]                                                # error on the ordinary tokens
+    errs = {}
+    for clip in (0.0, 30.0):
+        q, scale, zero, _ = qg.gptq_quantize_weight(w, hessian(clip), 128)
+        deq = (q.float() - zero.float().repeat_interleave(128, 0)) * scale.float().repeat_interleave(128, 0)
+        errs[clip] = ((typical @ deq - typical @ w.t()) ** 2).mean().item()
+    assert errs[30.0] < errs[0.0], errs

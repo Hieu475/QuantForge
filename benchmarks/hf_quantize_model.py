@@ -42,14 +42,14 @@ def main():
                     help="also quantise the lm_head with this format (group size from --group-size)")
     ap.add_argument("--no-fp16", action="store_true", help="skip the fp16 baseline (does not fit the GPU)")
     ap.add_argument("--compile", action="store_true", help="torch.compile the quantised model before the CUDA-graph decode")
-    ap.add_argument("--nseq", type=int, default=8)
+    ap.add_argument("--nseq", type=int, default=8, help="number of test windows; 0 = the whole test split")
     ap.add_argument("--seqlen", type=int, default=512)
     ns = ap.parse_args()
 
     import pandas as pd
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(ns.model)
-    ids = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: ns.nseq * ns.seqlen]
+    ids = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: (ns.nseq * ns.seqlen) if ns.nseq else None]
     prompt = "Explain in one paragraph why the sky is blue."
 
     def load():

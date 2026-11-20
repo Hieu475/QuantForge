@@ -91,9 +91,34 @@ Bảng nói lên điều gì:
 * **Prefill (M từ 512 trở lên)**: 85 đến 86 phần trăm của Marlin, chậm hơn cuBLAS fp16 khoảng 20 đến 25 phần trăm, trong khi cuBLAS đọc nhiều gấp bốn lần byte nhưng không phải dequantise: ở đây kernel bị giới hạn bởi tính toán và dequantisation tranh slot issue với Tensor Core.
 * **M từ 32 đến 256** là điểm yếu, chậm hơn 13 đến 33 phần trăm. [Một bài riêng](04-mid-batch-postmortem.html) điều tra chi tiết.
 
+### So với các kernel khác
+
+Marlin có phải là thước đo công bằng duy nhất? Cùng phương pháp (L2 đã flush, thời gian device, các vòng xen kẽ) được áp dụng cho **gemlite**, một kernel W4A16 viết bằng Triton có autotuner riêng (phiên bản 0.6.0, cùng weight INT4 và scale), cho **bitsandbytes NF4** (bảng mã 4 bit riêng trên cùng ma trận fp16, nên là quantiser khác: chỉ để so tốc độ) và cho cuBLAS fp16. Thời gian kernel tính bằng micro giây, kernel INT4 nhanh nhất in đậm:
+
+| M x K x N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
+|---|--:|--:|--:|--:|--:|
+| 1 x 4096 x 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 x 4096 x 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 x 4096 x 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
+| 32 x 4096 x 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 x 4096 x 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 x 4096 x 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 x 4096 x 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 x 4096 x 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 x 4096 x 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 x 4096 x 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 x 11008 x 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
+
+Đọc bảng:
+
+* **QuantForge ngang gemlite ở batch 1** (49.9 so với 49.3 micro giây) và **hơn rõ rệt từ batch 4 trở lên**: gemlite cần 100 micro giây ở M = 4 và 61 ở M = 16, trong khi QuantForge cần 50. Kernel prefill của nó chậm hơn của QuantForge khoảng 15 phần trăm.
+* gemlite **nhanh hơn ở shape decode rộng** 1 x 4096 x 11008 (129 so với 150 micro giây): điểm yếu của kernel decode QuantForge là hành vi lưới / wave trên layer rộng, không phải trường hợp 4096 x 4096.
+* Marlin là kernel nhanh nhất từ M = 32 trở lên, như trước; đường NF4 của bitsandbytes chậm hơn ở mọi nơi trừ các shape decode rộng, nơi nó nằm trong 8 đến 15 phần trăm.
+* Cả ba kernel INT4 chạm cùng giới hạn DRAM khoảng 50 micro giây ở 4096 x 4096 batch 1, đúng là kết quả cần có cho một kernel bị giới hạn bộ nhớ.
+
 ## Kết quả: toàn bộ model
 
-Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `quantforge.nn.quantize_model` thay các layer `nn.Linear` của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp `silu(gate) * up`. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token của tập test Wikitext-2, INT4 round-to-nearest đơn giản (group 128) với head INT8.
+Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `quantforge.nn.quantize_model` thay các layer `nn.Linear` của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp `silu(gate) * up`. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token đầu của tập test Wikitext-2 (chỉ 8 cửa sổ: các giá trị trên toàn tập, thấp hơn 1 đến 2 điểm ở mọi model, nằm trong [bài về GPTQ](05-gptq-and-checkpoints.html)), INT4 round-to-nearest đơn giản (group 128) với head INT8.
 
 {{chart:e2e_speed}}
 
@@ -108,6 +133,12 @@ Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `
 | Mistral-7B-Instruct-v0.3 (từ checkpoint NF4) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | đỉnh 4.65 GB |
 
 Một model 3B và một model 7B chạy được trên card 6 GB vốn không chứa nổi chúng ở fp16. Cái giá về perplexity của 4 bit round-to-nearest là có thật (1 đến 4 điểm); [bài về GPTQ](05-gptq-and-checkpoints.html) cho thấy một quantiser thông minh hơn lấy lại được bao nhiêu. Mức tăng tốc giảm khi model lớn lên, vì lm_head, attention và khoảng 1400 kernel nhỏ của đồ thị Hugging Face chiếm phần lớn hơn của mỗi bước.
+
+### Đầu-cuối so với vLLM
+
+vLLM 0.25.1 (engine offline, CUDA graph, một request, 256 token mới, tốt nhất trong 3 lần) trên Qwen2.5-0.5B-Instruct: fp16 **165 token/s**, checkpoint GPTQ-Int4 chính thức với kernel Marlin **310 token/s** (nhanh hơn fp16 của chính nó 1.88 lần). QuantForge trong một model Hugging Face thường với static cache và CUDA graph: fp16 129, INT4 với head INT8 209 token/s (1.62 lần), 226 khi dùng `torch.compile` (1.75 lần).
+
+**Về giá trị tuyệt đối vLLM nhanh hơn rõ rệt**, và lý do không nằm ở kernel GEMM (bảng ở trên cho thấy QuantForge ngang Marlin ở batch 1) mà ở phần còn lại của model: vLLM gộp norm, rotary embedding, phép cộng residual và sampling, còn đồ thị Hugging Face phát khoảng 1400 kernel nhỏ mỗi bước decode. Với model 0.5B chúng chiếm phần lớn. Phép so sánh đầu-cuối công bằng là chạy kernel QuantForge *bên trong* vLLM (một plugin lượng tử hóa); đó là việc tương lai.
 
 ## Bằng chứng về độ đúng
 
@@ -133,6 +164,6 @@ out = model.generate(ids.cuda(), max_new_tokens=64)            # chạy trên c�
 ## Hạn chế, nói thẳng
 
 * Mọi số đo đến từ **một GPU laptop** với xung nhịp dao động; chưa có kết quả trên GPU data-center.
-* Baseline duy nhất là Marlin và cuBLAS. Machete, kernel Triton như gemlite, torchao và vLLM đầu-cuối chưa được so sánh.
+* Baseline: Marlin, gemlite (Triton), bitsandbytes và cuBLAS ở mức kernel, và vLLM đầu-cuối trên một model. Machete và torchao chưa được so sánh, và QuantForge chưa được chạy *bên trong* vLLM.
 * Kernel là PTX dựng bằng backend NVPTX của LLVM 18: không có Hopper `wgmma` hay TMA, không có activation FP8.
 * M từ 32 đến 256 và prefill vẫn thua Marlin; các bài tiếp theo giải thích những gì đã thử.

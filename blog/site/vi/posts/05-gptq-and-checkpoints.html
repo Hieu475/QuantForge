@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chất lượng 4-bit tốt hơn với GPTQ, nạp checkpoint AWQ / GPTQ thật, và vài cái bẫy - QuantForge Notes</title>
-<meta name="description" content="INT4 round-to-nearest mất 1 đến 4 điểm perplexity. Một bản GPTQ trong thư viện lấy lại 17 đến 65 phần trăm, checkpoint AWQ và GPTQ thật được nạp và kiểm chứng, và các thứ không giúp được liệt kê rõ.">
+<meta name="description" content="INT4 round-to-nearest mất 2 đến 4 điểm perplexity. Một bản GPTQ lấy lại 38 đến 66 phần trăm, sau một câu chuyện gỡ lỗi về massive activation từng làm nó tệ hơn RTN trên Llama. Checkpoint AWQ, GPTQ (cả act-order) và FP8 thật được nạp và kiểm chứng.">
 <link rel="stylesheet" href="../../assets/style.css">
 </head>
 <body>
@@ -13,10 +13,11 @@
   <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/05-gptq-and-checkpoints.html" hreflang="en">English</a></nav>
 </div></header>
 <main class="wrap">
-<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Chất lượng 4-bit tốt hơn với GPTQ, nạp checkpoint AWQ / GPTQ thật, và vài cái bẫy</h1><p class="lede">INT4 round-to-nearest mất 1 đến 4 điểm perplexity. Một bản GPTQ trong thư viện lấy lại 17 đến 65 phần trăm, checkpoint AWQ và GPTQ thật được nạp và kiểm chứng, và các thứ không giúp được liệt kê rõ.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Chất lượng 4-bit tốt hơn với GPTQ, nạp checkpoint AWQ / GPTQ thật, và vài cái bẫy</h1><p class="lede">INT4 round-to-nearest mất 2 đến 4 điểm perplexity. Một bản GPTQ lấy lại 38 đến 66 phần trăm, sau một câu chuyện gỡ lỗi về massive activation từng làm nó tệ hơn RTN trên Llama. Checkpoint AWQ, GPTQ (cả act-order) và FP8 thật được nạp và kiểm chứng.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
 <ul>
 <li><a href="#round-to-nearest-uong-co-so">Round-to-nearest: đường cơ sở</a></li>
 <li><a href="#gptq-trong-thu-vien">GPTQ trong thư viện</a><ul>
+<li><a href="#mot-cai-bay-phien-ban-au-cua-bang-nay-a-sai">Một cái bẫy: phiên bản đầu của bảng này đã sai</a></li>
 <li><a href="#nhung-thu-khong-giup-nen-mac-inh-tat">Những thứ không giúp (nên mặc định tắt)</a></li>
 </ul>
 </li>
@@ -34,25 +35,25 @@
 <p><code>quantforge.gptq.quantize_model_gptq</code> cài đặt GPTQ tuần tự (Frantar và cộng sự) và cho ra đúng các layout mà kernel dùng:</p>
 <ol>
 <li>các decoder layer chạy trên 128 cửa sổ hiệu chỉnh 512 token; hidden state đi vào layer đầu được bắt bằng một module thế chỗ ghi lại input rồi hủy lượt forward;</li>
-<li>từng layer một, một forward pre-hook trên mọi Linear tích lũy Hessian của input, <code>H = 2 X^T X / n</code>, trong khi layer xử lý activation hiệu chỉnh;</li>
+<li>từng layer một, một forward pre-hook trên mọi Linear tích lũy Hessian của input, <code>H = 2 X^T X / n</code>, trong khi layer xử lý activation hiệu chỉnh (với norm của mỗi token bị giới hạn ở 30 lần trung vị, xem cái bẫy bên dưới);</li>
 <li>mỗi Linear được lượng tử hóa từng cột; sai số của mỗi cột đã làm tròn, nhân theo đường chéo của nghịch đảo thừa số Cholesky của <code>H</code>, được đẩy sang các cột chưa lượng tử hóa;</li>
 <li>scale và zero point của nhóm được tính từ weight <em>đã cập nhật</em> ở đầu mỗi nhóm, với scale được làm tròn về f16 <strong>trước</strong> khi lan truyền sai số, để quá trình tối ưu thấy đúng weight mà kernel sẽ dùng;</li>
 <li>layer đã lượng tử hóa được chạy lại trên tập hiệu chỉnh; output của nó là input của layer kế tiếp (nên các layer sau thấy nhiễu lượng tử hóa của các layer trước).</li>
 </ol>
-<p>Hiệu chỉnh mất 43 giây cho Qwen2.5-0.5B và 125 giây cho 1.5B trên GPU laptop 6 GB. Bộ nhớ bị chặn bởi một layer, các Hessian của nó (lớn nhất, <code>down_proj</code>, là <code>intermediate x intermediate</code> ở f32) và các activation đã lưu.</p>
-<figure class="viz"><div class="viz-title">Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>RTN INT4</span><span class="lg"><i class="sw s2"></i>GPTQ INT4</span><span class="lg"><i class="sw mk"></i>mốc fp16</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">6</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">12</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">18</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">24</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">30</text><path class="s1" d="M104.2 268 V72.9 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - RTN INT4: 24.08</title></path><text class="val" x="121.2" y="63.9" text-anchor="middle">24.08</text><path class="s2" d="M140.2 268 V95.3 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - GPTQ INT4: 21.38</title></path><text class="val" x="157.2" y="86.3" text-anchor="middle">21.38</text><line class="marker" x1="99.2" y1="103.2" x2="179.2" y2="103.2"><title>Qwen2.5
-0.5B - mốc fp16: 19.93</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V145.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-1.5B - RTN INT4: 15.31</title></path><text class="val" x="295.8" y="136.4" text-anchor="middle">15.31</text><path class="s2" d="M314.8 268 V148.0 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-1.5B - GPTQ INT4: 15.00</title></path><text class="val" x="331.8" y="139.0" text-anchor="middle">15.00</text><line class="marker" x1="273.8" y1="156.6" x2="353.8" y2="156.6"><title>Qwen2.5
-1.5B - mốc fp16: 13.48</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V70.1 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - RTN INT4: 24.42</title></path><text class="val" x="470.2" y="61.1" text-anchor="middle">24.42</text><path class="s2" d="M489.2 268 V78.6 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - GPTQ INT4: 23.39</title></path><text class="val" x="506.2" y="69.6" text-anchor="middle">23.39</text><line class="marker" x1="448.2" y1="101.4" x2="528.2" y2="101.4"><title>Llama-3.2
-1B - mốc fp16: 20.15</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V95.8 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - RTN INT4: 21.31</title></path><text class="val" x="644.8" y="86.8" text-anchor="middle">21.31</text><path class="s2" d="M663.8 268 V101.5 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - GPTQ INT4: 20.62</title></path><text class="val" x="680.8" y="92.5" text-anchor="middle">20.62</text><line class="marker" x1="622.8" y1="108.3" x2="702.8" y2="108.3"><title>OLMo-2
-1B - mốc fp16: 19.32</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>8 x 512 token test; GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>mốc fp16</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>24.08</td><td>21.38</td><td>19.93</td></tr><tr><th>Qwen2.5 1.5B</th><td>15.31</td><td>15.00</td><td>13.48</td></tr><tr><th>Llama-3.2 1B</th><td>24.42</td><td>23.39</td><td>20.15</td></tr><tr><th>OLMo-2 1B</th><td>21.31</td><td>20.62</td><td>19.32</td></tr></tbody></table></details></figure>
+<p>Hiệu chỉnh mất 42 giây cho Qwen2.5-0.5B và 121 giây cho 1.5B trên GPU laptop 6 GB. Bộ nhớ bị chặn bởi một layer, các Hessian của nó (lớn nhất, <code>down_proj</code>, là <code>intermediate x intermediate</code> ở f32) và các activation đã lưu.</p>
+<figure class="viz"><div class="viz-title">Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>RTN INT4</span><span class="lg"><i class="sw s2"></i>GPTQ INT4</span><span class="lg"><i class="sw mk"></i>mốc fp16</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">5</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">10</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">15</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">20</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">25</text><path class="s1" d="M104.2 268 V44.7 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - RTN INT4: 22.91</title></path><text class="val" x="121.2" y="35.7" text-anchor="middle">22.91</text><path class="s2" d="M140.2 268 V71.6 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - GPTQ INT4: 20.20</title></path><text class="val" x="157.2" y="62.6" text-anchor="middle">20.20</text><line class="marker" x1="99.2" y1="81.6" x2="179.2" y2="81.6"><title>Qwen2.5
+0.5B - mốc fp16: 18.79</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V130.1 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - RTN INT4: 14.30</title></path><text class="val" x="295.8" y="121.1" text-anchor="middle">14.30</text><path class="s2" d="M314.8 268 V139.3 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - GPTQ INT4: 13.38</title></path><text class="val" x="331.8" y="130.3" text-anchor="middle">13.38</text><line class="marker" x1="273.8" y1="142.4" x2="353.8" y2="142.4"><title>Qwen2.5
+1.5B - mốc fp16: 12.66</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V51.0 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - RTN INT4: 22.28</title></path><text class="val" x="470.2" y="42.0" text-anchor="middle">22.28</text><path class="s2" d="M489.2 268 V72.4 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - GPTQ INT4: 20.12</title></path><text class="val" x="506.2" y="63.4" text-anchor="middle">20.12</text><line class="marker" x1="448.2" y1="90.3" x2="528.2" y2="90.3"><title>Llama-3.2
+1B - mốc fp16: 17.91</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V83.3 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - RTN INT4: 19.02</title></path><text class="val" x="644.8" y="74.3" text-anchor="middle">19.02</text><path class="s2" d="M663.8 268 V90.0 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - GPTQ INT4: 18.35</title></path><text class="val" x="680.8" y="81.0" text-anchor="middle">18.35</text><line class="marker" x1="622.8" y1="97.0" x2="702.8" y2="97.0"><title>OLMo-2
+1B - mốc fp16: 17.24</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>Toàn bộ tập test Wikitext-2 (564-584 cửa sổ 512 token); GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>mốc fp16</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>22.91</td><td>20.20</td><td>18.79</td></tr><tr><th>Qwen2.5 1.5B</th><td>14.30</td><td>13.38</td><td>12.66</td></tr><tr><th>Llama-3.2 1B</th><td>22.28</td><td>20.12</td><td>17.91</td></tr><tr><th>OLMo-2 1B</th><td>19.02</td><td>18.35</td><td>17.24</td></tr></tbody></table></details></figure>
 <table>
 <thead>
 <tr>
@@ -66,93 +67,51 @@
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B-Instruct</td>
-<td style="text-align: right;">19.93</td>
-<td style="text-align: right;">24.08</td>
-<td style="text-align: right;"><strong>21.38</strong></td>
-<td style="text-align: right;">65 %</td>
+<td style="text-align: right;">18.79</td>
+<td style="text-align: right;">22.91</td>
+<td style="text-align: right;"><strong>20.20</strong></td>
+<td style="text-align: right;">66 %</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B-Instruct</td>
-<td style="text-align: right;">13.48</td>
-<td style="text-align: right;">15.31</td>
-<td style="text-align: right;"><strong>15.00</strong></td>
-<td style="text-align: right;">17 %</td>
+<td style="text-align: right;">12.66</td>
+<td style="text-align: right;">14.30</td>
+<td style="text-align: right;"><strong>13.38</strong></td>
+<td style="text-align: right;">56 %</td>
 </tr>
 <tr>
 <td>Llama-3.2-1B-Instruct</td>
-<td style="text-align: right;">20.15</td>
-<td style="text-align: right;">24.42</td>
-<td style="text-align: right;"><strong>23.39</strong></td>
-<td style="text-align: right;">24 %</td>
+<td style="text-align: right;">17.91</td>
+<td style="text-align: right;">22.28</td>
+<td style="text-align: right;"><strong>20.12</strong></td>
+<td style="text-align: right;">49 %</td>
 </tr>
 <tr>
 <td>OLMo-2-0425-1B-Instruct</td>
-<td style="text-align: right;">19.32</td>
-<td style="text-align: right;">21.31</td>
-<td style="text-align: right;"><strong>20.62</strong></td>
-<td style="text-align: right;">34 %</td>
+<td style="text-align: right;">17.24</td>
+<td style="text-align: right;">19.02</td>
+<td style="text-align: right;"><strong>18.35</strong></td>
+<td style="text-align: right;">38 %</td>
 </tr>
 </tbody>
 </table>
-<p>Hiệu chỉnh dùng các cửa sổ của tập <em>train</em> Wikitext-2; perplexity đo trên 8 x 512 token của tập <em>test</em>. Tốc độ decode không đổi (cùng layout): 226 token/s so với 219 cho Qwen2.5-0.5B trong cùng phiên, nằm trong nhiễu của máy này.</p>
-<p><strong>Một cách đọc trung thực</strong>: GPTQ luôn giúp, nhưng mức tăng rất không đều (65 phần trăm mất mát ở model nhỏ nhất, 17 phần trăm ở 1.5B). Tôi chưa có lời giải thích rõ ràng; các model mà mất mát RTN bị chi phối bởi vài kênh ngoại lai có vẻ hưởng lợi nhiều nhất. Với tập test tám cửa sổ 4096 token, chữ số thập phân thứ hai của các perplexity này cũng nhạy với nhiễu. Một nghiên cứu đàng hoàng nên dùng toàn bộ tập test và nhiều seed cho các cửa sổ hiệu chỉnh.</p>
+<p>Đây là perplexity trên <strong>toàn bộ</strong> tập test Wikitext-2 (564 đến 584 cửa sổ 512 token); hiệu chỉnh dùng các cửa sổ của tập <em>train</em>. Tốc độ decode không đổi (cùng layout): khoảng 226 token/s cho cả hai biến thể trên Qwen2.5-0.5B.</p>
+<h3 id="mot-cai-bay-phien-ban-au-cua-bang-nay-a-sai">Một cái bẫy: phiên bản đầu của bảng này đã sai<a class="headerlink" href="#mot-cai-bay-phien-ban-au-cua-bang-nay-a-sai" title="Permanent link">#</a></h3>
+<p>Lần đo đầu của tôi chỉ dùng 8 cửa sổ test đầu tiên (4096 token), và trên đó GPTQ thắng round-to-nearest ở mọi model. Đo lại trên toàn tập test cho thấy trên <strong>Llama-3.2-1B GPTQ tệ hơn RTN (24.08 so với 22.28)</strong> và trên Qwen2.5-1.5B nó chỉ lấy lại 24 phần trăm mất mát. Tám cửa sổ đơn giản là quá ít cho một phương pháp mà các lỗi hiếm khi xảy ra. Cuộc điều tra, qua bốn bước:</p>
+<ol>
+<li><strong>Loss theo từng cửa sổ</strong> (<code>benchmarks/ppl_per_window.py</code>): GPTQ tốt hơn RTN ở 83 phần trăm số cửa sổ (chênh lệch trung vị -0.11 nat), nhưng ở vài cửa sổ nó hỏng hoàn toàn, với loss 9 đến 10 mỗi token thay vì khoảng 3. Một nhúm cửa sổ như vậy chi phối trung bình.</li>
+<li><strong>Theo từng layer</strong> (hidden state so với model fp16 trên một cửa sổ tốt và một cửa sổ hỏng): sai số nhỏ cho đến layer 1 rồi bùng nổ ở <em>một vị trí token</em> (vị trí 1 trong cửa sổ hỏng) và lan từ đó sang mọi token sau.</li>
+<li><strong>Layer nào?</strong> Chỉ quantize <code>layers.1.mlp.down_proj</code> bằng RTN (còn lại bằng GPTQ) đưa Llama từ 24.08 xuống 20.26. Layer đó tạo ra <em>massive activation</em> của token attention-sink: input của nó chứa một token có norm <strong>gấp 675 lần trung vị</strong> (790 lần ở Qwen2.5-1.5B). Trong chính layer đó sai số trung bình của GPTQ trên các token hiệu chỉnh thấp hơn RTN 2.5 đến 5 lần, đúng như thiết kế, nên kiểm tra sai số trung bình không thể thấy vấn đề.</li>
+<li><strong>Vì sao</strong>: token đơn lẻ đó chi phối Hessian <code>H = 2 X^T X / n</code>, việc bù sai số được tinh chỉnh theo nó, và các token khác, cũng như các token sink ở vị trí khác, phải trả giá.</li>
+</ol>
+<p>Một danh sách layer cố định không phải cách sửa: ép RTN cho các layer massive-activation giúp Llama (20.26) và Qwen-1.5B (13.47) nhưng làm hại Qwen-0.5B (20.83 so với 20.20). Thứ hiệu quả cho cả ba là <strong>giới hạn norm token trong Hessian</strong>: trước khi một token hiệu chỉnh vào <code>H</code>, norm của nó bị giới hạn ở 30 lần norm token trung vị. Token massive vẫn tham gia nhưng với trọng số bị chặn. Kết quả: Llama 24.08 xuống <strong>20.12</strong>, Qwen-1.5B 13.91 xuống <strong>13.38</strong>, Qwen-0.5B không đổi (20.21 xuống 20.20). Đây là mặc định (<code>token_clip=30</code>).</p>
 <h3 id="nhung-thu-khong-giup-nen-mac-inh-tat">Những thứ không giúp (nên mặc định tắt)<a class="headerlink" href="#nhung-thu-khong-giup-nen-mac-inh-tat" title="Permanent link">#</a></h3>
-<table>
-<thead>
-<tr>
-<th>biến thể</th>
-<th style="text-align: right;">Qwen 0.5B</th>
-<th style="text-align: right;">Qwen 1.5B</th>
-<th style="text-align: right;">Llama-3.2 1B</th>
-<th style="text-align: right;">OLMo-2 1B</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>GPTQ, mặc định (damping 0.01, group 128)</td>
-<td style="text-align: right;">21.38</td>
-<td style="text-align: right;">15.00</td>
-<td style="text-align: right;">23.39</td>
-<td style="text-align: right;">20.62</td>
-</tr>
-<tr>
-<td>+ cắt khoảng giá trị theo nhóm (<code>clip=True</code>)</td>
-<td style="text-align: right;">21.66</td>
-<td style="text-align: right;"><strong>14.40</strong></td>
-<td style="text-align: right;">30.87</td>
-<td style="text-align: right;"><strong>19.77</strong></td>
-</tr>
-<tr>
-<td>act-order (<code>act_order=True</code>)</td>
-<td style="text-align: right;">21.74</td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-</tr>
-<tr>
-<td>damping 0.1 / 0.03</td>
-<td style="text-align: right;">21.54 / 21.61</td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-</tr>
-<tr>
-<td>256 cửa sổ hiệu chỉnh</td>
-<td style="text-align: right;">21.44</td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-</tr>
-<tr>
-<td>group size 64</td>
-<td style="text-align: right;"><strong>21.26</strong></td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-<td style="text-align: right;"></td>
-</tr>
-</tbody>
-</table>
-<p>Cắt khoảng giá trị (co min/max của mỗi hàng trong nhóm khi điều đó giảm sai số làm tròn của weight) là thứ thú vị nhất: nó cho kết quả tốt nhất trên hai model và tệ nhất trên Llama-3.2-1B, nơi perplexity nhảy từ 23.4 lên 30.9. Tiêu chí nó tối ưu, sai số của weight, không phải sai số output của layer mà GPTQ tối ưu, và hai thứ này bất đồng ở một số layer. Nó vẫn là một tùy chọn. Act-order cũng tốn tốc độ: một layer có hoán vị đầu vào không thể tham gia việc gộp q/k/v, nên decode tụt từ 226 xuống 169 token/s trên Qwen2.5-0.5B.</p>
+<ul>
+<li>cắt khoảng giá trị theo nhóm (<code>clip=True</code>): giúp OLMo và Qwen-1.5B, làm hỏng Llama-3.2-1B (30.9 trên 8 cửa sổ đầu so với 23.4 khi không dùng): sai số làm tròn trong không gian weight mà nó tối thiểu hóa không phải sai số output của layer mà GPTQ tối thiểu hóa;</li>
+<li>act-order (<code>act_order=True</code>): một layer có hoán vị đầu vào không thể tham gia việc gộp q/k/v, nên decode tụt từ 226 xuống 169 token/s trên Qwen2.5-0.5B, và perplexity cũng không tốt hơn;</li>
+<li>damping lớn hơn: trước khi có giới hạn token, 0.1 biến Llama thành model có perplexity 58 (giới hạn token làm kết quả ít nhạy với nó hơn nhiều);</li>
+<li>nhiều cửa sổ hiệu chỉnh hơn (256) hoặc dài hơn (2048 token): không có mức tăng nhất quán.</li>
+</ul>
 <h2 id="checkpoint-awq-va-gptq-that">Checkpoint AWQ và GPTQ thật<a class="headerlink" href="#checkpoint-awq-va-gptq-that" title="Permanent link">#</a></h2>
 <p>Hầu hết model 4 bit trên Hub là file AWQ hoặc GPTQ. <code>quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")</code> chuyển các tensor đóng gói int32 sang layout của kernel (<code>quant.from_gptq</code>, <code>quant.from_awq</code>), hỗ trợ checkpoint GPTQ <code>desc_act</code> bằng cách hoán vị hàng offline (hoán vị activation được áp bằng một phép gather nhỏ lúc chạy) và quy ước zero-point <code>gptq_v2</code>.</p>
 <p>Kiểm chứng với bản sinh đôi dense (cùng weight đã dequantise trong các layer <code>nn.Linear</code> thường), Qwen2.5-0.5B-Instruct, 16 x 512 token test:</p>
@@ -181,8 +140,23 @@
 <td style="text-align: right;">59 / 59 token giống hệt</td>
 <td style="text-align: right;">184 tok/s</td>
 </tr>
+<tr>
+<td><strong>TinyLlama-1.1B GPTQ với <code>desc_act=True</code></strong> (TheBloke; cả 154 layer có act-order)</td>
+<td style="text-align: right;">17.259</td>
+<td style="text-align: right;">17.259</td>
+<td style="text-align: right;">60 / 60 token giống hệt</td>
+<td style="text-align: right;">124 tok/s (layer act-order không được gộp)</td>
+</tr>
+<tr>
+<td><strong>FP8-dynamic</strong> (RedHatAI, scale theo kênh), Qwen2.5-0.5B</td>
+<td style="text-align: right;">22.543</td>
+<td style="text-align: right;">22.543 (model fp16 gốc: 22.441)</td>
+<td style="text-align: right;">28 / 59 giống, xem bên dưới</td>
+<td style="text-align: right;">165 tok/s</td>
+</tr>
 </tbody>
 </table>
+<p>File FP8 chỉ cung cấp <em>weight</em> (activation vẫn là fp16); scale theo kênh của nó được mở rộng ra group 128 và 0.55 phần trăm trong số đó là subnormal ở f16. Các lần greedy decode lệch nhau sau 28 token vì hai token gần hòa đổi chỗ dưới phép làm tròn fp16 hơi khác của phép nhân ma trận bên bản sinh đôi; logit khớp 99.4 phần trăm top-1 và perplexity giống hệt đến ba chữ số thập phân, nên đây là chuyện phá thế hòa, không phải lỗi. Checkpoint act-order là bài kiểm tra <em>thật</em> đầu tiên của đường hoán vị hàng (trước đó chỉ test bằng file tổng hợp).</p>
 <h3 id="cai-bay-ton-mot-gio-awq-thay-oi-cac-norm">Cái bẫy tốn một giờ: AWQ thay đổi các norm<a class="headerlink" href="#cai-bay-ton-mot-gio-awq-thay-oi-cac-norm" title="Permanent link">#</a></h3>
 <p>Lần chạy AWQ đầu tiên in ra perplexity <strong>83,014</strong> cho bản sinh đôi dense trong khi model QuantForge, dựng cùng cách, in 26.7. Một layer đơn lẻ khớp tới từng bit, nên kernel không sao. Nguyên nhân: AWQ nhân các kênh đầu vào của một layer tuyến tính với một hệ số học được <code>s</code> để bảo vệ các weight quan trọng, và gộp nghịch đảo của hệ số đó vào phép tính <em>đứng trước</em>, thường là weight của RMSNorm. Vì vậy weight norm lưu trong checkpoint AWQ không phải của model gốc. Nạp chỉ các layer tuyến tính đã lượng tử hóa lên trên norm của model gốc cho kết quả rác; loader giờ copy mọi tensor phi tuyến (embedding, norm) tồn tại ở cả checkpoint và model, và README có ghi điều này. GPTQ không làm vậy, đó là lý do GPTQ chạy đúng ngay lần đầu.</p>
 <h2 id="tai-hien">Tái hiện<a class="headerlink" href="#tai-hien" title="Permanent link">#</a></h2>

@@ -30,27 +30,35 @@ def main():
     ap.add_argument("--train", required=True)
     ap.add_argument("--text", required=True)
     ap.add_argument("--group-size", type=int, default=128)
+    ap.add_argument("--seed", type=int, default=0, help="seed of the calibration windows")
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--calib-len", type=int, default=512)
     ap.add_argument("--act-order", action="store_true")
+    ap.add_argument("--rtn", nargs="*", default=[], help="Linears quantised with RTN instead of GPTQ, e.g. 1.mlp.down_proj")
+    ap.add_argument("--token-clip", type=float, default=30.0, help="cap token norms at this multiple of the median in the Hessian (0 = off)")
     ap.add_argument("--clip", action="store_true", help="per-row range shrinking search at every group")
     ap.add_argument("--damp", type=float, default=0.01)
-    ap.add_argument("--nseq", type=int, default=8)
+    ap.add_argument("--nseq", type=int, default=8, help="number of test windows; 0 = the whole test split")
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--no-rtn", action="store_true")
+    ap.add_argument("--fp16", action="store_true", help="also measure the fp16 perplexity (model must fit the GPU)")
     ns = ap.parse_args()
 
     import pandas as pd
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(ns.model)
-    test = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: ns.nseq * ns.seqlen]
-    calib = qgptq.calibration_ids(tok, "\n\n".join(pd.read_parquet(ns.train)["text"]), ns.nsamples, ns.calib_len)
+    test = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: (ns.nseq * ns.seqlen) if ns.nseq else None]
+    calib = qgptq.calibration_ids(tok, "\n\n".join(pd.read_parquet(ns.train)["text"]), ns.nsamples, ns.calib_len, ns.seed)
     prompt = "Explain in one paragraph why the sky is blue."
 
     def load():
         return AutoModelForCausalLM.from_pretrained(ns.model, dtype=torch.float16, low_cpu_mem_usage=True).eval()
 
     rows = []
+    if ns.fp16:
+        m = load().cuda()
+        print(f"  fp16 perplexity {perplexity(m, test, ns.seqlen):.3f}", flush=True)
+        del m; gc.collect(); torch.cuda.empty_cache()
 
     def evaluate(label, m, seconds):
         rows.append((label, perplexity(m, test, ns.seqlen), graph_run(m, tok, prompt, 48)[0], seconds,
@@ -66,7 +74,7 @@ def main():
 
     m = load()
     t = time.time()
-    st = qgptq.quantize_model_gptq(m, calib, ns.group_size, ns.damp, ns.act_order, clip=ns.clip)
+    st = qgptq.quantize_model_gptq(m, calib, ns.group_size, ns.damp, ns.act_order, clip=ns.clip, rtn=tuple(ns.rtn), token_clip=ns.token_clip)
     qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
     evaluate("GPTQ" + (" act-order" if ns.act_order else "") + (" clip" if ns.clip else ""), m, time.time() - t)
     print(f"({st['quantized']} layers, fused qkv {st['fused_qkv']}, mlp {st['fused_mlp']}, act-order layers {st['act_order']}; "

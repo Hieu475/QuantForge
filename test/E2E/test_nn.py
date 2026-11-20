@@ -187,3 +187,28 @@ def test_phi3_style_stacked_gate_up_is_fused(fmt):
     with torch.no_grad():
         u, f = unfused(ids).logits.float(), fused(ids).logits.float()
     assert (f - u).abs().max().item() < 5e-3 * u.abs().max().item() + 5e-3
+
+
+def test_load_fp8_per_channel_checkpoint():
+    """compressed-tensors style FP8 file: `<layer>.weight` float8_e4m3fn [out, in] + `<layer>.weight_scale` [out, 1]."""
+    _require_gpu()
+    import quantforge.nn as qnn
+
+    model = _tiny("qwen2")
+    tensors, ref = {}, copy.deepcopy(model)
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear) or name == "lm_head":
+            continue
+        w = mod.weight.data.float()                                           # [out, in]
+        scale = (w.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-8)   # per output channel
+        w8 = (w / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        tensors[f"{name}.weight"], tensors[f"{name}.weight_scale"] = w8, scale.to(torch.bfloat16)
+        if mod.bias is not None:
+            tensors[f"{name}.bias"] = mod.bias.data.clone()
+        ref.get_submodule(name).weight.data = (w8.float() * scale.to(torch.bfloat16).float()).half()
+    st = qnn.load_quantized_checkpoint(model, tensors, "fp8")
+    assert st["quantized"] == 2 * 7 and st["fused_qkv"] == 2
+    ids = torch.randint(0, 512, (2, 24), device="cuda")
+    with torch.no_grad():
+        r, f = ref.cuda()(ids).logits.float(), model(ids).logits.float()
+    assert (f - r).abs().max().item() < 5e-3 * r.abs().max().item() + 5e-3
