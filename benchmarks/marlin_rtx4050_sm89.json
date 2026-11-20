@@ -7,208 +7,364 @@
       "K": 4096,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_7fc0505da1",
+      "quantforge_opts": "3bf5f6db2d1015a1f371a452571fa4fb",
       "err_marlin": 0.011505126953125,
       "err_quantforge": 0.0002593994140625,
       "ref_max": 35.693756103515625,
       "marlin": {
-        "us": 49.438999999999396,
-        "tflops": 0.6787036954631043,
-        "weight_gbs_int4": 169.67592386577607
+        "us": 49.630999999997584,
+        "tflops": 0.6760780963511037,
+        "weight_gbs_int4": 169.01952408777595
       },
       "quantforge": {
-        "us": 37.952000000001135,
-        "tflops": 0.884128161888675,
-        "weight_gbs_int4": 221.03204047216877
+        "us": 50.0480000000025,
+        "tflops": 0.6704450127876903,
+        "weight_gbs_int4": 167.61125319692258
       },
       "cublas_fp16": {
-        "us": 180.8289999999979,
-        "tflops": 0.18555890924575366,
-        "weight_gbs_int4": 46.38972731143841
+        "us": 180.92700000000332,
+        "tflops": 0.18545840034930877,
+        "weight_gbs_int4": 46.3646000873272
       },
-      "quantforge_vs_marlin": 1.3026717959527274
+      "quantforge_vs_marlin": 0.9916679987211299
     },
     {
       "M": 4,
       "K": 4096,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_7fc0505da1",
+      "quantforge_opts": "3bf5f6db2d1015a1f371a452571fa4fb",
       "err_marlin": 0.01149749755859375,
       "err_quantforge": 0.00032806396484375,
       "ref_max": 37.659915924072266,
       "marlin": {
-        "us": 49.43899999999849,
-        "tflops": 2.714814781852467,
-        "weight_gbs_int4": 169.67592386577917
+        "us": 49.44000000000233,
+        "tflops": 2.714759870550034,
+        "weight_gbs_int4": 169.67249190937713
       },
       "quantforge": {
-        "us": 37.984000000004016,
-        "tflops": 3.5335332771689605,
-        "weight_gbs_int4": 220.84582982306003
+        "us": 49.791000000004715,
+        "tflops": 2.695622261050939,
+        "weight_gbs_int4": 168.47639131568368
       },
       "cublas_fp16": {
-        "us": 181.66199999999662,
-        "tflops": 0.7388321608261633,
-        "weight_gbs_int4": 46.17701005163521
+        "us": 181.5020000000004,
+        "tflops": 0.7394834657469322,
+        "weight_gbs_int4": 46.21771660918326
       },
-      "quantforge_vs_marlin": 1.3015743470933354
+      "quantforge_vs_marlin": 0.9929505332288495
     },
     {
       "M": 16,
       "K": 4096,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_7fc0505da1",
+      "quantforge_opts": "3bf5f6db2d1015a1f371a452571fa4fb",
       "err_marlin": 0.0154876708984375,
       "err_quantforge": 0.00031280517578125,
       "ref_max": 40.20481872558594,
       "marlin": {
-        "us": 50.0480000000025,
-        "tflops": 10.727120204603045,
-        "weight_gbs_int4": 167.61125319692258
+        "us": 50.047999999998865,
+        "tflops": 10.727120204603825,
+        "weight_gbs_int4": 167.61125319693474
       },
       "quantforge": {
-        "us": 49.98399999999674,
-        "tflops": 10.740855313701084,
-        "weight_gbs_int4": 167.82586427657944
+        "us": 49.79200000000128,
+        "tflops": 10.782272493572988,
+        "weight_gbs_int4": 168.47300771207793
       },
       "cublas_fp16": {
-        "us": 182.97400000000016,
-        "tflops": 2.934137702624414,
-        "weight_gbs_int4": 45.84590160350647
+        "us": 182.33499999999913,
+        "tflops": 2.944420500726699,
+        "weight_gbs_int4": 46.00657032385467
       },
-      "quantforge_vs_marlin": 1.0012804097312293
+      "quantforge_vs_marlin": 1.0051413881747586
     },
     {
       "M": 1,
       "K": 4096,
       "N": 11008,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_353daa57f8",
+      "quantforge_opts": "e9fa073d104df82478d6232e273bad78",
       "err_marlin": 0.01430511474609375,
       "err_quantforge": 0.00031280517578125,
       "ref_max": 40.572265625,
       "marlin": {
-        "us": 126.71800000000076,
-        "tflops": 0.7116395145125354,
-        "weight_gbs_int4": 177.90987862813384
+        "us": 126.62300000000052,
+        "tflops": 0.7121734282081426,
+        "weight_gbs_int4": 178.04335705203565
       },
       "quantforge": {
-        "us": 139.23000000000138,
-        "tflops": 0.6476875386051792,
-        "weight_gbs_int4": 161.9218846512948
+        "us": 149.279,
+        "tflops": 0.6040872192337838,
+        "weight_gbs_int4": 151.02180480844595
       },
       "cublas_fp16": {
-        "us": 482.3299999999999,
-        "tflops": 0.18696232040304359,
-        "weight_gbs_int4": 46.740580100760894
+        "us": 482.87399999999616,
+        "tflops": 0.18675169091730082,
+        "weight_gbs_int4": 46.6879227293252
       },
-      "quantforge_vs_marlin": 0.9101343101343066
+      "quantforge_vs_marlin": 0.8482304945772715
     },
     {
       "M": 1,
       "K": 11008,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_6964d68b09",
+      "quantforge_opts": "9904af7019c667d69df74f362179bb55",
       "err_marlin": 0.015392303466796875,
       "err_quantforge": 0.0009918212890625,
       "ref_max": 54.66216278076172,
       "marlin": {
-        "us": 127.03799999999957,
-        "tflops": 0.7098469434342505,
-        "weight_gbs_int4": 177.46173585856263
+        "us": 127.03900000000067,
+        "tflops": 0.7098413558041193,
+        "weight_gbs_int4": 177.46033895102985
       },
       "quantforge": {
-        "us": 135.10299999999916,
-        "tflops": 0.6674724913584492,
-        "weight_gbs_int4": 166.8681228396123
+        "us": 131.00700000000143,
+        "tflops": 0.6883413558054075,
+        "weight_gbs_int4": 172.08533895135187
       },
       "cublas_fp16": {
-        "us": 483.29100000000017,
-        "tflops": 0.18659055517276332,
-        "weight_gbs_int4": 46.647638793190836
+        "us": 483.612000000001,
+        "tflops": 0.1864667047136957,
+        "weight_gbs_int4": 46.61667617842393
       },
-      "quantforge_vs_marlin": 0.9403048044825086
+      "quantforge_vs_marlin": 0.969711542131331
     },
     {
       "M": 16,
       "K": 4096,
       "N": 11008,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_353daa57f8",
+      "quantforge_opts": "e9fa073d104df82478d6232e273bad78",
       "err_marlin": 0.015468597412109375,
       "err_quantforge": 0.000335693359375,
       "ref_max": 42.945125579833984,
       "marlin": {
-        "us": 127.38999999999942,
-        "tflops": 11.32616827066494,
-        "weight_gbs_int4": 176.97137922913967
+        "us": 127.16700000000127,
+        "tflops": 11.34602983478407,
+        "weight_gbs_int4": 177.28171616850108
       },
       "quantforge": {
-        "us": 148.92699999999968,
-        "tflops": 9.688240386229516,
-        "weight_gbs_int4": 151.3787560348362
+        "us": 149.2149999999965,
+        "tflops": 9.669541105117004,
+        "weight_gbs_int4": 151.08657976745317
       },
       "cublas_fp16": {
-        "us": 498.55399999999645,
-        "tflops": 2.8940507467596492,
-        "weight_gbs_int4": 45.21954291811952
+        "us": 498.4890000000014,
+        "tflops": 2.894428113759774,
+        "weight_gbs_int4": 45.22543927749647
       },
-      "quantforge_vs_marlin": 0.8553855244515749
+      "quantforge_vs_marlin": 0.8522400562946368
+    },
+    {
+      "M": 32,
+      "K": 4096,
+      "N": 4096,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_37425b25e2",
+      "err_marlin": 0.01555633544921875,
+      "err_quantforge": 0.000335693359375,
+      "ref_max": 42.4282112121582,
+      "marlin": {
+        "us": 50.91100000000006,
+        "tflops": 21.0905663609043,
+        "weight_gbs_int4": 164.77004969456485
+      },
+      "quantforge": {
+        "us": 58.84799999999814,
+        "tflops": 18.2460206634046,
+        "weight_gbs_int4": 142.54703643284844
+      },
+      "cublas_fp16": {
+        "us": 180.95799999999872,
+        "tflops": 5.933652140275686,
+        "weight_gbs_int4": 46.35665734590379
+      },
+      "quantforge_vs_marlin": 0.865127107123465
+    },
+    {
+      "M": 32,
+      "K": 4096,
+      "N": 11008,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_e37187f145",
+      "err_marlin": 0.015472412109375,
+      "err_quantforge": 0.000354766845703125,
+      "ref_max": 43.13392639160156,
+      "marlin": {
+        "us": 130.27000000000044,
+        "tflops": 22.151540277884315,
+        "weight_gbs_int4": 173.05890842097122
+      },
+      "quantforge": {
+        "us": 149.2780000000057,
+        "tflops": 19.33092051072422,
+        "weight_gbs_int4": 151.02281649003297
+      },
+      "cublas_fp16": {
+        "us": 497.33899999999994,
+        "tflops": 5.802241835046116,
+        "weight_gbs_int4": 45.330014336297786
+      },
+      "quantforge_vs_marlin": 0.8726671043288058
+    },
+    {
+      "M": 64,
+      "K": 4096,
+      "N": 4096,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_eae2ea8533",
+      "err_marlin": 0.015613555908203125,
+      "err_quantforge": 0.000335693359375,
+      "ref_max": 42.42820739746094,
+      "marlin": {
+        "us": 58.33599999999933,
+        "tflops": 36.8123225452555,
+        "weight_gbs_int4": 143.7981349424043
+      },
+      "quantforge": {
+        "us": 87.39100000000326,
+        "tflops": 24.57328155073085,
+        "weight_gbs_int4": 95.98938105754239
+      },
+      "cublas_fp16": {
+        "us": 181.4059999999954,
+        "tflops": 11.837996802752139,
+        "weight_gbs_int4": 46.24217501075054
+      },
+      "quantforge_vs_marlin": 0.6675286928859625
+    },
+    {
+      "M": 64,
+      "K": 4096,
+      "N": 11008,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_ef88b663a6",
+      "err_marlin": 0.0155487060546875,
+      "err_quantforge": 0.00038909912109375,
+      "ref_max": 45.12098693847656,
+      "marlin": {
+        "us": 139.87099999999919,
+        "tflops": 41.26203647646784,
+        "weight_gbs_int4": 161.17982998620252
+      },
+      "quantforge": {
+        "us": 199.96600000000035,
+        "tflops": 28.861718012062,
+        "weight_gbs_int4": 112.74108598461719
+      },
+      "cublas_fp16": {
+        "us": 506.90699999999924,
+        "tflops": 11.385446056179948,
+        "weight_gbs_int4": 44.47439865695292
+      },
+      "quantforge_vs_marlin": 0.6994739105647907
+    },
+    {
+      "M": 128,
+      "K": 4096,
+      "N": 4096,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_77dfe7f4f9",
+      "err_marlin": 0.0156097412109375,
+      "err_quantforge": 0.00034332275390625,
+      "ref_max": 46.10186767578125,
+      "marlin": {
+        "us": 105.05500000000029,
+        "tflops": 40.88303551473027,
+        "weight_gbs_int4": 79.84967873970756
+      },
+      "quantforge": {
+        "us": 152.2230000000054,
+        "tflops": 28.214969459279132,
+        "weight_gbs_int4": 55.10736222515455
+      },
+      "cublas_fp16": {
+        "us": 188.73400000000038,
+        "tflops": 22.756722667881736,
+        "weight_gbs_int4": 44.446723960706514
+      },
+      "quantforge_vs_marlin": 0.6901388095097097
+    },
+    {
+      "M": 256,
+      "K": 4096,
+      "N": 4096,
+      "group_size": 128,
+      "quantforge_opts": "quantforge_e2e_1e12a3fa31",
+      "err_marlin": 0.01561737060546875,
+      "err_quantforge": 0.000396728515625,
+      "ref_max": 46.101863861083984,
+      "marlin": {
+        "us": 201.02100000000064,
+        "tflops": 42.73152850697177,
+        "weight_gbs_int4": 41.73000830758962
+      },
+      "quantforge": {
+        "us": 262.97299999999996,
+        "tflops": 32.66470166899264,
+        "weight_gbs_int4": 31.899122723625627
+      },
+      "cublas_fp16": {
+        "us": 208.1899999999987,
+        "tflops": 41.26007297180486,
+        "weight_gbs_int4": 40.293040011528184
+      },
+      "quantforge_vs_marlin": 0.7644168792993983
     },
     {
       "M": 512,
       "K": 4096,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_a82dd465a3",
+      "quantforge_opts": "5974a4956645e7c9afbddb084352768c",
       "err_marlin": 0.0157012939453125,
       "err_quantforge": 0.000415802001953125,
       "ref_max": 46.339515686035156,
       "marlin": {
-        "us": 387.91799999999785,
-        "tflops": 44.28737306337962,
-        "weight_gbs_int4": 21.624693878603328
+        "us": 391.45100000000093,
+        "tflops": 43.8876620164464,
+        "weight_gbs_int4": 21.429522468967967
       },
       "quantforge": {
-        "us": 456.7479999999996,
-        "tflops": 37.61345245956198,
-        "weight_gbs_int4": 18.365943583770495
+        "us": 461.6270000000004,
+        "tflops": 37.21591064647428,
+        "weight_gbs_int4": 18.17183137034877
       },
       "cublas_fp16": {
-        "us": 371.0880000000034,
-        "tflops": 46.29594377613894,
-        "weight_gbs_int4": 22.60544129694284
+        "us": 373.40399999999863,
+        "tflops": 46.00879793467682,
+        "weight_gbs_int4": 22.465233366541415
       },
-      "quantforge_vs_marlin": 0.8493042115126901
+      "quantforge_vs_marlin": 0.8479811622803705
     },
     {
       "M": 2048,
       "K": 4096,
       "N": 4096,
       "group_size": 128,
-      "quantforge_opts": "quantforge_e2e_e9f4acac98",
+      "quantforge_opts": "e4865079b36694e690c2b9fff1653afd",
       "err_marlin": 0.01573944091796875,
       "err_quantforge": 0.0004425048828125,
       "ref_max": 49.3185920715332,
       "marlin": {
-        "us": 1514.5589999999938,
-        "tflops": 45.372598053955166,
-        "weight_gbs_int4": 5.538647223383199
+        "us": 1532.0790000000052,
+        "tflops": 44.85374235662767,
+        "weight_gbs_int4": 5.475310346268026
       },
       "quantforge": {
-        "us": 1764.6280000000006,
-        "tflops": 38.942755490675644,
-        "weight_gbs_int4": 4.753754332357866
+        "us": 1775.7570000000014,
+        "tflops": 38.698693985719856,
+        "weight_gbs_int4": 4.723961668178694
       },
       "cublas_fp16": {
-        "us": 1427.074999999997,
-        "tflops": 48.15407510887665,
-        "weight_gbs_int4": 5.878182996689044
+        "us": 1452.9759999999987,
+        "tflops": 47.295672286397064,
+        "weight_gbs_int4": 5.773397495898079
       },
-      "quantforge_vs_marlin": 0.8582879791094743
+      "quantforge_vs_marlin": 0.8627751432206118
     }
   ]
 }

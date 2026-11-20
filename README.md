@@ -32,36 +32,39 @@ come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop 
 
 | M × K × N | Marlin (µs) | QuantForge (µs) | cuBLAS fp16 (µs, 4× the weight bytes) | QuantForge / Marlin speed |
 |---|--:|--:|--:|--:|
-| 1 × 4096 × 4096 | 49.4 | 38.0 | 180.8 | 1.30× |
-| 4 × 4096 × 4096 | 49.4 | 38.0 | 181.7 | 1.30× |
-| 16 × 4096 × 4096 | 50.0 | 50.0 | 183.0 | 1.00× |
-| 1 × 4096 × 11008 | 126.7 | 139.2 | 482.3 | 0.91× |
-| 1 × 11008 × 4096 | 127.0 | 135.1 | 483.3 | 0.94× |
-| 16 × 4096 × 11008 | 127.4 | 148.9 | 498.6 | 0.86× |
-| 32 × 4096 × 4096 | 50.8 | 57.8 | 181.0 | 0.88× |
-| 32 × 4096 × 11008 | 129.8 | 148.8 | 497.1 | 0.87× |
-| 64 × 4096 × 4096 | 58.6 | 86.9 | 181.4 | 0.67× |
-| 64 × 4096 × 11008 | 139.4 | 197.9 | 507.0 | 0.70× |
-| 128 × 4096 × 4096 | 104.1 | 150.8 | 188.7 | 0.69× |
-| 256 × 4096 × 4096 | 198.7 | 261.1 | 207.2 | 0.76× |
-| 512 × 4096 × 4096 | 387.9 | 456.7 | 371.1 | 0.85× |
-| 2048 × 4096 × 4096 | 1514.6 | 1764.6 | 1427.1 | 0.86× |
+| 1 × 4096 × 4096 | 49.6 | 50.0 | 180.9 | 0.99× |
+| 4 × 4096 × 4096 | 49.4 | 49.8 | 181.5 | 0.99× |
+| 16 × 4096 × 4096 | 50.0 | 49.8 | 182.3 | 1.01× |
+| 1 × 4096 × 11008 | 126.6 | 149.3 | 482.9 | 0.85× |
+| 1 × 11008 × 4096 | 127.0 | 131.0 | 483.6 | 0.97× |
+| 16 × 4096 × 11008 | 127.2 | 149.2 | 498.5 | 0.85× |
+| 32 × 4096 × 4096 | 50.9 | 58.8 | 181.0 | 0.87× |
+| 32 × 4096 × 11008 | 130.3 | 149.3 | 497.3 | 0.87× |
+| 64 × 4096 × 4096 | 58.3 | 87.4 | 181.4 | 0.67× |
+| 64 × 4096 × 11008 | 139.9 | 200.0 | 506.9 | 0.70× |
+| 128 × 4096 × 4096 | 105.1 | 152.2 | 188.7 | 0.69× |
+| 256 × 4096 × 4096 | 201.0 | 263.0 | 208.2 | 0.76× |
+| 512 × 4096 × 4096 | 391.5 | 461.6 | 373.4 | 0.85× |
+| 2048 × 4096 × 4096 | 1532.1 | 1775.8 | 1453.0 | 0.86× |
 
-The rows with M = 32 … 256 (small-batch decode / short prefill; autotuned, the same method,
-[`benchmarks/marlin_midM_rtx4050_sm89.json`](benchmarks/marlin_midM_rtx4050_sm89.json)) are the weak spot:
-0.67–0.88× of Marlin (M = 64 / 128 are 0.67 / 0.69×: the kernel is limited by the Tensor Core / `ldmatrix`
-path at ~50 % tensor-pipe activity, not by DRAM; Marlin stays memory-bound up to M = 64).
+QuantForge is 3.2–3.7× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of the bytes) and
+0.67–1.01× of Marlin. **The "≥ 90 % of Marlin" goal is reached for decode (M ≤ 16) at 4096 × 4096 (0.99–1.01×) and for
+1 × 11008 × 4096 (0.97×); it is not reached for 1 × 4096 × 11008 and 16 × 4096 × 11008 (0.85×), for M = 32 … 256 (0.67–0.87×;
+M = 64 / 128 are the worst: the kernel is limited by the Tensor Core / `ldmatrix` path at ~50 % tensor-pipe activity, not
+by DRAM, while Marlin stays memory-bound up to M = 64) and for the prefill GEMMs (0.85–0.86×)**. Activations are
+re-touched after the L2 flush (they are L2-resident in a real model, written by the previous layer). At prefill sizes the
+compute-bound kernel is ~25 % slower than cuBLAS fp16 with group-wise parameters.
 
-QuantForge is 2.5–4.8× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of
-the bytes) and 0.85–1.30× of Marlin: **the "≥ 90 % of Marlin" goal is reached for decode
-(M ≤ 16) at 4096 × 4096 (1.0–1.3×) and for 1 × 4096 × 11008 / 1 × 11008 × 4096 (0.91 / 0.94×); not yet
-for 16 × 4096 × 11008 (0.86×) and the prefill GEMMs (0.85–0.86×)**. Activations are re-touched after the
-L2 flush (they are L2-resident in a real model, written by the previous layer). At
-prefill sizes the compute-bound kernel is ~15 % slower than cuBLAS fp16 with
-per-tensor parameters and ~30 % slower with group-wise ones.
+> **Correction (2026-11-20).** Earlier versions of this README reported 38.0 µs / 1.30× Marlin for M = 1 and 4 at
+> 4096 × 4096 (and 0.91 / 0.94× for the wide decode shapes). That figure could not be reproduced: re-running the same
+> harness on the very commit that recorded it gives 50.2 µs (0.99×). With the current method the kernel is on the DRAM
+> limit: `ncu` (`dram__bytes_read`, caches flushed) shows 9.2 MB read from DRAM for the 8.65 MB of weights and scales, i.e.
+> ~184 GB/s at 50 µs, and a 1 GB flush instead of the 256 MB one changes neither kernel's time (50.3 µs both).
+> The table above was regenerated in one run (`benchmarks/compare_marlin.py --autotune`, interleaved rounds);
+> `benchmarks/l2_residency_check.py` reproduces the flush and DRAM-byte checks.
 
 Without group-wise parameters (per-tensor scale), TFLOP/s, 4096³: 36.9 (cuBLAS fp16
-43.6); 1 × 4096 × 4096 decode: 45 µs warm-L2 (4× faster than cuBLAS). Numbers from a
+43.6); 1 × 4096 × 4096 decode: ~49 µs with the weights L2-resident (the kernel is latency-bound there, 3.7× faster than cuBLAS). Numbers from a
 laptop GPU are only meaningful relative to the same machine and clock state.
 
 ## Build
@@ -331,7 +334,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 
 ## Limitations
 
-* **Speed:** 0.85–1.30× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050, but only **0.67–0.88× at
+* **Speed:** 0.85–1.01× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050 (decode 4096² on par, the wide decode shapes 0.85–0.97×), but only **0.67–0.87× at
   M = 32 … 256** (see the table above). The gap is not DRAM, tile choice or dequantisation arithmetic (ablated:
   1–3 %); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 75.8 µs at M = 64 (compiler
   87, Marlin 59), see `PIPELINE.md` -- closing it needs tuning of a hand-written kernel, which is not done.
@@ -369,7 +372,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 * Kernels are PTX loaded through a small CUDA driver shim (`runtime/mgpu_cuda_runtime.c`):
   the JIT-compiled module is cached and launches go on PyTorch's current stream,
   asynchronously like any other op (host cost ~45–50 µs per call from Python for a
-  4096 × 4096 decode GEMM, kernel 38 µs; Marlin's launch is ~20–25 µs wall). The torch op's hot path is C++
+  4096 × 4096 decode GEMM, kernel ~50 µs; Marlin's launch is ~20–25 µs wall). The torch op's hot path is C++
   (no interpreter per call); the Python `W4A16Gemm.run` still costs ~45 µs. The benchmark tables report device kernel time.
 
 ## Contributing

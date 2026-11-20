@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dequantise weight FP8 (E4M3) không cần phần cứng hỗ trợ: một mẹo bit gói gọn trong bốn phép số nguyên - QuantForge Notes</title>
+<meta name="description" content="Thêm weight FP8 vào compiler dù backend NVPTX của LLVM 18 không có kiểu FP8 như thế nào, vì sao phép chuyển đổi là chính xác, cách vector hóa, và nó tốn gì.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/03-fp8-without-hardware.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Dequantise weight FP8 (E4M3) không cần phần cứng hỗ trợ: một mẹo bit gói gọn trong bốn phép số nguyên</h1><p class="lede">Thêm weight FP8 vào compiler dù backend NVPTX của LLVM 18 không có kiểu FP8 như thế nào, vì sao phép chuyển đổi là chính xác, cách vector hóa, và nó tốn gì.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#quan-sat">Quan sát</a></li>
+<li><a href="#a-kiem-chung-tren-ca-256-byte">Đã kiểm chứng trên cả 256 byte</a></li>
+<li><a href="#lam-cho-nhanh-f16x2-ong-goi">Làm cho nhanh: f16x2 đóng gói</a></li>
+<li><a href="#fp8-ton-gi-va-uoc-gi">FP8 tốn gì và được gì</a></li>
+<li><a href="#nhung-gi-no-khong-lam">Những gì nó không làm</a></li>
+</ul>
+</div>
+</details><p>FP8 là định dạng weight 8 bit phổ biến còn lại. <strong>E4M3</strong> có 1 bit dấu, 4 bit mũ (bias 7) và 3 bit mantissa, độ lớn tối đa 448, không có vô cực, và chỉ một mã hóa NaN (<code>0x7F</code> và <code>0xFF</code>). Nó giữ độ chính xác tương đối trên các độ lớn khác nhau, phù hợp với weight hơn lưới INT8 đều khi các giá trị trải rộng.</p>
+<p>Compiler không thể dùng con đường hiển nhiên. Toolchain ở đây là LLVM / MLIR 18: backend NVPTX không có kiểu số thực E4M3 và không lộ lệnh <code>cvt.f16x2.e4m3x2</code> của PTX mới hơn. Thay vì chờ LLVM mới hơn, tôi tìm một phép chuyển đổi chỉ cần lệnh số nguyên.</p>
+<h2 id="quan-sat">Quan sát<a class="headerlink" href="#quan-sat" title="Permanent link">#</a></h2>
+<p>Lấy byte FP8 <code>s eeee mmm</code> và xét mẫu 16 bit</p>
+<pre><code class="language-text">f16 bits = (s &lt;&lt; 15) | ((byte &amp; 0x7F) &lt;&lt; 7)
+         = s 0 0 e e e e m m m 0 0 0 0 0 0 0      (bit 15 .. bit 0)
+</code></pre>
+<p>Đọc như một số half-precision IEEE, 4 bit mũ của FP8 rơi vào bốn bit thấp của trường mũ 5 bit của f16, 3 bit mantissa rơi vào đầu trường mantissa 10 bit. Bias mũ của f16 là 15 và của E4M3 là 7, nên số half-precision là</p>
+<pre><code class="language-text">2^(e - 15) * (1 + m/8)  =  2^-8 * 2^(e - 7) * (1 + m/8)
+   (số half-precision)     (2^-8 lần giá trị FP8)
+</code></pre>
+<p>tức là <strong>đúng 2^-8 lần giá trị FP8</strong>. Điều này cũng đúng với subnormal: với <code>e = 0</code> giá trị FP8 là <code>m/8 * 2^-6</code> và mẫu f16 là một subnormal có giá trị <code>(m * 128 / 1024) * 2^-14 = m/8 * 2^-14</code>, lại là 2^-8 lần giá trị FP8. Vậy</p>
+<pre><code class="language-text">value(byte) = bitcast_f16( ((byte &amp; 0x7F) &lt;&lt; 7) | ((byte &amp; 0x80) &lt;&lt; 8) ) * 256
+</code></pre>
+<p>và phép nhân với 256 là chính xác (giá trị tối đa là 448, xa giới hạn của f16). Scale của nhóm được nhân sau đó, và đó là phép làm tròn duy nhất, nên kết quả giống hệt việc dequantise ở độ chính xác cao hơn rồi làm tròn một lần.</p>
+<p>Chi phí: một AND, một shift, một AND, một shift, một OR, một bit-cast, và hai phép nhân, một trong hai là nhân với hằng. NaN (<code>0x7F</code>) được đọc là 480 thay vì NaN; weight đã lượng tử hóa không bao giờ chứa nó.</p>
+<h2 id="a-kiem-chung-tren-ca-256-byte">Đã kiểm chứng trên cả 256 byte<a class="headerlink" href="#a-kiem-chung-tren-ca-256-byte" title="Permanent link">#</a></h2>
+<p>Một unit test dựng mẹo này bằng PyTorch cho mọi giá trị byte và so với phép chuyển đổi <code>torch.float8_e4m3fn</code>: cả 254 byte không-NaN giống hệt nhau, và <code>0x7F</code> được đọc là 480.0 như đã ghi. Test nằm cạnh các test layout của repository.</p>
+<h2 id="lam-cho-nhanh-f16x2-ong-goi">Làm cho nhanh: f16x2 đóng gói<a class="headerlink" href="#lam-cho-nhanh-f16x2-ong-goi" title="Permanent link">#</a></h2>
+<p>Bản cài đặt đầu tiên là cây vô hướng ở trên (khoảng 9 lệnh số nguyên cho mỗi weight). Kernel bị giới hạn bởi bộ nhớ ở decode, nên ở 1 x 4096 x 4096 nó đã ngang INT8 (97 so với 100 micro giây). Nhưng trong cả một model, các layer nhỏ bị giới hạn bởi số lệnh, và bản vô hướng decode 155 token/s so với 165 của INT8 trên Qwen2.5-0.5B.</p>
+<p>Pass <code>vectorize-dequant</code> có sẵn, nhận ra tám cây dequantisation cấp cho một vector store và phát ra số học đóng gói, được mở rộng để nhận ra cây FP8. Với hai byte <code>b0, b1</code> nó dựng một từ 32 bit <code>x = b0 | (b1 &lt;&lt; 16)</code> (mỗi byte trong nửa 16 bit riêng), rồi làm AND / shift / OR trên <strong>cả hai nửa cùng lúc</strong>:</p>
+<pre><code class="language-text">mag  = (x &lt;&lt; 7) &amp; 0x3F803F80
+sgn  = (x &lt;&lt; 8) &amp; 0x80008000
+half2 = mag | sgn                       // hai giá trị f16 bằng 2^-8 lần các giá trị FP8
+w     = (half2 * 256.h2) * scale.h2     // hai mul.f16x2
+</code></pre>
+<p>Dạng đóng gói <strong>giống hệt từng bit</strong> với dạng vô hướng (được kiểm bằng các test đầu-cuối và các case sanitizer) và đưa decode cả model về 165 token/s. Một test FileCheck khẳng định kernel decode không chứa lệnh shift 16 bit nào (dạng vô hướng có 128 lệnh), nên một thay đổi sau này làm hỏng việc khớp mẫu sẽ bị bắt ngay.</p>
+<h2 id="fp8-ton-gi-va-uoc-gi">FP8 tốn gì và được gì<a class="headerlink" href="#fp8-ton-gi-va-uoc-gi" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">INT8</th>
+<th style="text-align: right;">FP8 (E4M3)</th>
+<th>ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>kernel decode 1 x 4096 x 4096</td>
+<td style="text-align: right;">101 us</td>
+<td style="text-align: right;">99 us</td>
+<td>weight 8 bit: gấp đôi byte của INT4</td>
+</tr>
+<tr>
+<td>kernel decode 1 x 4096 x 11008</td>
+<td style="text-align: right;">272 us</td>
+<td style="text-align: right;">271 us</td>
+<td></td>
+</tr>
+<tr>
+<td>prefill 512 x 4096 x 4096</td>
+<td style="text-align: right;">564 us</td>
+<td style="text-align: right;">584 us</td>
+<td>chậm hơn 4 phần trăm</td>
+</tr>
+<tr>
+<td>perplexity Qwen2.5-0.5B (fp16: 19.93)</td>
+<td style="text-align: right;">19.91</td>
+<td style="text-align: right;">20.10</td>
+<td>round-to-nearest, group 128</td>
+</tr>
+<tr>
+<td>decode Qwen2.5-0.5B (CUDA graph)</td>
+<td style="text-align: right;">165 tok/s</td>
+<td style="text-align: right;">165 tok/s</td>
+<td>sau khi vector hóa</td>
+</tr>
+</tbody>
+</table>
+<p>Trên model này INT8 và FP8 tương đương về tốc độ và gần nhau về chất lượng, cả hai nhanh hơn fp16 khoảng 28 phần trăm (165 so với 129 token/s) trên một model cỡ này. Chúng giảm một nửa byte weight của fp16 thay vì giảm còn một phần tư như INT4, nên INT4 vẫn là định dạng cho tốc độ. FP8 là định dạng cho các checkpoint đã phát hành sẵn ở đó, hoặc khi mất chất lượng của INT4 là không chấp nhận được.</p>
+<h2 id="nhung-gi-no-khong-lam">Những gì nó không làm<a class="headerlink" href="#nhung-gi-no-khong-lam" title="Permanent link">#</a></h2>
+<p>Chỉ <em>weight</em> là FP8. Activation vẫn là fp16 và phép nhân-cộng chạy trên đường Tensor Core fp16. Dùng Tensor Core FP8 của Ada (<code>mma</code> với toán hạng <code>e4m3</code>) để nhân đôi tốc độ số học là một dự án khác: nó cần activation FP8, scale activation theo tensor và cách phát các lệnh đó từ LLVM 18. Chưa làm.</p>
+<p>Các số FP8 cũng đến từ lượng tử hóa round-to-nearest checkpoint fp16; chưa có checkpoint FP8 nào ngoài đời được chạy qua nó.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

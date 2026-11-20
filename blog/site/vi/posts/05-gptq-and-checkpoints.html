@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chất lượng 4-bit tốt hơn với GPTQ, nạp checkpoint AWQ / GPTQ thật, và vài cái bẫy - QuantForge Notes</title>
+<meta name="description" content="INT4 round-to-nearest mất 1 đến 4 điểm perplexity. Một bản GPTQ trong thư viện lấy lại 17 đến 65 phần trăm, checkpoint AWQ và GPTQ thật được nạp và kiểm chứng, và các thứ không giúp được liệt kê rõ.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/05-gptq-and-checkpoints.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Chất lượng 4-bit tốt hơn với GPTQ, nạp checkpoint AWQ / GPTQ thật, và vài cái bẫy</h1><p class="lede">INT4 round-to-nearest mất 1 đến 4 điểm perplexity. Một bản GPTQ trong thư viện lấy lại 17 đến 65 phần trăm, checkpoint AWQ và GPTQ thật được nạp và kiểm chứng, và các thứ không giúp được liệt kê rõ.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#round-to-nearest-uong-co-so">Round-to-nearest: đường cơ sở</a></li>
+<li><a href="#gptq-trong-thu-vien">GPTQ trong thư viện</a><ul>
+<li><a href="#nhung-thu-khong-giup-nen-mac-inh-tat">Những thứ không giúp (nên mặc định tắt)</a></li>
+</ul>
+</li>
+<li><a href="#checkpoint-awq-va-gptq-that">Checkpoint AWQ và GPTQ thật</a><ul>
+<li><a href="#cai-bay-ton-mot-gio-awq-thay-oi-cac-norm">Cái bẫy tốn một giờ: AWQ thay đổi các norm</a></li>
+</ul>
+</li>
+<li><a href="#tai-hien">Tái hiện</a></li>
+</ul>
+</div>
+</details><p>Kernel nhanh chỉ là một nửa câu chuyện lượng tử hóa: nửa kia là weight 4 bit mất bao nhiêu chất lượng. Vì vậy thư viện có hai cách có được weight, một quantiser round-to-nearest một dòng và một quantiser có hiệu chỉnh, và nó có thể nạp checkpoint do các công cụ khác tạo ra.</p>
+<h2 id="round-to-nearest-uong-co-so">Round-to-nearest: đường cơ sở<a class="headerlink" href="#round-to-nearest-uong-co-so" title="Permanent link">#</a></h2>
+<p><code>quantforge.nn.quantize_model(model, "int4", group_size=128)</code> lượng tử hóa từng <code>nn.Linear</code> độc lập: mỗi nhóm 128 hàng đầu vào của một cột ánh xạ giá trị nhỏ nhất và lớn nhất của nó lên 16 mức. Mất 3 giây cho model 0.5B, không cần dữ liệu, và mất một lượng chất lượng nhìn thấy được (1 đến 4 điểm perplexity trên các model dưới đây). Head (<code>lm_head</code>) mặc định giữ ở fp16; lượng tử hóa nó sang INT8 là không mất mát (perplexity 24.08 so với 24.09 cho Qwen2.5-0.5B) và nhanh hơn 16 phần trăm, nên các số trong bài này dùng head INT8 ở mọi nơi.</p>
+<h2 id="gptq-trong-thu-vien">GPTQ trong thư viện<a class="headerlink" href="#gptq-trong-thu-vien" title="Permanent link">#</a></h2>
+<p><code>quantforge.gptq.quantize_model_gptq</code> cài đặt GPTQ tuần tự (Frantar và cộng sự) và cho ra đúng các layout mà kernel dùng:</p>
+<ol>
+<li>các decoder layer chạy trên 128 cửa sổ hiệu chỉnh 512 token; hidden state đi vào layer đầu được bắt bằng một module thế chỗ ghi lại input rồi hủy lượt forward;</li>
+<li>từng layer một, một forward pre-hook trên mọi Linear tích lũy Hessian của input, <code>H = 2 X^T X / n</code>, trong khi layer xử lý activation hiệu chỉnh;</li>
+<li>mỗi Linear được lượng tử hóa từng cột; sai số của mỗi cột đã làm tròn, nhân theo đường chéo của nghịch đảo thừa số Cholesky của <code>H</code>, được đẩy sang các cột chưa lượng tử hóa;</li>
+<li>scale và zero point của nhóm được tính từ weight <em>đã cập nhật</em> ở đầu mỗi nhóm, với scale được làm tròn về f16 <strong>trước</strong> khi lan truyền sai số, để quá trình tối ưu thấy đúng weight mà kernel sẽ dùng;</li>
+<li>layer đã lượng tử hóa được chạy lại trên tập hiệu chỉnh; output của nó là input của layer kế tiếp (nên các layer sau thấy nhiễu lượng tử hóa của các layer trước).</li>
+</ol>
+<p>Hiệu chỉnh mất 43 giây cho Qwen2.5-0.5B và 125 giây cho 1.5B trên GPU laptop 6 GB. Bộ nhớ bị chặn bởi một layer, các Hessian của nó (lớn nhất, <code>down_proj</code>, là <code>intermediate x intermediate</code> ở f32) và các activation đã lưu.</p>
+<figure class="viz"><div class="viz-title">Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>RTN INT4</span><span class="lg"><i class="sw s2"></i>GPTQ INT4</span><span class="lg"><i class="sw mk"></i>mốc fp16</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">6</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">12</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">18</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">24</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">30</text><path class="s1" d="M104.2 268 V72.9 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - RTN INT4: 24.08</title></path><text class="val" x="121.2" y="63.9" text-anchor="middle">24.08</text><path class="s2" d="M140.2 268 V95.3 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - GPTQ INT4: 21.38</title></path><text class="val" x="157.2" y="86.3" text-anchor="middle">21.38</text><line class="marker" x1="99.2" y1="103.2" x2="179.2" y2="103.2"><title>Qwen2.5
+0.5B - mốc fp16: 19.93</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V145.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - RTN INT4: 15.31</title></path><text class="val" x="295.8" y="136.4" text-anchor="middle">15.31</text><path class="s2" d="M314.8 268 V148.0 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - GPTQ INT4: 15.00</title></path><text class="val" x="331.8" y="139.0" text-anchor="middle">15.00</text><line class="marker" x1="273.8" y1="156.6" x2="353.8" y2="156.6"><title>Qwen2.5
+1.5B - mốc fp16: 13.48</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V70.1 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - RTN INT4: 24.42</title></path><text class="val" x="470.2" y="61.1" text-anchor="middle">24.42</text><path class="s2" d="M489.2 268 V78.6 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - GPTQ INT4: 23.39</title></path><text class="val" x="506.2" y="69.6" text-anchor="middle">23.39</text><line class="marker" x1="448.2" y1="101.4" x2="528.2" y2="101.4"><title>Llama-3.2
+1B - mốc fp16: 20.15</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V95.8 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - RTN INT4: 21.31</title></path><text class="val" x="644.8" y="86.8" text-anchor="middle">21.31</text><path class="s2" d="M663.8 268 V101.5 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - GPTQ INT4: 20.62</title></path><text class="val" x="680.8" y="92.5" text-anchor="middle">20.62</text><line class="marker" x1="622.8" y1="108.3" x2="702.8" y2="108.3"><title>OLMo-2
+1B - mốc fp16: 19.32</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>8 x 512 token test; GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>mốc fp16</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>24.08</td><td>21.38</td><td>19.93</td></tr><tr><th>Qwen2.5 1.5B</th><td>15.31</td><td>15.00</td><td>13.48</td></tr><tr><th>Llama-3.2 1B</th><td>24.42</td><td>23.39</td><td>20.15</td></tr><tr><th>OLMo-2 1B</th><td>21.31</td><td>20.62</td><td>19.32</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">RTN INT4</th>
+<th style="text-align: right;">GPTQ INT4</th>
+<th style="text-align: right;">phần mất mát của RTN được lấy lại</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B-Instruct</td>
+<td style="text-align: right;">19.93</td>
+<td style="text-align: right;">24.08</td>
+<td style="text-align: right;"><strong>21.38</strong></td>
+<td style="text-align: right;">65 %</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B-Instruct</td>
+<td style="text-align: right;">13.48</td>
+<td style="text-align: right;">15.31</td>
+<td style="text-align: right;"><strong>15.00</strong></td>
+<td style="text-align: right;">17 %</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B-Instruct</td>
+<td style="text-align: right;">20.15</td>
+<td style="text-align: right;">24.42</td>
+<td style="text-align: right;"><strong>23.39</strong></td>
+<td style="text-align: right;">24 %</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct</td>
+<td style="text-align: right;">19.32</td>
+<td style="text-align: right;">21.31</td>
+<td style="text-align: right;"><strong>20.62</strong></td>
+<td style="text-align: right;">34 %</td>
+</tr>
+</tbody>
+</table>
+<p>Hiệu chỉnh dùng các cửa sổ của tập <em>train</em> Wikitext-2; perplexity đo trên 8 x 512 token của tập <em>test</em>. Tốc độ decode không đổi (cùng layout): 226 token/s so với 219 cho Qwen2.5-0.5B trong cùng phiên, nằm trong nhiễu của máy này.</p>
+<p><strong>Một cách đọc trung thực</strong>: GPTQ luôn giúp, nhưng mức tăng rất không đều (65 phần trăm mất mát ở model nhỏ nhất, 17 phần trăm ở 1.5B). Tôi chưa có lời giải thích rõ ràng; các model mà mất mát RTN bị chi phối bởi vài kênh ngoại lai có vẻ hưởng lợi nhiều nhất. Với tập test tám cửa sổ 4096 token, chữ số thập phân thứ hai của các perplexity này cũng nhạy với nhiễu. Một nghiên cứu đàng hoàng nên dùng toàn bộ tập test và nhiều seed cho các cửa sổ hiệu chỉnh.</p>
+<h3 id="nhung-thu-khong-giup-nen-mac-inh-tat">Những thứ không giúp (nên mặc định tắt)<a class="headerlink" href="#nhung-thu-khong-giup-nen-mac-inh-tat" title="Permanent link">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>biến thể</th>
+<th style="text-align: right;">Qwen 0.5B</th>
+<th style="text-align: right;">Qwen 1.5B</th>
+<th style="text-align: right;">Llama-3.2 1B</th>
+<th style="text-align: right;">OLMo-2 1B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPTQ, mặc định (damping 0.01, group 128)</td>
+<td style="text-align: right;">21.38</td>
+<td style="text-align: right;">15.00</td>
+<td style="text-align: right;">23.39</td>
+<td style="text-align: right;">20.62</td>
+</tr>
+<tr>
+<td>+ cắt khoảng giá trị theo nhóm (<code>clip=True</code>)</td>
+<td style="text-align: right;">21.66</td>
+<td style="text-align: right;"><strong>14.40</strong></td>
+<td style="text-align: right;">30.87</td>
+<td style="text-align: right;"><strong>19.77</strong></td>
+</tr>
+<tr>
+<td>act-order (<code>act_order=True</code>)</td>
+<td style="text-align: right;">21.74</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>damping 0.1 / 0.03</td>
+<td style="text-align: right;">21.54 / 21.61</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>256 cửa sổ hiệu chỉnh</td>
+<td style="text-align: right;">21.44</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>group size 64</td>
+<td style="text-align: right;"><strong>21.26</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Cắt khoảng giá trị (co min/max của mỗi hàng trong nhóm khi điều đó giảm sai số làm tròn của weight) là thứ thú vị nhất: nó cho kết quả tốt nhất trên hai model và tệ nhất trên Llama-3.2-1B, nơi perplexity nhảy từ 23.4 lên 30.9. Tiêu chí nó tối ưu, sai số của weight, không phải sai số output của layer mà GPTQ tối ưu, và hai thứ này bất đồng ở một số layer. Nó vẫn là một tùy chọn. Act-order cũng tốn tốc độ: một layer có hoán vị đầu vào không thể tham gia việc gộp q/k/v, nên decode tụt từ 226 xuống 169 token/s trên Qwen2.5-0.5B.</p>
+<h2 id="checkpoint-awq-va-gptq-that">Checkpoint AWQ và GPTQ thật<a class="headerlink" href="#checkpoint-awq-va-gptq-that" title="Permanent link">#</a></h2>
+<p>Hầu hết model 4 bit trên Hub là file AWQ hoặc GPTQ. <code>quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")</code> chuyển các tensor đóng gói int32 sang layout của kernel (<code>quant.from_gptq</code>, <code>quant.from_awq</code>), hỗ trợ checkpoint GPTQ <code>desc_act</code> bằng cách hoán vị hàng offline (hoán vị activation được áp bằng một phép gather nhỏ lúc chạy) và quy ước zero-point <code>gptq_v2</code>.</p>
+<p>Kiểm chứng với bản sinh đôi dense (cùng weight đã dequantise trong các layer <code>nn.Linear</code> thường), Qwen2.5-0.5B-Instruct, 16 x 512 token test:</p>
+<table>
+<thead>
+<tr>
+<th>checkpoint</th>
+<th style="text-align: right;">perplexity, bản sinh đôi dense</th>
+<th style="text-align: right;">perplexity, QuantForge</th>
+<th style="text-align: right;">greedy decode</th>
+<th style="text-align: right;">tốc độ decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPTQ-Int4 (Qwen chính thức)</td>
+<td style="text-align: right;">26.335</td>
+<td style="text-align: right;">26.336</td>
+<td style="text-align: right;">59 / 59 token giống hệt</td>
+<td style="text-align: right;">182 tok/s</td>
+</tr>
+<tr>
+<td>AWQ (Qwen chính thức)</td>
+<td style="text-align: right;">26.689</td>
+<td style="text-align: right;">26.689</td>
+<td style="text-align: right;">59 / 59 token giống hệt</td>
+<td style="text-align: right;">184 tok/s</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cai-bay-ton-mot-gio-awq-thay-oi-cac-norm">Cái bẫy tốn một giờ: AWQ thay đổi các norm<a class="headerlink" href="#cai-bay-ton-mot-gio-awq-thay-oi-cac-norm" title="Permanent link">#</a></h3>
+<p>Lần chạy AWQ đầu tiên in ra perplexity <strong>83,014</strong> cho bản sinh đôi dense trong khi model QuantForge, dựng cùng cách, in 26.7. Một layer đơn lẻ khớp tới từng bit, nên kernel không sao. Nguyên nhân: AWQ nhân các kênh đầu vào của một layer tuyến tính với một hệ số học được <code>s</code> để bảo vệ các weight quan trọng, và gộp nghịch đảo của hệ số đó vào phép tính <em>đứng trước</em>, thường là weight của RMSNorm. Vì vậy weight norm lưu trong checkpoint AWQ không phải của model gốc. Nạp chỉ các layer tuyến tính đã lượng tử hóa lên trên norm của model gốc cho kết quả rác; loader giờ copy mọi tensor phi tuyến (embedding, norm) tồn tại ở cả checkpoint và model, và README có ghi điều này. GPTQ không làm vậy, đó là lý do GPTQ chạy đúng ngay lần đầu.</p>
+<h2 id="tai-hien">Tái hiện<a class="headerlink" href="#tai-hien" title="Permanent link">#</a></h2>
+<pre><code class="language-bash"># 4 bit có hiệu chỉnh, kèm so sánh với round-to-nearest
+python benchmarks/hf_gptq.py --model Qwen/Qwen2.5-0.5B-Instruct \
+    --train wikitext2-train.parquet --text wikitext2-test.parquet
+
+# một checkpoint thật so với bản sinh đôi dense
+python benchmarks/hf_load_checkpoint.py --base Qwen/Qwen2.5-0.5B-Instruct \
+    --ckpt Qwen2.5-0.5B-Instruct-GPTQ-Int4/model.safetensors --method gptq --text wikitext2-test.parquet
+</code></pre>
+<p>Mọi thứ ở trên chạy trên một GPU RTX 4050 Laptop 6 GB; model 3B và Phi-3.5 (3.8B) được nạp trên CPU và lượng tử hóa từng layer trên GPU, còn model 7B chạy từ checkpoint bitsandbytes 4 bit trong 4.65 GB.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

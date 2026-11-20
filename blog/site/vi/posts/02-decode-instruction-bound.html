@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Điều gì làm kernel decode nhanh: một bảng ablation, và một đính chính về con số đẹp quá mức - QuantForge Notes</title>
+<meta name="description" content="Vì sao kernel decode bị giới hạn bởi số lệnh, mỗi pass đáng giá bao nhiêu (đo lạnh, hôm nay), các cạm bẫy khi benchmark trên GPU laptop, và đính chính tuyên bố nhanh hơn Marlin 1.30 lần trước đây không tái hiện được.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/02-decode-instruction-bound.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Điều gì làm kernel decode nhanh: một bảng ablation, và một đính chính về con số đẹp quá mức</h1><p class="lede">Vì sao kernel decode bị giới hạn bởi số lệnh, mỗi pass đáng giá bao nhiêu (đo lạnh, hôm nay), các cạm bẫy khi benchmark trên GPU laptop, và đính chính tuyên bố nhanh hơn Marlin 1.30 lần trước đây không tái hiện được.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#buoc-0-o-ung-thu-can-o-va-kiem-tra-lai">Bước 0: đo đúng thứ cần đo, và kiểm tra lại</a></li>
+<li><a href="#buoc-1-em-lenh-khong-em-byte">Bước 1: đếm lệnh, không đếm byte</a></li>
+<li><a href="#buoc-2-cac-load-scale-bi-load-tam-lan-va-pass-ngung-khop">Bước 2: các load scale bị load tám lần, và pass ngừng khớp</a></li>
+<li><a href="#buoc-3-dequantisation-bang-hai-lenh-cho-hai-weight">Bước 3: dequantisation bằng hai lệnh cho hai weight</a></li>
+<li><a href="#buoc-4-bang-ablation-o-hom-nay-l2-lanh-1-x-4096-x-4096">Bước 4: bảng ablation, đo hôm nay (L2 lạnh, 1 x 4096 x 4096)</a></li>
+<li><a href="#buoc-5-wave-quantisation-tren-cac-shape-rong">Bước 5: wave quantisation trên các shape rộng</a></li>
+<li><a href="#rut-ra-gi">Rút ra gì</a></li>
+</ul>
+</div>
+</details><blockquote>
+<p><strong>Đính chính (2026-11-20).</strong> Phiên bản trước của bài này, và của README dự án, khẳng định kernel decode sinh ra cần <strong>38 micro giây</strong> cho một layer 4096 x 4096, "nhanh hơn Marlin 1.30 lần". <strong>Con số đó sai</strong>: nó không tái hiện được. Chạy lại đúng harness benchmark đó trên chính commit đã ghi nó cho 50.2 micro giây, và harness hôm nay cho 50.0 micro giây so với 49.6 của Marlin, tỷ lệ <strong>0.99</strong>. Con số là một sai lệch đo đạc của giai đoạn phát triển mà tôi không dựng lại chính xác được. Mọi thứ dưới đây đã được đo lại hôm nay. Trang bạn đang đọc thay câu chuyện cũ ("từ 53 xuống 38 micro giây") bằng phần còn đứng vững: phương pháp chẩn đoán và một bảng ablation.</p>
+</blockquote>
+<p>Một GEMM decode batch 1 đọc mỗi weight INT4 đúng một lần, nên lẽ ra nó chạy ở tốc độ của hệ thống bộ nhớ. Với layer 4096 x 4096 đó là 8.4 MB weight cộng 0.25 MB scale và 0.25 MB zero point: 8.65 MB, khoảng 45 micro giây ở 192 GB/s mà thông số card cho phép.</p>
+<h2 id="buoc-0-o-ung-thu-can-o-va-kiem-tra-lai">Bước 0: đo đúng thứ cần đo, và kiểm tra lại<a class="headerlink" href="#buoc-0-o-ung-thu-can-o-va-kiem-tra-lai" title="Permanent link">#</a></h2>
+<p>Các cạm bẫy này áp dụng cho mọi công việc kernel trên GPU laptop, và lời đính chính ở trên cho thấy vì sao chúng quan trọng.</p>
+<ol>
+<li><strong>Đo bằng đồng hồ tường che mất kernel.</strong> Launch từ Python tốn 45 đến 270 micro giây, nhiều hơn kernel. Mọi số là thời gian device từ trace CUPTI (profiler của PyTorch).</li>
+<li><strong>L2 còn ấm làm kernel trông nhanh hơn thực tế.</strong> RTX 4050 có 24 MB L2, nên weight INT4 8 MB nằm lại trong cache giữa các vòng benchmark và benchmark đo chính cache. Trước mỗi lần gọi tôi flush L2.</li>
+<li><strong>Cách flush cũng quan trọng.</strong> Ghi vào buffer 256 MB để lại các dòng dirty trong L2, việc write-back làm kernel <em>kế tiếp</em> chậm 20 đến 50 phần trăm; đọc buffer thì loại cache sạch. Sau đó phải chạm lại activation, nếu không một harness tình cờ copy chúng (để pad) sẽ đưa cho kernel một A còn nóng.</li>
+<li><strong>Xung nhịp trôi.</strong> GPU dùng chung với desktop và xung nhịp dao động tới 30 phần trăm giữa các phiên. So các kernel <em>xen kẽ trong cùng một lần chạy</em>, không bao giờ so với con số của hôm qua. (Lời đính chính là một ví dụ.)</li>
+<li><strong>Kiểm tra rằng các byte đến từ DRAM.</strong> <code>ncu --cache-control all --metrics dram__bytes_read.sum</code> trên kernel decode báo <strong>9.2 MB</strong> đọc từ DRAM cho 8.65 MB weight và scale; ở 50 micro giây đó là khoảng <strong>184 GB/s</strong>, về cơ bản là giới hạn DRAM của card. Thay flush 256 MB bằng flush 1 GB không làm đổi thời gian của kernel nào (50.3 micro giây cho cả hai). Script là <code>benchmarks/l2_residency_check.py</code>.</li>
+</ol>
+<p>Vậy ở 4096 x 4096 kernel sinh ra và Marlin <strong>cùng ở giới hạn DRAM</strong>, và hòa chính là kết quả mong đợi.</p>
+<h2 id="buoc-1-em-lenh-khong-em-byte">Bước 1: đếm lệnh, không đếm byte<a class="headerlink" href="#buoc-1-em-lenh-khong-em-byte" title="Permanent link">#</a></h2>
+<p>Trong lúc phát triển kernel, <code>ncu</code> cho bảng lệnh theo từng opcode (<code>sass__inst_executed_per_opcode</code>): khoảng <strong>7.7 lệnh thread cho mỗi weight</strong>, gồm một lệnh <code>I2F</code> (đổi số nguyên sang số thực) cho mỗi weight. Một kernel phải stream 16.7 triệu weight trong 45 micro giây trên 20 SM có khoảng 10 slot lệnh cho mỗi weight, nên với 7.7 nó gần hết slot issue trước khi hết băng thông: kernel decode <em>bị giới hạn bởi số lệnh trước khi bị giới hạn bởi độ trễ</em>. (Số lệnh không phụ thuộc trạng thái cache, nên quan sát này không bị ảnh hưởng bởi lời đính chính.)</p>
+<h2 id="buoc-2-cac-load-scale-bi-load-tam-lan-va-pass-ngung-khop">Bước 2: các load scale bị load tám lần, và pass ngừng khớp<a class="headerlink" href="#buoc-2-cac-load-scale-bi-load-tam-lan-va-pass-ngung-khop" title="Permanent link">#</a></h2>
+<p>Dequantisation của một work item 16 byte (8 cột) cần tám scale và tám zero point. Một pass (<code>vectorize-global-loads</code>) gộp tám load vô hướng thành một load 16 byte. Hai lỗi tác động lẫn nhau:</p>
+<ul>
+<li>biểu thức chỉ số ánh xạ một hàng K sang nhóm của nó (<code>k / 128</code>) không được gấp thành hằng với các K tile lớn hơn, vì phân tích cận dùng đối số block-size của launch thay vì kích thước tile: <strong>tám load scale và zero point trùng lặp mỗi vòng lặp</strong>;</li>
+<li>sau khi sửa, các load của tám work item trong một thread trở nên <em>giống hệt nhau</em>, common-subexpression elimination gộp chúng, và bộ vector hóa chỉ thay <strong>load đầu tiên</strong>. Pass dequantisation đóng gói (bước sau) khớp mẫu "tám lane liên tiếp trích từ cùng một vector load", và với bảy trong tám item nó không còn thấy hình dạng đó; chúng rơi về đường vô hướng với một <code>I2F</code> cho mỗi weight.</li>
+</ul>
+<p>Thay <em>tất cả</em> các bản sao đã khôi phục dạng đóng gói. Bài học là về compiler: một tính chất hiệu năng phụ thuộc vào chuỗi các pass khớp mẫu là mong manh, nên dự án có một test FileCheck mà việc duy nhất là khẳng định PTX không chứa <code>cvt.rn.f16</code>. (Tôi không còn nêu mức tăng micro giây cho hai bản sửa này, vì các số đo gốc chính là thứ không còn đứng vững.)</p>
+<h2 id="buoc-3-dequantisation-bang-hai-lenh-cho-hai-weight">Bước 3: dequantisation bằng hai lệnh cho hai weight<a class="headerlink" href="#buoc-3-dequantisation-bang-hai-lenh-cho-hai-weight" title="Permanent link">#</a></h2>
+<p>Dạng đóng gói là mẹo quen thuộc mà Marlin dùng. Một nibble <code>q</code> (0 đến 15) đặt vào các bit mantissa thấp của hằng half-precision <code>1152 = 0x6480</code> cho ra <strong>đúng <code>1152 + q</code></strong>, không cần lệnh chuyển đổi. Với hai weight cùng lúc, trong một thanh ghi 32 bit có hai lane half-precision:</p>
+<pre><code class="language-text">packed  = (nibble_lo) | (nibble_hi &lt;&lt; 16) | 0x64806480        // một tổ hợp kiểu LOP3
+zero'   = (byte zero ^ 0x80) | 0x6400 cho mỗi lane              // 1152 + zero_point, dựng theo cùng cách
+diff    = packed - zero'          // sub.f16x2: chính xác, một số nguyên trong [-15, 15]
+weight  = diff * scale            // mul.f16x2: phép làm tròn duy nhất
+</code></pre>
+<p>Cả hai toán hạng mang cùng độ lệch, phép trừ chính xác (số nguyên dưới 2048), và phép làm tròn duy nhất xảy ra ở phép nhân, nên kết quả <strong>giống hệt từng bit</strong> với <code>(q - zero) * scale</code> tính theo sách giáo khoa bằng fp16.</p>
+<h2 id="buoc-4-bang-ablation-o-hom-nay-l2-lanh-1-x-4096-x-4096">Bước 4: bảng ablation, đo hôm nay (L2 lạnh, 1 x 4096 x 4096)<a class="headerlink" href="#buoc-4-bang-ablation-o-hom-nay-l2-lanh-1-x-4096-x-4096" title="Permanent link">#</a></h2>
+<p>Cách tốt nhất để nói mỗi pass đáng giá bao nhiêu là tắt nó đi. Cùng kernel, cùng shape, L2 đã flush, thời gian device:</p>
+<table>
+<thead>
+<tr>
+<th>cấu hình</th>
+<th style="text-align: right;">thời gian</th>
+<th style="text-align: right;">tương đối</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mọi pass (kernel decode đã autotune)</td>
+<td style="text-align: right;"><strong>50 us</strong></td>
+<td style="text-align: right;">1.00x</td>
+</tr>
+<tr>
+<td><code>vectorize-dequant=false</code> (dequantisation vô hướng, một <code>I2F</code> mỗi weight)</td>
+<td style="text-align: right;">58 us</td>
+<td style="text-align: right;">chậm 1.16x</td>
+</tr>
+<tr>
+<td><code>prefetch-distance=0</code> (không look-ahead cho load weight)</td>
+<td style="text-align: right;">61 us</td>
+<td style="text-align: right;">chậm 1.22x</td>
+</tr>
+<tr>
+<td><code>vectorize-loads=false</code> (load weight / scale / zero-point vô hướng)</td>
+<td style="text-align: right;"><strong>156 us</strong></td>
+<td style="text-align: right;"><strong>chậm 3.1x</strong></td>
+</tr>
+<tr>
+<td>Marlin (tham chiếu)</td>
+<td style="text-align: right;">49.6 us</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>cuBLAS fp16 trên weight đã dequantise (gấp 4 lần byte)</td>
+<td style="text-align: right;">181 us</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Khi weight đã nằm sẵn trong L2 (không flush) kernel đầy đủ mất 49 micro giây: ở kích thước này nó bị giới hạn bởi độ trễ (ít warp, mỗi warp có chuỗi phụ thuộc dài), không phải bởi băng thông, nên thời gian lạnh và ấm gần như bằng nhau.</p>
+<p>Thứ hạng mang nhiều thông tin. <strong>Load vector hóa là cái lớn nhất</strong>: không có load 16 byte kernel phát lệnh load nhiều gấp ba và chạy chậm gấp ba. Dequantisation đóng gói và look-ahead một tile mỗi cái đáng 16 đến 22 phần trăm. Các pass hoàn toàn <em>không giúp</em> trong chế độ này: stage shared-memory thứ hai cho decode, đẩy các store dequantisation xuống, look-ahead hai tile trở lên (các load đã đủ sớm) và split-K.</p>
+<h2 id="buoc-5-wave-quantisation-tren-cac-shape-rong">Bước 5: wave quantisation trên các shape rộng<a class="headerlink" href="#buoc-5-wave-quantisation-tren-cac-shape-rong" title="Permanent link">#</a></h2>
+<p>Các shape rộng cư xử khác. Trong lúc phát triển, một lần quét kích thước lưới theo băng thông đạt được cho thấy khoảng 183 GB/s khi lưới vừa các block đang cư trú của GPU (80 block 128 cột với K tile 128 trên card này), và khoảng 151 GB/s ngay khi có làn thứ hai không đầy: layer 4096 x 11008 có 86 block cột cho 80 slot. K tile nhỏ hơn (64 thay vì 128, giảm shared memory mỗi block) cùng look-ahead một tile lấy lại một phần mất mát. Đây là số đo thời phát triển; kết quả lạnh hôm nay trên các shape rộng nằm ở bài tổng quan: 0.85 của Marlin cho 1 x 4096 x 11008 và 0.97 cho 1 x 11008 x 4096.</p>
+<h2 id="rut-ra-gi">Rút ra gì<a class="headerlink" href="#rut-ra-gi" title="Permanent link">#</a></h2>
+<ol>
+<li>Ở giới hạn DRAM, hòa với một kernel viết tay là kết quả đúng, và tuyên bố hơn nó 30 phần trăm trên một kernel bị giới hạn bộ nhớ cần được kiểm tra bằng <code>dram__bytes_read</code> trước khi tin.</li>
+<li>Đếm lệnh trước: tính toán băng thông nói kernel lẽ ra ở 45 micro giây, chỉ histogram opcode giải thích vì sao các phiên bản đầu không như vậy.</li>
+<li>Hãy ablation, đừng kể chuyện: bảng ở trên nhiều thông tin hơn mọi câu chuyện về các bước.</li>
+<li>Giữ một test hồi quy cho mọi tính chất hiệu năng phụ thuộc vào tương tác giữa các pass.</li>
+</ol></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -1,7 +1,14 @@
 {
-  "title": "QuantForge Notes",
-  "tagline": "Writing a compiler for low-precision LLM kernels: what worked, what did not, and the numbers.",
   "author": "Hieu475",
-  "github_url": "",
-  "footer": "QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB)."
+  "github_url": "https://github.com/Hieu475",
+  "en": {
+    "title": "QuantForge Notes",
+    "tagline": "Writing a compiler for low-precision LLM kernels: what worked, what did not, and the numbers.",
+    "footer": "QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB)."
+  },
+  "vi": {
+    "title": "QuantForge Notes",
+    "tagline": "Viết compiler cho kernel LLM độ chính xác thấp: cái gì hiệu quả, cái gì không, và các con số.",
+    "footer": "QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB)."
+  }
 }

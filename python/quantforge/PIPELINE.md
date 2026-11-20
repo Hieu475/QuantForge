@@ -89,9 +89,15 @@ Measured with `ncu` and a micro-kernel that only reads the packed weights (RTX 4
 * Regression found by that analysis: after `GroupRowOfTile` started folding the group row of a
   K tile (tile-k > 64 previously never matched), the 8 per-item scale / zero-point scalar loads
   became identical and only the first was vectorised, so `quantforge-vectorize-dequant` stopped
-  matching 7 of 8 items. Fixing it (all duplicate loads are replaced) took 1 × 4096 × 4096 from
-  53 µs to 38 µs (Marlin: 49.6 µs). `test/Transforms/gpu_pipeline_groupwise.mlir` now checks that
-  no `cvt.rn.f16` is left in the PTX.
+  matching 7 of 8 items. Fixing it (all duplicate loads are replaced) restored the packed dequantisation.
+  `test/Transforms/gpu_pipeline_groupwise.mlir` now checks that no `cvt.rn.f16` is left in the PTX.
+  (An earlier version of this note quoted 53 → 38 µs for that fix and "faster than Marlin"; those timings came from
+  development runs that are not reproducible: the same kernels measure 50 µs cold, on par with Marlin's 49.6 µs, see
+  the ablation below.)
+* **Ablation of the decode kernel, cold L2, 1 × 4096 × 4096 (2026-11-20):** all passes 50 µs; scalar dequantisation
+  (`vectorize-dequant=false`) 58 µs (+16 %); no look-ahead (`prefetch-distance=0`) 61 µs (+22 %); scalar scale / zero-point /
+  weight loads (`vectorize-loads=false`) 156 µs (3.1×). With the weights L2-resident (no flush) the full kernel is 49 µs:
+  it is latency-bound, not bandwidth-bound, at this size.
 
 * **Wave quantization.** Effective bandwidth by N (K = 4096, `block-tile-n=128`): 183.6 GB/s at
   N = 8192 (64 blocks), 169 at N = 10240 (80 blocks = 4 resident blocks × 20 SMs), ~151 for every
@@ -100,8 +106,8 @@ Measured with `ncu` and a micro-kernel that only reads the packed weights (RTX 4
   with `prefetch-distance=1` (which keeps the bytes in flight) moved 1 × 4096 × 11008 from
   153 to 140 µs; the autotuner now tries it.
 * Benchmark pitfall: with the L2 flushed, a harness that happens to copy the activations (the
-  padding path for M < 16) hands the kernel hot A while M = 16 gets cold A (63 vs 38 µs on the
-  same kernel). `compare_marlin.py` now re-touches the activations after the flush for every
+  padding path for M < 16) hands the kernel hot A while M = 16 gets cold A (an earlier note quoted 63 vs 38 µs on the
+  same kernel; with the current harness M = 1, 4 and 16 all measure 50 µs). `compare_marlin.py` now re-touches the activations after the flush for every
   kernel.
 
 Untried: stream-K / persistent scheduling for the tail wave. Marlin-style offline repacking (contiguous 16-byte-per-thread
@@ -226,7 +232,7 @@ host code on the CUDA driver API. The PTX module is JIT-compiled once and cached
 of its embedded image; `W4A16Gemm.run` hands it PyTorch's current stream (`mgpuSetStream`), the
 stream is neither created nor synchronised per call, so a call is an ordinary asynchronous op
 ordered after the caller's pending work. Per-call wall time of `run` (1 × 4096 × 4096, group-wise):
-211–272 µs before, ~45–50 µs now (kernel 38 µs). An M < 16 call only pads the activations and the
+211–272 µs before, ~45–50 µs now (kernel ~50 µs). An M < 16 call only pads the activations and the
 output (the weights, scales and zero points are not copied).
 
 ## Compile cache and row buckets

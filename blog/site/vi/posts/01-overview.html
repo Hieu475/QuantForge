@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuantForge: sinh kernel GEMM INT4 / INT8 / FP8 bằng MLIR - QuantForge Notes</title>
+<meta name="description" content="Dự án là gì, pipeline compiler được tổ chức ra sao, và toàn bộ kết quả: thời gian kernel so với Marlin, tốc độ decode đầu-cuối trên model thật, và bằng chứng về độ đúng.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/01-overview.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge: sinh kernel GEMM INT4 / INT8 / FP8 bằng MLIR</h1><p class="lede">Dự án là gì, pipeline compiler được tổ chức ra sao, và toàn bộ kết quả: thời gian kernel so với Marlin, tốc độ decode đầu-cuối trên model thật, và bằng chứng về độ đúng.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#vi-sao-luong-tu-hoa-weight-only-va-vi-sao-can-compiler">Vì sao lượng tử hóa weight-only, và vì sao cần compiler</a></li>
+<li><a href="#pipeline">Pipeline</a><ul>
+<li><a href="#runtime">Runtime</a></li>
+</ul>
+</li>
+<li><a href="#ket-qua-kernel-so-voi-marlin">Kết quả: kernel so với Marlin</a></li>
+<li><a href="#ket-qua-toan-bo-model">Kết quả: toàn bộ model</a></li>
+<li><a href="#bang-chung-ve-o-ung">Bằng chứng về độ đúng</a></li>
+<li><a href="#cach-dung">Cách dùng</a></li>
+<li><a href="#han-che-noi-thang">Hạn chế, nói thẳng</a></li>
+</ul>
+</div>
+</details><h2 id="vi-sao-luong-tu-hoa-weight-only-va-vi-sao-can-compiler">Vì sao lượng tử hóa weight-only, và vì sao cần compiler<a class="headerlink" href="#vi-sao-luong-tu-hoa-weight-only-va-vi-sao-can-compiler" title="Permanent link">#</a></h2>
+<p>Khi decode tự hồi quy, LLM đọc <strong>mọi weight một lần cho mỗi token sinh ra</strong> và làm rất ít phép tính với nó: ở batch size 1, mỗi weight chỉ tham gia một phép nhân-cộng. Bước decode bị giới hạn bởi băng thông bộ nhớ, không phải sức tính. Lưu weight dạng số nguyên 4 bit thay vì số thực 16 bit làm một bước decode rẻ hơn tới bốn lần về byte, miễn là dequantisation đủ rẻ để ẩn sau lưu lượng bộ nhớ. Đây là ý tưởng đằng sau GPTQ, AWQ và các kernel như Marlin.</p>
+<p>Kernel viết tay như Marlin chạm tới giới hạn băng thông, nhưng được viết cho từng shape và bit-width cụ thể. Câu hỏi của QuantForge là: <strong>compiler có thể tiến gần đến đâu khi sinh kernel từ một mô tả cấp cao và một tập pass ghép được, không cần tuning tay cho từng shape?</strong> Pipeline bắt đầu từ mô tả ở mức tensor của</p>
+<pre><code>C = A @ dequant(unpack(W_packed))        # A: activation fp16, dequant(q) = (q - zero) * scale theo nhóm 128 hàng
+</code></pre>
+<p>và kết thúc bằng PTX được gọi từ PyTorch.</p>
+<h2 id="pipeline">Pipeline<a class="headerlink" href="#pipeline" title="Permanent link">#</a></h2>
+<p>Đầu vào là một hàm trong dialect <code>qf</code>:</p>
+<pre><code class="language-mlir">func.func @w4a16_gemm(%act: tensor&lt;MxKxf16&gt;, %wp: tensor&lt;Kx(N/2)xi8&gt;,
+                      %scale: tensor&lt;(K/G)xNxf16&gt;, %zp: tensor&lt;(K/G)xNxi8&gt;,
+                      %c: tensor&lt;MxNxf32&gt;) -&gt; tensor&lt;MxNxf32&gt; {
+  %w  = qf.unpack %wp : tensor&lt;Kx(N/2)xi8&gt; -&gt; tensor&lt;KxNxi8&gt;      // hai INT4 trong một byte
+  %wf = qf.dequant %w, %scale, %zp : ... -&gt; tensor&lt;KxNxf16&gt;        // (q - zero) * scale, theo nhóm
+  %r  = linalg.matmul ins(%act, %wf) outs(%c)
+  return %r
+}
+</code></pre>
+<p><code>quantforge-opt --quantforge-gpu-pipeline</code> hạ nó xuống qua bốn giai đoạn. Tên dưới đây là tên pass thật:</p>
+<table>
+<thead>
+<tr>
+<th>giai đoạn</th>
+<th>điều xảy ra</th>
+<th>pass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mức tensor</td>
+<td>dequantisation thành <code>linalg.generic</code> theo phần tử, unpack và dequant được gộp</td>
+<td><code>fuse-unpack-dequant</code>, <code>lower-dequant-to-arith</code></td>
+</tr>
+<tr>
+<td>tiling và ánh xạ</td>
+<td>chia tile block / warp, ánh xạ lên lưới GPU, swizzle tile thân thiện L2 (tùy chọn)</td>
+<td><code>tiling</code>, <code>forall-to-gpu</code> (<code>block-swizzle</code>), <code>thread-distribute</code></td>
+</tr>
+<tr>
+<td>phân cấp bộ nhớ</td>
+<td>tile A đi qua shared memory với pipeline <code>cp.async</code> nhiều stage; <strong>dequantisation được tính lại ngay khi tile weight được đưa vào</strong>, nên chỉ byte INT4 đã đóng gói mới đi từ DRAM</td>
+<td><code>smem-promotion</code>, <code>fuse-producer-into-loads</code></td>
+</tr>
+<tr>
+<td>mức lệnh</td>
+<td>load vector 16 byte, dequantisation <code>f16x2</code> đóng gói, accumulator trong register, <code>mma.sync.m16n8k16</code>, look-ahead cho load weight, epilogue gộp</td>
+<td><code>simplify-index-math</code>, <code>vectorize-global-loads</code>, <code>vectorize-dequant</code>, <code>hoist-vector-transfers</code>, <code>convert-vector-to-gpu</code>, <code>prefetch-weight-loads</code>, <code>fuse-epilogue</code>, <code>overwrite-output</code></td>
+</tr>
+</tbody>
+</table>
+<p>Kết quả là một kernel duy nhất cho mỗi GEMM. Weight f16 đã dequantise không bao giờ được ghi ra bộ nhớ; đó là lý do kernel INT4 nhanh hơn GEMM fp16 của cuBLAS từ 3.2 đến 3.7 lần ở decode.</p>
+<h3 id="runtime">Runtime<a class="headerlink" href="#runtime" title="Permanent link">#</a></h3>
+<p>PTX sinh ra được đóng thành shared library và nạp qua một shim CUDA driver nhỏ. Bên trên có:</p>
+<ul>
+<li>PyTorch custom op <code>torch.ops.quantforge.w4a16_gemm</code> đăng ký trong dispatcher từ C++ (khoảng 45 micro giây thời gian host mỗi lần gọi từ Python, thay vì 210 đến 270 với launcher Python thuần ban đầu), chạy ở chế độ eager, dưới <code>torch.compile</code> và trong CUDA graph;</li>
+<li>cache kernel đã biên dịch bền vững trên đĩa và <strong>row bucket</strong> (M tới 16, 32, 64, 128, 256, ... mỗi nhóm một kernel) để server gặp prompt dài từ 1 đến 4096 chỉ biên dịch khoảng một chục kernel cho mỗi shape layer, thay vì một kernel cho mỗi độ dài;</li>
+<li>autotuner đo các tùy chọn tile một lần cho mỗi shape và lưu lại kết quả tốt nhất.</li>
+</ul>
+<p>Bốn schedule kernel được chọn theo số hàng activation M:</p>
+<table>
+<thead>
+<tr>
+<th>M</th>
+<th>schedule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 đến 16</td>
+<td><em>decode</em>: một tile Tensor Core 16 hàng cho mỗi block, N rải trên các block, weight chỉ đọc đúng một lần</td>
+</tr>
+<tr>
+<td>17 đến 32 / 33 đến 64</td>
+<td><em>skinny</em>: tile block 32 hoặc 64 hàng</td>
+</tr>
+<tr>
+<td>65 đến 256</td>
+<td>tile 64 hoặc 128 hàng</td>
+</tr>
+<tr>
+<td>trên 256</td>
+<td><em>prefill</em>: tile 128 x 128, pipeline 3 stage cho weight lớn</td>
+</tr>
+</tbody>
+</table>
+<h2 id="ket-qua-kernel-so-voi-marlin">Kết quả: kernel so với Marlin<a class="headerlink" href="#ket-qua-kernel-so-voi-marlin" title="Permanent link">#</a></h2>
+<p>Mọi số kernel là <strong>thời gian device từ trace CUPTI</strong>, tốt nhất của nhiều lần chạy, với weight đọc từ DRAM: L2 được flush trước mỗi lần gọi bằng cách <em>đọc</em> một buffer 256 MB (ghi vào nó để lại các dòng cache dirty làm kernel kế tiếp chậm 20 đến 50 phần trăm), và activation được chạm lại sau đó vì trong model thật layer trước vừa ghi chúng. Marlin là <code>marlin_gemm</code> của vLLM 0.25.1 trên cùng giá trị INT4 và scale. Group size 128.</p>
+<figure class="viz"><div class="viz-title">Tốc độ QuantForge so với Marlin (càng cao càng tốt)</div><svg class="chart" viewBox="0 0 760 402" role="img" aria-label="Tốc độ QuantForge so với Marlin (càng cao càng tốt)"><line class="grid" x1="150.0" y1="12" x2="150.0" y2="380"/><text class="tick" x="150.0" y="396" text-anchor="middle">0x</text><line class="grid" x1="258.0" y1="12" x2="258.0" y2="380"/><text class="tick" x="258.0" y="396" text-anchor="middle">0.25x</text><line class="grid" x1="366.0" y1="12" x2="366.0" y2="380"/><text class="tick" x="366.0" y="396" text-anchor="middle">0.5x</text><line class="grid" x1="474.0" y1="12" x2="474.0" y2="380"/><text class="tick" x="474.0" y="396" text-anchor="middle">0.75x</text><line class="grid" x1="582.0" y1="12" x2="582.0" y2="380"/><text class="tick" x="582.0" y="396" text-anchor="middle">1x</text><line class="grid" x1="690.0" y1="12" x2="690.0" y2="380"/><text class="tick" x="690.0" y="396" text-anchor="middle">1.25x</text><text class="lab" x="140" y="32.4" text-anchor="end">16 x 4096 x 4096</text><path class="s1" d="M150 18 H582.3 a4 4 0 0 1 4 4 V34 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 4096: 1.01x</title></path><text class="val" x="594.3" y="32.4">1.01x</text><text class="lab" x="140" y="62.4" text-anchor="end">1 x 4096 x 4096</text><path class="s1" d="M150 48 H573.7 a4 4 0 0 1 4 4 V64 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 4096: 0.99x</title></path><text class="val" x="585.7" y="62.4">0.99x</text><text class="lab" x="140" y="92.4" text-anchor="end">4 x 4096 x 4096</text><path class="s1" d="M150 78 H573.7 a4 4 0 0 1 4 4 V94 a4 4 0 0 1 -4 4 H150 Z"><title>4 x 4096 x 4096: 0.99x</title></path><text class="val" x="585.7" y="92.4">0.99x</text><text class="lab" x="140" y="122.4" text-anchor="end">1 x 11008 x 4096</text><path class="s1" d="M150 108 H565.0 a4 4 0 0 1 4 4 V124 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 11008 x 4096: 0.97x</title></path><text class="val" x="577.0" y="122.4">0.97x</text><text class="lab" x="140" y="152.4" text-anchor="end">32 x 4096 x 4096</text><path class="s1" d="M150 138 H521.8 a4 4 0 0 1 4 4 V154 a4 4 0 0 1 -4 4 H150 Z"><title>32 x 4096 x 4096: 0.87x</title></path><text class="val" x="533.8" y="152.4">0.87x</text><text class="lab" x="140" y="182.4" text-anchor="end">2048 x 4096 x 4096</text><path class="s1" d="M150 168 H517.5 a4 4 0 0 1 4 4 V184 a4 4 0 0 1 -4 4 H150 Z"><title>2048 x 4096 x 4096: 0.86x</title></path><text class="val" x="529.5" y="182.4">0.86x</text><text class="lab" x="140" y="212.4" text-anchor="end">1 x 4096 x 11008</text><path class="s1" d="M150 198 H513.2 a4 4 0 0 1 4 4 V214 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 11008: 0.85x</title></path><text class="val" x="525.2" y="212.4">0.85x</text><text class="lab" x="140" y="242.4" text-anchor="end">16 x 4096 x 11008</text><path class="s1" d="M150 228 H513.2 a4 4 0 0 1 4 4 V244 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 11008: 0.85x</title></path><text class="val" x="525.2" y="242.4">0.85x</text><text class="lab" x="140" y="272.4" text-anchor="end">512 x 4096 x 4096</text><path class="s1" d="M150 258 H513.2 a4 4 0 0 1 4 4 V274 a4 4 0 0 1 -4 4 H150 Z"><title>512 x 4096 x 4096: 0.85x</title></path><text class="val" x="525.2" y="272.4">0.85x</text><text class="lab" x="140" y="302.4" text-anchor="end">256 x 4096 x 4096</text><path class="s1" d="M150 288 H474.3 a4 4 0 0 1 4 4 V304 a4 4 0 0 1 -4 4 H150 Z"><title>256 x 4096 x 4096: 0.76x</title></path><text class="val" x="486.3" y="302.4">0.76x</text><text class="lab" x="140" y="332.4" text-anchor="end">128 x 4096 x 4096</text><path class="s1" d="M150 318 H444.1 a4 4 0 0 1 4 4 V334 a4 4 0 0 1 -4 4 H150 Z"><title>128 x 4096 x 4096: 0.69x</title></path><text class="val" x="456.1" y="332.4">0.69x</text><text class="lab" x="140" y="362.4" text-anchor="end">64 x 4096 x 4096</text><path class="s1" d="M150 348 H435.4 a4 4 0 0 1 4 4 V364 a4 4 0 0 1 -4 4 H150 Z"><title>64 x 4096 x 4096: 0.67x</title></path><text class="val" x="447.4" y="362.4">0.67x</text><line class="ref" x1="582.0" y1="10" x2="582.0" y2="380"/><text class="reflab" x="587.0" y="10">Marlin = 1.0</text></svg><figcaption>M x K x N, group size 128, weight đọc từ DRAM (đã flush L2), thời gian kernel trên device, RTX 4050 Laptop. Đường nét đứt là Marlin (vLLM 0.25.1) trên cùng weight INT4.</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>M x K x N</th>
+<th style="text-align: right;">Marlin (us)</th>
+<th style="text-align: right;">QuantForge (us)</th>
+<th style="text-align: right;">cuBLAS fp16 (us)</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 x 4096 x 4096</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">180.9</td>
+<td style="text-align: right;">0.99x</td>
+</tr>
+<tr>
+<td>4 x 4096 x 4096</td>
+<td style="text-align: right;">49.4</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">181.5</td>
+<td style="text-align: right;">0.99x</td>
+</tr>
+<tr>
+<td>16 x 4096 x 4096</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">182.3</td>
+<td style="text-align: right;">1.01x</td>
+</tr>
+<tr>
+<td>1 x 4096 x 11008</td>
+<td style="text-align: right;">126.6</td>
+<td style="text-align: right;">149.3</td>
+<td style="text-align: right;">482.9</td>
+<td style="text-align: right;">0.85x</td>
+</tr>
+<tr>
+<td>1 x 11008 x 4096</td>
+<td style="text-align: right;">127.0</td>
+<td style="text-align: right;">131.0</td>
+<td style="text-align: right;">483.6</td>
+<td style="text-align: right;">0.97x</td>
+</tr>
+<tr>
+<td>16 x 4096 x 11008</td>
+<td style="text-align: right;">127.2</td>
+<td style="text-align: right;">149.2</td>
+<td style="text-align: right;">498.5</td>
+<td style="text-align: right;">0.85x</td>
+</tr>
+<tr>
+<td>32 x 4096 x 4096</td>
+<td style="text-align: right;">50.9</td>
+<td style="text-align: right;">58.8</td>
+<td style="text-align: right;">181.0</td>
+<td style="text-align: right;">0.87x</td>
+</tr>
+<tr>
+<td>32 x 4096 x 11008</td>
+<td style="text-align: right;">130.3</td>
+<td style="text-align: right;">149.3</td>
+<td style="text-align: right;">497.3</td>
+<td style="text-align: right;">0.87x</td>
+</tr>
+<tr>
+<td>64 x 4096 x 4096</td>
+<td style="text-align: right;">58.3</td>
+<td style="text-align: right;">87.4</td>
+<td style="text-align: right;">181.4</td>
+<td style="text-align: right;">0.67x</td>
+</tr>
+<tr>
+<td>64 x 4096 x 11008</td>
+<td style="text-align: right;">139.9</td>
+<td style="text-align: right;">200.0</td>
+<td style="text-align: right;">506.9</td>
+<td style="text-align: right;">0.70x</td>
+</tr>
+<tr>
+<td>128 x 4096 x 4096</td>
+<td style="text-align: right;">105.1</td>
+<td style="text-align: right;">152.2</td>
+<td style="text-align: right;">188.7</td>
+<td style="text-align: right;">0.69x</td>
+</tr>
+<tr>
+<td>256 x 4096 x 4096</td>
+<td style="text-align: right;">201.0</td>
+<td style="text-align: right;">263.0</td>
+<td style="text-align: right;">208.2</td>
+<td style="text-align: right;">0.76x</td>
+</tr>
+<tr>
+<td>512 x 4096 x 4096</td>
+<td style="text-align: right;">391.5</td>
+<td style="text-align: right;">461.6</td>
+<td style="text-align: right;">373.4</td>
+<td style="text-align: right;">0.85x</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">1532.1</td>
+<td style="text-align: right;">1775.8</td>
+<td style="text-align: right;">1453.0</td>
+<td style="text-align: right;">0.86x</td>
+</tr>
+</tbody>
+</table>
+<figure class="viz"><div class="viz-title">Thời gian kernel ở batch nhỏ và vừa (micro giây, càng thấp càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>Marlin</span><span class="lg"><i class="sw s2"></i>QuantForge</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Thời gian kernel ở batch nhỏ và vừa (micro giây, càng thấp càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">60</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">120</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">180</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">240</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">300</text><path class="s1" d="M75.2 268 V231.0 a4 4 0 0 1 4 -4 H105.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - Marlin: 50 us</title></path><text class="val" x="92.2" y="222.0" text-anchor="middle">50</text><path class="s2" d="M111.2 268 V230.7 a4 4 0 0 1 4 -4 H141.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - QuantForge: 50 us</title></path><text class="val" x="128.2" y="221.7" text-anchor="middle">50</text><text class="lab" x="110.2" y="286" text-anchor="middle">M=1</text><path class="s1" d="M191.5 268 V230.7 a4 4 0 0 1 4 -4 H221.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - Marlin: 50 us</title></path><text class="val" x="208.5" y="221.7" text-anchor="middle">50</text><path class="s2" d="M227.5 268 V230.8 a4 4 0 0 1 4 -4 H257.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - QuantForge: 50 us</title></path><text class="val" x="244.5" y="221.8" text-anchor="middle">50</text><text class="lab" x="226.5" y="286" text-anchor="middle">M=16</text><path class="s1" d="M307.8 268 V229.9 a4 4 0 0 1 4 -4 H337.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - Marlin: 51 us</title></path><text class="val" x="324.8" y="220.9" text-anchor="middle">51</text><path class="s2" d="M343.8 268 V223.4 a4 4 0 0 1 4 -4 H373.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - QuantForge: 59 us</title></path><text class="val" x="360.8" y="214.4" text-anchor="middle">59</text><text class="lab" x="342.8" y="286" text-anchor="middle">M=32</text><path class="s1" d="M424.2 268 V223.8 a4 4 0 0 1 4 -4 H454.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - Marlin: 58 us</title></path><text class="val" x="441.2" y="214.8" text-anchor="middle">58</text><path class="s2" d="M460.2 268 V199.7 a4 4 0 0 1 4 -4 H490.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - QuantForge: 87 us</title></path><text class="val" x="477.2" y="190.7" text-anchor="middle">87</text><text class="lab" x="459.2" y="286" text-anchor="middle">M=64</text><path class="s1" d="M540.5 268 V185.1 a4 4 0 0 1 4 -4 H570.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - Marlin: 105 us</title></path><text class="val" x="557.5" y="176.1" text-anchor="middle">105</text><path class="s2" d="M576.5 268 V146.2 a4 4 0 0 1 4 -4 H606.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - QuantForge: 152 us</title></path><text class="val" x="593.5" y="137.2" text-anchor="middle">152</text><text class="lab" x="575.5" y="286" text-anchor="middle">M=128</text><path class="s1" d="M656.8 268 V105.8 a4 4 0 0 1 4 -4 H686.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - Marlin: 201 us</title></path><text class="val" x="673.8" y="96.8" text-anchor="middle">201</text><path class="s2" d="M692.8 268 V54.6 a4 4 0 0 1 4 -4 H722.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - QuantForge: 263 us</title></path><text class="val" x="709.8" y="45.6" text-anchor="middle">263</text><text class="lab" x="691.8" y="286" text-anchor="middle">M=256</text></svg><figcaption>K = N = 4096, group size 128. Cùng phương pháp đo như trên.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>Marlin</th><th>QuantForge</th></tr></thead><tbody><tr><th>M=1</th><td>50</td><td>50</td></tr><tr><th>M=16</th><td>50</td><td>50</td></tr><tr><th>M=32</th><td>51</td><td>59</td></tr><tr><th>M=64</th><td>58</td><td>87</td></tr><tr><th>M=128</th><td>105</td><td>152</td></tr><tr><th>M=256</th><td>201</td><td>263</td></tr></tbody></table></details></figure>
+<p>Bảng nói lên điều gì:</p>
+<ul>
+<li><strong>Decode (M tới 16)</strong>: ở 4096 x 4096 kernel sinh ra <strong>ngang Marlin</strong> (0.99 đến 1.01x, khoảng 50 micro giây, đúng là giới hạn DRAM: <code>ncu</code> đo được 9.2 MB đọc cho 8.65 MB weight và scale, khoảng 184 GB/s); với shape rộng 4096 x 11008 đạt 85 phần trăm, với 1 x 11008 x 4096 đạt 97 phần trăm. (Phiên bản đầu của bài này báo 1.30x ở 4096 x 4096; con số đó không qua được lần đo lại, xem <a href="02-decode-instruction-bound.html">bài về decode</a>.)</li>
+<li><strong>Prefill (M từ 512 trở lên)</strong>: 85 đến 86 phần trăm của Marlin, chậm hơn cuBLAS fp16 khoảng 20 đến 25 phần trăm, trong khi cuBLAS đọc nhiều gấp bốn lần byte nhưng không phải dequantise: ở đây kernel bị giới hạn bởi tính toán và dequantisation tranh slot issue với Tensor Core.</li>
+<li><strong>M từ 32 đến 256</strong> là điểm yếu, chậm hơn 13 đến 33 phần trăm. <a href="04-mid-batch-postmortem.html">Một bài riêng</a> điều tra chi tiết.</li>
+</ul>
+<h2 id="ket-qua-toan-bo-model">Kết quả: toàn bộ model<a class="headerlink" href="#ket-qua-toan-bo-model" title="Permanent link">#</a></h2>
+<p>Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. <code>quantforge.nn.quantize_model</code> thay các layer <code>nn.Linear</code> của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp <code>silu(gate) * up</code>. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token của tập test Wikitext-2, INT4 round-to-nearest đơn giản (group 128) với head INT8.</p>
+<figure class="viz"><div class="viz-title">Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>fp16 (Hugging Face)</span><span class="lg"><i class="sw s2"></i>QuantForge INT4 + head INT8</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">48</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">96</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">144</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">192</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">240</text><path class="s1" d="M104.2 268 V138.7 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - fp16 (Hugging Face): 129</title></path><text class="val" x="121.2" y="129.7" text-anchor="middle">129</text><path class="s2" d="M140.2 268 V56.0 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - QuantForge INT4 + head INT8: 209</title></path><text class="val" x="157.2" y="47.0" text-anchor="middle">209</text><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V221.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - fp16 (Hugging Face): 49</title></path><text class="val" x="295.8" y="212.4" text-anchor="middle">49</text><path class="s2" d="M314.8 268 V171.8 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - QuantForge INT4 + head INT8: 97</title></path><text class="val" x="331.8" y="162.8" text-anchor="middle">97</text><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V206.9 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - fp16 (Hugging Face): 63</title></path><text class="val" x="470.2" y="197.9" text-anchor="middle">63</text><path class="s2" d="M489.2 268 V125.3 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - QuantForge INT4 + head INT8: 142</title></path><text class="val" x="506.2" y="116.3" text-anchor="middle">142</text><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V210.0 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - fp16 (Hugging Face): 60</title></path><text class="val" x="644.8" y="201.0" text-anchor="middle">60</text><path class="s2" d="M663.8 268 V129.4 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - QuantForge INT4 + head INT8: 138</title></path><text class="val" x="680.8" y="120.4" text-anchor="middle">138</text><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>RTX 4050 Laptop, 6 GB. INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>fp16 (Hugging Face)</th><th>QuantForge INT4 + head INT8</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>129</td><td>209</td></tr><tr><th>Qwen2.5 1.5B</th><td>49</td><td>97</td></tr><tr><th>Llama-3.2 1B</th><td>63</td><td>142</td></tr><tr><th>OLMo-2 1B</th><td>60</td><td>138</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">ppl fp16</th>
+<th style="text-align: right;">tok/s fp16</th>
+<th style="text-align: right;">ppl INT4</th>
+<th style="text-align: right;">tok/s INT4</th>
+<th style="text-align: right;">weight fp16 -&gt; INT4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B-Instruct</td>
+<td style="text-align: right;">19.93</td>
+<td style="text-align: right;">129</td>
+<td style="text-align: right;">24.08</td>
+<td style="text-align: right;">209</td>
+<td style="text-align: right;">0.72 -&gt; 0.19 GB</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B-Instruct</td>
+<td style="text-align: right;">13.48</td>
+<td style="text-align: right;">49</td>
+<td style="text-align: right;">15.31</td>
+<td style="text-align: right;">97</td>
+<td style="text-align: right;">2.62 -&gt; 0.69 GB</td>
+</tr>
+<tr>
+<td>Qwen2.5-3B-Instruct</td>
+<td style="text-align: right;">không vừa 6 GB</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">14.29</td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">5.55 -&gt; 1.45 GB</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B-Instruct</td>
+<td style="text-align: right;">20.15</td>
+<td style="text-align: right;">63</td>
+<td style="text-align: right;">24.42</td>
+<td style="text-align: right;">142</td>
+<td style="text-align: right;">1.95 -&gt; 0.51 GB</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct</td>
+<td style="text-align: right;">19.32</td>
+<td style="text-align: right;">60</td>
+<td style="text-align: right;">21.31</td>
+<td style="text-align: right;">138</td>
+<td style="text-align: right;">2.15 -&gt; 0.56 GB</td>
+</tr>
+<tr>
+<td>Phi-3.5-mini-instruct (3.8B)</td>
+<td style="text-align: right;">không vừa</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">9.62</td>
+<td style="text-align: right;">chưa đo</td>
+<td style="text-align: right;">7.25 -&gt; 1.90 GB</td>
+</tr>
+<tr>
+<td>Mistral-7B-Instruct-v0.3 (từ checkpoint NF4)</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">8.51 (bitsandbytes NF4: 8.37)</td>
+<td style="text-align: right;">35.3 (bitsandbytes: 36.0)</td>
+<td style="text-align: right;">đỉnh 4.65 GB</td>
+</tr>
+</tbody>
+</table>
+<p>Một model 3B và một model 7B chạy được trên card 6 GB vốn không chứa nổi chúng ở fp16. Cái giá về perplexity của 4 bit round-to-nearest là có thật (1 đến 4 điểm); <a href="05-gptq-and-checkpoints.html">bài về GPTQ</a> cho thấy một quantiser thông minh hơn lấy lại được bao nhiêu. Mức tăng tốc giảm khi model lớn lên, vì lm_head, attention và khoảng 1400 kernel nhỏ của đồ thị Hugging Face chiếm phần lớn hơn của mỗi bước.</p>
+<h2 id="bang-chung-ve-o-ung">Bằng chứng về độ đúng<a class="headerlink" href="#bang-chung-ve-o-ung" title="Permanent link">#</a></h2>
+<p>Số tốc độ vô giá trị nếu kernel sai tinh vi, nên dự án dựa nhiều vào kiểm tra:</p>
+<ul>
+<li>mọi lần chạy đầu-cuối được so với một <strong>bản sinh đôi dense</strong>: cùng model nhưng weight INT4 được dequantise thành các layer <code>nn.Linear</code> fp16 bình thường. Perplexity khớp trong 0.002 và greedy decoding cho ra token giống hệt (48/48 hoặc 59/59) trên mọi model đã thử;</li>
+<li>checkpoint AWQ và GPTQ-Int4 thật của Qwen2.5-0.5B chạy qua thư viện khớp với bản sinh đôi dense: GPTQ 26.336 so với 26.335 perplexity, AWQ 26.689 so với 26.689;</li>
+<li><code>compute-sanitizer</code> (memcheck và racecheck) sạch cho 54 biến thể pipeline, gồm các pipeline prefetch, epilogue gộp và mọi schedule ở trên;</li>
+<li>37 test FileCheck bảo vệ cấu trúc code sinh ra (ví dụ "không có phép đổi int sang float vô hướng cho mỗi weight", lỗi hồi quy từng làm chậm 40 phần trăm).</li>
+</ul>
+<h2 id="cach-dung">Cách dùng<a class="headerlink" href="#cach-dung" title="Permanent link">#</a></h2>
+<pre><code class="language-python">import torch, quantforge.nn as qnn
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-1.5B-Instruct&quot;, dtype=torch.float16)
+qnn.quantize_model(model, fmt=&quot;int4&quot;, group_size=128)          # int4 | int8 | fp8
+qnn.quantize_model(model, &quot;int8&quot;, only=(&quot;lm_head&quot;,), fuse=False)  # head INT8 không mất chất lượng
+out = model.generate(ids.cuda(), max_new_tokens=64)            # chạy trên các kernel đã sinh
+</code></pre>
+<h2 id="han-che-noi-thang">Hạn chế, nói thẳng<a class="headerlink" href="#han-che-noi-thang" title="Permanent link">#</a></h2>
+<ul>
+<li>Mọi số đo đến từ <strong>một GPU laptop</strong> với xung nhịp dao động; chưa có kết quả trên GPU data-center.</li>
+<li>Baseline duy nhất là Marlin và cuBLAS. Machete, kernel Triton như gemlite, torchao và vLLM đầu-cuối chưa được so sánh.</li>
+<li>Kernel là PTX dựng bằng backend NVPTX của LLVM 18: không có Hopper <code>wgmma</code> hay TMA, không có activation FP8.</li>
+<li>M từ 32 đến 256 và prefill vẫn thua Marlin; các bài tiếp theo giải thích những gì đã thử.</li>
+</ul></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -41,7 +41,7 @@ func.func @w4a16_gemm(%act: tensor<MxKxf16>, %wp: tensor<Kx(N/2)xi8>,
 | memory hierarchy | A tile through shared memory with a multi-stage `cp.async` pipeline; **the dequantisation is recomputed while the weight tile is staged**, so only the packed INT4 bytes ever travel from DRAM | `smem-promotion`, `fuse-producer-into-loads` |
 | instruction level | vectorised 16-byte loads, packed `f16x2` dequantisation, accumulators in registers, `mma.sync.m16n8k16`, weight-load look-ahead, fused epilogues | `simplify-index-math`, `vectorize-global-loads`, `vectorize-dequant`, `hoist-vector-transfers`, `convert-vector-to-gpu`, `prefetch-weight-loads`, `fuse-epilogue`, `overwrite-output` |
 
-The result is a single kernel per GEMM. The dequantised f16 weights are never materialised in memory; that is what makes the INT4 kernels 2.5 to 4.8 times faster than a cuBLAS fp16 GEMM at decode.
+The result is a single kernel per GEMM. The dequantised f16 weights are never materialised in memory; that is what makes the INT4 kernels 3.2 to 3.7 times faster than a cuBLAS fp16 GEMM at decode.
 
 ### Runtime
 
@@ -68,28 +68,28 @@ All kernel numbers are **device time from the CUPTI trace**, best of many runs, 
 
 | M x K x N | Marlin (us) | QuantForge (us) | cuBLAS fp16 (us) | QuantForge / Marlin |
 |---|--:|--:|--:|--:|
-| 1 x 4096 x 4096 | 49.4 | 38.0 | 180.8 | 1.30x |
-| 4 x 4096 x 4096 | 49.4 | 38.0 | 181.7 | 1.30x |
-| 16 x 4096 x 4096 | 50.0 | 50.0 | 183.0 | 1.00x |
-| 1 x 4096 x 11008 | 126.7 | 139.2 | 482.3 | 0.91x |
-| 1 x 11008 x 4096 | 127.0 | 135.1 | 483.3 | 0.94x |
-| 16 x 4096 x 11008 | 127.4 | 148.9 | 498.6 | 0.86x |
-| 32 x 4096 x 4096 | 50.8 | 57.8 | 181.0 | 0.88x |
-| 32 x 4096 x 11008 | 129.8 | 148.8 | 497.1 | 0.87x |
-| 64 x 4096 x 4096 | 58.6 | 86.9 | 181.4 | 0.67x |
-| 64 x 4096 x 11008 | 139.4 | 197.9 | 507.0 | 0.70x |
-| 128 x 4096 x 4096 | 104.1 | 150.8 | 188.7 | 0.69x |
-| 256 x 4096 x 4096 | 198.7 | 261.1 | 207.2 | 0.76x |
-| 512 x 4096 x 4096 | 387.9 | 456.7 | 371.1 | 0.85x |
-| 2048 x 4096 x 4096 | 1514.6 | 1764.6 | 1427.1 | 0.86x |
+| 1 x 4096 x 4096 | 49.6 | 50.0 | 180.9 | 0.99x |
+| 4 x 4096 x 4096 | 49.4 | 49.8 | 181.5 | 0.99x |
+| 16 x 4096 x 4096 | 50.0 | 49.8 | 182.3 | 1.01x |
+| 1 x 4096 x 11008 | 126.6 | 149.3 | 482.9 | 0.85x |
+| 1 x 11008 x 4096 | 127.0 | 131.0 | 483.6 | 0.97x |
+| 16 x 4096 x 11008 | 127.2 | 149.2 | 498.5 | 0.85x |
+| 32 x 4096 x 4096 | 50.9 | 58.8 | 181.0 | 0.87x |
+| 32 x 4096 x 11008 | 130.3 | 149.3 | 497.3 | 0.87x |
+| 64 x 4096 x 4096 | 58.3 | 87.4 | 181.4 | 0.67x |
+| 64 x 4096 x 11008 | 139.9 | 200.0 | 506.9 | 0.70x |
+| 128 x 4096 x 4096 | 105.1 | 152.2 | 188.7 | 0.69x |
+| 256 x 4096 x 4096 | 201.0 | 263.0 | 208.2 | 0.76x |
+| 512 x 4096 x 4096 | 391.5 | 461.6 | 373.4 | 0.85x |
+| 2048 x 4096 x 4096 | 1532.1 | 1775.8 | 1453.0 | 0.86x |
 
 {{chart:kernel_us}}
 
 What the table says:
 
-* **Decode (M up to 16)**: at 4096 x 4096 the generated kernel is at or above Marlin (the 1.30x implies more than the measured DRAM read ceiling, so part of it is probably L2 residency that the flush did not remove; the wide shapes are the cleaner comparison, see [the decode post](02-decode-instruction-bound.html)); for the wide 4096 x 11008 shapes it reaches 86 to 94 percent. The weights stream from DRAM at 150 to 175 GB/s on a card whose measured read ceiling is about 183 GB/s.
+* **Decode (M up to 16)**: at 4096 x 4096 the generated kernel is **on par with Marlin** (0.99 to 1.01x, about 50 microseconds, which is the DRAM limit: `ncu` measures 9.2 MB read for 8.65 MB of weights and scales, about 184 GB/s); on the wide 4096 x 11008 shapes it reaches 85 percent, on 1 x 11008 x 4096 97 percent. (An earlier version of this post reported 1.30x at 4096 x 4096; that figure did not survive re-measurement, see [the decode post](02-decode-instruction-bound.html).)
 * **Prefill (M of 512 and more)**: 85 to 86 percent of Marlin, about 20 to 25 percent slower than cuBLAS fp16, which reads four times the bytes but has no dequantisation to do: the kernel is compute-bound there and the dequantisation competes with the Tensor Cores for issue slots.
-* **M between 32 and 256** is the weak spot, 12 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail.
+* **M between 32 and 256** is the weak spot, 13 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail.
 
 ## Results: whole models
 

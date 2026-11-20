@@ -26,6 +26,15 @@ def _fmt(v, decimals):
     return f"{v:.{decimals}f}"
 
 
+UI = {
+    "en": {"posts": "Posts", "about": "About", "contents": "Contents", "table": "Table view", "marlin": "Marlin = 1.0",
+           "other": "Tiếng Việt", "lang": "en"},
+    "vi": {"posts": "Bài viết", "about": "Giới thiệu", "contents": "Mục lục", "table": "Xem dạng bảng", "marlin": "Marlin = 1.0",
+           "other": "English", "lang": "vi"},
+}
+LANG = "en"
+
+
 def hbar_chart(title, rows, xmax, ref=None, unit="", decimals=2, label_w=190, note=""):
     """Horizontal bars (one series). rows: [(label, value)]. Optional reference line at `ref`."""
     bar_h, gap, top, left, right = 20, 10, 18, label_w, 70
@@ -46,7 +55,7 @@ def hbar_chart(title, rows, xmax, ref=None, unit="", decimals=2, label_w=190, no
         out.append(f'<text class="val" x="{x(v) + 8:.1f}" y="{y + bar_h * 0.72:.1f}">{_fmt(v, decimals)}{unit}</text>')
     if ref is not None:
         out.append(f'<line class="ref" x1="{x(ref):.1f}" y1="{top - 8}" x2="{x(ref):.1f}" y2="{H - 22}"/>')
-        out.append(f'<text class="reflab" x="{x(ref) + 5:.1f}" y="{top - 8}">Marlin = 1.0</text>')
+        out.append(f'<text class="reflab" x="{x(ref) + 5:.1f}" y="{top - 8}">{UI[LANG]["marlin"]}</text>')
     out.append("</svg>")
     return _figure(title, "".join(out), note=note)
 
@@ -92,7 +101,7 @@ def grouped_chart(title, groups, series, ymax, unit="", decimals=0, markers=None
     for gi, g in enumerate(groups):
         cells = "".join(f"<td>{_fmt(vals[gi], decimals)}</td>" for _, vals in series) + (f"<td>{markers[gi]:g}</td>" if markers else "")
         rows += f"<tr><th>{html.escape(g.replace(chr(10), ' '))}</th>{cells}</tr>"
-    table = f"<details class='tv'><summary>Table view</summary><table><thead><tr><th></th>{head}</tr></thead><tbody>{rows}</tbody></table></details>"
+    table = f"<details class='tv'><summary>{UI[LANG]["table"]}</summary><table><thead><tr><th></th>{head}</tr></thead><tbody>{rows}</tbody></table></details>"
     return _figure(title, "".join(out), legend, note, table)
 
 
@@ -102,35 +111,54 @@ def _figure(title, svg, legend="", note="", table=""):
     return f'<figure class="viz"><div class="viz-title">{html.escape(title)}</div>{leg}{svg}{nt}{table}</figure>'
 
 
-CHARTS = {
-    "marlin_ratio": lambda: hbar_chart(
-        "QuantForge speed relative to Marlin (higher is better)",
-        [("1 x 4096 x 4096", 1.30), ("4 x 4096 x 4096", 1.30), ("16 x 4096 x 4096", 1.00),
-         ("1 x 11008 x 4096", 0.94), ("1 x 4096 x 11008", 0.91), ("32 x 4096 x 4096", 0.88),
-         ("16 x 4096 x 11008", 0.86), ("2048 x 4096 x 4096", 0.86), ("512 x 4096 x 4096", 0.85),
-         ("256 x 4096 x 4096", 0.76), ("128 x 4096 x 4096", 0.69), ("64 x 4096 x 4096", 0.67)],
-        1.5, ref=1.0, unit="x", decimals=2, label_w=150,
-        note="M x K x N, group size 128, weights read from DRAM (L2 flushed), device kernel time, RTX 4050 Laptop. "
-             "The line is Marlin (vLLM 0.25.1) on the same INT4 weights."),
-    "kernel_us": lambda: grouped_chart(
-        "Kernel time at small and medium batch (microseconds, lower is better)",
-        ["M=1", "M=16", "M=32", "M=64", "M=128", "M=256"],
-        [("Marlin", [49.4, 50.0, 50.8, 58.6, 104.1, 198.7]), ("QuantForge", [38.0, 50.0, 57.8, 86.9, 150.8, 261.1])],
-        300, unit=" us", decimals=0,
-        note="K = N = 4096, group size 128. Same method as above."),
-    "e2e_speed": lambda: grouped_chart(
-        "Batch-1 decode speed with CUDA graphs (tokens per second, higher is better)",
-        ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
-        [("fp16 (Hugging Face)", [129, 49, 63, 60]), ("QuantForge INT4 + INT8 head", [209, 97, 142, 138])],
-        240, decimals=0,
-        note="RTX 4050 Laptop, 6 GB. Round-to-nearest INT4, group size 128. Qwen2.5-3B and Phi-3.5 do not fit in fp16 on this card."),
-    "gptq_ppl": lambda: grouped_chart(
-        "Wikitext-2 perplexity of the quantised models (lower is better)",
-        ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
-        [("RTN INT4", [24.08, 15.31, 24.42, 21.31]), ("GPTQ INT4", [21.38, 15.00, 23.39, 20.62])],
-        30, decimals=2, markers=[19.93, 13.48, 20.15, 19.32], marker_label="fp16 reference",
-        note="8 x 512 test tokens; GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants."),
+T = {
+    "marlin_ratio": {
+        "en": ("QuantForge speed relative to Marlin (higher is better)",
+               "M x K x N, group size 128, weights read from DRAM (L2 flushed), device kernel time, RTX 4050 Laptop. "
+               "The line is Marlin (vLLM 0.25.1) on the same INT4 weights."),
+        "vi": ("Tốc độ QuantForge so với Marlin (càng cao càng tốt)",
+               "M x K x N, group size 128, weight đọc từ DRAM (đã flush L2), thời gian kernel trên device, RTX 4050 Laptop. "
+               "Đường nét đứt là Marlin (vLLM 0.25.1) trên cùng weight INT4."),
+    },
+    "kernel_us": {
+        "en": ("Kernel time at small and medium batch (microseconds, lower is better)", "K = N = 4096, group size 128. Same method as above."),
+        "vi": ("Thời gian kernel ở batch nhỏ và vừa (micro giây, càng thấp càng tốt)", "K = N = 4096, group size 128. Cùng phương pháp đo như trên."),
+    },
+    "e2e_speed": {
+        "en": ("Batch-1 decode speed with CUDA graphs (tokens per second, higher is better)",
+               "RTX 4050 Laptop, 6 GB. Round-to-nearest INT4, group size 128. Qwen2.5-3B and Phi-3.5 do not fit in fp16 on this card."),
+        "vi": ("Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)",
+               "RTX 4050 Laptop, 6 GB. INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này."),
+    },
+    "gptq_ppl": {
+        "en": ("Wikitext-2 perplexity of the quantised models (lower is better)",
+               "8 x 512 test tokens; GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants."),
+        "vi": ("Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)",
+               "8 x 512 token test; GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể."),
+    },
 }
+LEG = {"en": {"fp16": "fp16 (Hugging Face)", "qf": "QuantForge INT4 + INT8 head", "ref": "fp16 reference", "rtn": "RTN INT4", "gptq": "GPTQ INT4"},
+       "vi": {"fp16": "fp16 (Hugging Face)", "qf": "QuantForge INT4 + head INT8", "ref": "mốc fp16", "rtn": "RTN INT4", "gptq": "GPTQ INT4"}}
+
+
+def chart(name):
+    ttl, note = T[name][LANG]
+    lg = LEG[LANG]
+    if name == "marlin_ratio":
+        return hbar_chart(ttl, [("16 x 4096 x 4096", 1.01), ("1 x 4096 x 4096", 0.99), ("4 x 4096 x 4096", 0.99), ("1 x 11008 x 4096", 0.97), ("32 x 4096 x 4096", 0.87), ("2048 x 4096 x 4096", 0.86), ("1 x 4096 x 11008", 0.85), ("16 x 4096 x 11008", 0.85), ("512 x 4096 x 4096", 0.85), ("256 x 4096 x 4096", 0.76), ("128 x 4096 x 4096", 0.69), ("64 x 4096 x 4096", 0.67)],
+                          1.25, ref=1.0, unit="x", decimals=2, label_w=150, note=note)
+    if name == "kernel_us":
+        return grouped_chart(ttl, ["M=1", "M=16", "M=32", "M=64", "M=128", "M=256"],
+                             [("Marlin", [49.6, 50.0, 50.9, 58.3, 105.1, 201.0]), ("QuantForge", [50.0, 49.8, 58.8, 87.4, 152.2, 263.0])],
+                             300, unit=" us", decimals=0, note=note)
+    if name == "e2e_speed":
+        return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
+                             [(lg["fp16"], [129, 49, 63, 60]), (lg["qf"], [209, 97, 142, 138])], 240, decimals=0, note=note)
+    if name == "gptq_ppl":
+        return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
+                             [(lg["rtn"], [24.08, 15.31, 24.42, 21.31]), (lg["gptq"], [21.38, 15.00, 23.39, 20.62])],
+                             30, decimals=2, markers=[19.93, 13.48, 20.15, 19.32], marker_label=lg["ref"], note=note)
+    raise KeyError(name)
 
 
 # --------------------------------------------------------------------------- pages
@@ -146,23 +174,23 @@ def render(body):
     md = markdown.Markdown(extensions=["tables", "fenced_code", "toc", "attr_list", "sane_lists"],
                            extension_configs={"toc": {"permalink": "#", "toc_depth": "2-3"}})
     out = md.convert(body)
-    out = re.sub(r"<p>\{\{chart:(\w+)\}\}</p>", lambda mo: CHARTS[mo.group(1)](), out)
+    out = re.sub(r"<p>\{\{chart:(\w+)\}\}</p>", lambda mo: chart(mo.group(1)), out)
     return out, md.toc
 
 
 LAYOUT = """<!doctype html>
-<html lang="en">
+<html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <meta name="description" content="{description}">
-<link rel="stylesheet" href="{root}assets/style.css">
+<link rel="stylesheet" href="{assets}assets/style.css">
 </head>
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href="{root}index.html">{site_title}</a>
-  <nav><a href="{root}index.html">Posts</a><a href="{root}about.html">About</a>{gh}</nav>
+  <nav><a href="{home}">{t_posts}</a><a href="{about}">{t_about}</a>{gh}<a class="langsw" href="{other_href}" hreflang="{other_lang}">{other}</a></nav>
 </div></header>
 <main class="wrap">
 {content}
@@ -173,19 +201,28 @@ LAYOUT = """<!doctype html>
 """
 
 
-def page(title, description, content, root=""):
+def page(title, description, content, root="", rel="index.html"):
+    """root: relative path from this page to the site root; rel: this page's path inside its language folder."""
+    ui = UI[LANG]
+    prefix = "" if LANG == "en" else "vi/"
+    other_prefix = "vi/" if LANG == "en" else ""
+    # page folder depth inside the language folder = rel.count("/"); root already includes the language folder level
+    to_site_root = root if LANG == "en" else root + "../"
     gh = f'<a href="{SITE["github_url"]}">GitHub</a>' if SITE.get("github_url") else ""
-    return LAYOUT.format(title=html.escape(title), description=html.escape(description), content=content, root=root,
-                         site_title=html.escape(SITE["title"]), gh=gh, footer=SITE["footer"])
+    S = SITE[LANG]
+    return LAYOUT.format(title=html.escape(title), description=html.escape(description), content=content, root=root, lang=ui["lang"],
+                         site_title=html.escape(S["title"]), assets=to_site_root, gh=gh, footer=S["footer"], home=f"{root}index.html", about=f"{root}about.html",
+                         t_posts=ui["posts"], t_about=ui["about"], other=ui["other"], other_lang=("vi" if LANG == "en" else "en"),
+                         other_href=f"{to_site_root}{other_prefix}{rel}")
 
 
-def main():
-    if OUT.exists():
-        shutil.rmtree(OUT)
-    (OUT / "posts").mkdir(parents=True)
-    shutil.copytree(ROOT / "assets", OUT / "assets")
+def build_language(lang, out_dir, content_dir, root_to_site):
+    global LANG
+    LANG = lang
+    S = SITE[lang]
+    (out_dir / "posts").mkdir(parents=True, exist_ok=True)
     posts = []
-    for path in sorted((ROOT / "content").glob("*.md")):
+    for path in sorted(content_dir.glob("*.md")):
         if path.stem == "about":
             continue
         meta, body = parse(path)
@@ -193,20 +230,33 @@ def main():
         posts.append((int(meta.get("order", 99)), path.stem, meta))
         article = (f'<article class="post"><p class="meta">{html.escape(meta["date"])} &middot; {html.escape(SITE["author"])}</p>'
                    f'<h1>{html.escape(meta["title"])}</h1><p class="lede">{html.escape(meta["summary"])}</p>'
-                   f'<details class="toc"><summary>Contents</summary>{toc}</details>{content}</article>')
-        (OUT / "posts" / f"{path.stem}.html").write_text(page(meta["title"] + " - " + SITE["title"], meta["summary"], article, "../"))
+                   f'<details class="toc"><summary>{UI[lang]["contents"]}</summary>{toc}</details>{content}</article>')
+        (out_dir / "posts" / f"{path.stem}.html").write_text(
+            page(meta["title"] + " - " + S["title"], meta["summary"], article, "../", f"posts/{path.stem}.html"))
     posts.sort()
     items = "".join(
         f'<li><a href="posts/{slug}.html"><span class="pt">{html.escape(m["title"])}</span></a>'
         f'<span class="pd">{html.escape(m["date"])}</span><p>{html.escape(m["summary"])}</p></li>' for _, slug, m in posts)
-    intro, _ = render((ROOT / "content" / "index_intro.txt").read_text()) if (ROOT / "content" / "index_intro.txt").exists() else ("", "")
-    index = f'<section class="intro">{intro}</section><h2 class="sec">Posts</h2><ol class="posts">{items}</ol>'
-    (OUT / "index.html").write_text(page(SITE["title"], SITE["tagline"], index))
-    meta, body = parse(ROOT / "content" / "about.md")
+    intro_path = content_dir / "index_intro.txt"
+    intro, _ = render(intro_path.read_text()) if intro_path.exists() else ("", "")
+    index = f'<section class="intro">{intro}</section><h2 class="sec">{UI[lang]["posts"]}</h2><ol class="posts">{items}</ol>'
+    (out_dir / "index.html").write_text(page(S["title"], S["tagline"], index, "", "index.html"))
+    meta, body = parse(content_dir / "about.md")
     content, _ = render(body)
-    (OUT / "about.html").write_text(page("About - " + SITE["title"], SITE["tagline"], f'<article class="post"><h1>{html.escape(meta["title"])}</h1>{content}</article>'))
+    (out_dir / "about.html").write_text(page(meta["title"] + " - " + S["title"], S["tagline"],
+                                            f'<article class="post"><h1>{html.escape(meta["title"])}</h1>{content}</article>', "", "about.html"))
+    return len(posts)
+
+
+def main():
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    OUT.mkdir(parents=True)
+    shutil.copytree(ROOT / "assets", OUT / "assets")
+    n_en = build_language("en", OUT, ROOT / "content", "")
+    n_vi = build_language("vi", OUT / "vi", ROOT / "content" / "vi", "../")
     (OUT / ".nojekyll").write_text("")
-    print(f"built {len(posts)} posts -> {OUT}")
+    print(f"built {n_en} English + {n_vi} Vietnamese posts -> {OUT}")
 
 
 if __name__ == "__main__":

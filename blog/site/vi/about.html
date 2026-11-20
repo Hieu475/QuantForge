@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Giới thiệu - QuantForge Notes</title>
+<meta name="description" content="Viết compiler cho kernel LLM độ chính xác thấp: cái gì hiệu quả, cái gì không, và các con số.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="index.html">QuantForge Notes</a>
+  <nav><a href="index.html">Bài viết</a><a href="about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../about.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><h1>Giới thiệu</h1><p>Blog này ghi lại <strong>QuantForge</strong>, một compiler kernel mã nguồn mở xây trên MLIR cho suy luận LLM lượng tử hóa weight-only (GEMM W4A16, W8A16 và FP8-weight trên GPU NVIDIA sm_80 trở lên), cùng các thí nghiệm xung quanh nó.</p>
+<h2 id="du-an-gom-nhung-gi">Dự án gồm những gì<a class="headerlink" href="#du-an-gom-nhung-gi" title="Permanent link">#</a></h2>
+<ul>
+<li>Dialect MLIR <code>qf</code> (<code>qf.unpack</code>, <code>qf.dequant</code>) và khoảng hai mươi pass đưa phép nhân ma trận lượng tử hóa xuống PTX: tiling, đưa tile vào shared memory với pipeline <code>cp.async</code>, gộp dequantisation vào lúc load weight, load vector hóa, dequantisation <code>f16x2</code> đóng gói, accumulator giữ trong register, lowering Tensor Core <code>mma.sync</code>, prefetch weight, epilogue gộp.</li>
+<li>Một PyTorch custom op (<code>quantforge::w4a16_gemm</code>) với đường nóng bằng C++ dispatcher, chạy được với <code>torch.compile</code> và CUDA graph.</li>
+<li><code>quantforge.nn</code> / <code>quantforge.gptq</code>: lượng tử hóa bất kỳ causal LM nào của Hugging Face (RTN hoặc GPTQ) hoặc nạp checkpoint AWQ / GPTQ thật.</li>
+<li>37 test FileCheck, khoảng 70 test GPU đầu-cuối, và script <code>compute-sanitizer</code> (memcheck + racecheck) chạy 54 biến thể của pipeline.</li>
+</ul>
+<h2 id="cach-oc-cac-con-so">Cách đọc các con số<a class="headerlink" href="#cach-oc-cac-con-so" title="Permanent link">#</a></h2>
+<p>Mọi số đo đến từ <strong>một GPU laptop</strong> (RTX 4050, sm_89, 6 GB) vừa chạy desktop. Xung nhịp dao động tới 30 phần trăm giữa các phiên, nên tỷ lệ đo trong cùng một lần chạy (ví dụ so với Marlin) đáng tin hơn nhiều so với thời gian tuyệt đối. Chưa có kết quả trên GPU data-center (A100, H100); đây là hạn chế lớn nhất còn mở.</p>
+<h2 id="trang-thai">Trạng thái<a class="headerlink" href="#trang-thai" title="Permanent link">#</a></h2>
+<p>Prototype nghiên cứu. Nó hữu ích cho thí nghiệm và để hiểu compiler làm được và không làm được gì cho loại kernel này; nó không thay thế các engine suy luận production.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

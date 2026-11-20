@@ -10,7 +10,7 @@
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href="../index.html">QuantForge Notes</a>
-  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/04-mid-batch-postmortem.html" hreflang="vi">Tiếng Việt</a></nav>
 </div></header>
 <main class="wrap">
 <article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Why are batches of 32 to 256 slower than Marlin? A post-mortem with a hand-written CUDA prototype</h1><p class="lede">Profiling, ablations and a hand-written Marlin-style kernel to find out what limits the generated kernels at medium batch size. Most hypotheses were wrong, and the negative results are the useful part.</p><details class="toc"><summary>Contents</summary><div class="toc">
@@ -24,7 +24,7 @@
 <li><a href="#what-i-take-from-this">What I take from this</a></li>
 </ul>
 </div>
-</details><p>The kernel table in the <a href="01-overview.html">overview</a> has one ugly region. At batch size 1 to 16 the generated kernels match Marlin; at 512 rows and more they reach 85 percent; but at <strong>32, 64, 128 and 256 rows they are 88, 67, 69 and 76 percent of Marlin</strong>. This regime matters in practice: it is what a server sees with a few concurrent requests or short prompts. This post is the investigation. The conclusion is not "here is the fix"; it is a list of things that are <em>not</em> the problem, with measurements.</p>
+</details><p>The kernel table in the <a href="01-overview.html">overview</a> has one ugly region. At batch size 1 to 16 the generated kernels match Marlin; at 512 rows and more they reach 85 percent; but at <strong>32, 64, 128 and 256 rows they are 87, 67, 69 and 76 percent of Marlin</strong>. This regime matters in practice: it is what a server sees with a few concurrent requests or short prompts. This post is the investigation. The conclusion is not "here is the fix"; it is a list of things that are <em>not</em> the problem, with measurements.</p>
 <table>
 <thead>
 <tr>
@@ -37,33 +37,33 @@
 <tbody>
 <tr>
 <td>32</td>
-<td style="text-align: right;">50.8</td>
-<td style="text-align: right;">57.8</td>
-<td style="text-align: right;">0.88</td>
+<td style="text-align: right;">50.9</td>
+<td style="text-align: right;">58.8</td>
+<td style="text-align: right;">0.87</td>
 </tr>
 <tr>
 <td>64</td>
-<td style="text-align: right;">58.6</td>
-<td style="text-align: right;">86.9</td>
+<td style="text-align: right;">58.3</td>
+<td style="text-align: right;">87.4</td>
 <td style="text-align: right;">0.67</td>
 </tr>
 <tr>
 <td>128</td>
-<td style="text-align: right;">104.1</td>
-<td style="text-align: right;">150.8</td>
+<td style="text-align: right;">105.1</td>
+<td style="text-align: right;">152.2</td>
 <td style="text-align: right;">0.69</td>
 </tr>
 <tr>
 <td>256</td>
-<td style="text-align: right;">198.7</td>
-<td style="text-align: right;">261.1</td>
+<td style="text-align: right;">201.0</td>
+<td style="text-align: right;">263.0</td>
 <td style="text-align: right;">0.76</td>
 </tr>
 </tbody>
 </table>
 <p>(K = N = 4096, group 128, weights from DRAM.) At M = 64 the arithmetic is 2.1 GFLOP, about 47 microseconds at the 45 TFLOP/s cuBLAS reaches on this card; Marlin does it in 59.</p>
 <h2 id="hypothesis-1-the-schedule-is-wrong">Hypothesis 1: the schedule is wrong<a class="headerlink" href="#hypothesis-1-the-schedule-is-wrong" title="Permanent link">#</a></h2>
-<p>For M between 17 and 64 the first version used a 64-row tile intended for prefill. A sweep over block tile M (16, 32, 64, 128), warp tile, K tile, stages and look-ahead (up to about 190 configurations per M) found better ones: for 32 rows a 32-row block tile with a 128-deep K tile (<strong>68.6 to 58.6 microseconds</strong>), for 64 rows a 64-row tile with a 32 x 64 warp tile and one-tile look-ahead (<strong>97 to 87 microseconds</strong>). Both are now the defaults, and the autotuner searches the same space. That moved M = 32 from 0.75x to 0.88x and M = 64 from 0.61x to 0.67x of Marlin. Then the sweeps plateaued: at M = 64, the best eight configurations lie between 87 and 94 microseconds. Tiling is exhausted.</p>
+<p>For M between 17 and 64 the first version used a 64-row tile intended for prefill. A sweep over block tile M (16, 32, 64, 128), warp tile, K tile, stages and look-ahead (up to about 190 configurations per M) found better ones: for 32 rows a 32-row block tile with a 128-deep K tile (<strong>68.6 to 58.6 microseconds</strong>), for 64 rows a 64-row tile with a 32 x 64 warp tile and one-tile look-ahead (<strong>97 to 87 microseconds</strong>). Both are now the defaults, and the autotuner searches the same space. That moved M = 32 from 0.75x to 0.87x and M = 64 from 0.61x to 0.67x of Marlin. Then the sweeps plateaued: at M = 64, the best eight configurations lie between 87 and 94 microseconds. Tiling is exhausted.</p>
 <h2 id="hypothesis-2-not-enough-parallelism">Hypothesis 2: not enough parallelism<a class="headerlink" href="#hypothesis-2-not-enough-parallelism" title="Permanent link">#</a></h2>
 <p>The grid for M = 64 has only 64 blocks on 20 SMs. If starvation were the problem, more blocks should help. They do not: a 64 x 1024 x 16384 problem has exactly the same number of weights as 64 x 4096 x 4096 but four times as many blocks (256 instead of 64, each with a quarter of the K loop), and it takes 110 microseconds against 102. Time follows the work per SM, not the number of idle SMs. Smaller 16-row block tiles (four times the blocks, but four times the weight traffic, since each block re-reads the weights) are 30 percent <em>slower</em>.</p>
 <h2 id="hypothesis-3-dram">Hypothesis 3: DRAM<a class="headerlink" href="#hypothesis-3-dram" title="Permanent link">#</a></h2>
@@ -139,14 +139,14 @@
 <tr>
 <td>32</td>
 <td style="text-align: right;">57.3 us</td>
-<td style="text-align: right;">57.8 us</td>
-<td style="text-align: right;">50.8 us</td>
+<td style="text-align: right;">58.8 us</td>
+<td style="text-align: right;">50.9 us</td>
 </tr>
 <tr>
 <td>64</td>
 <td style="text-align: right;"><strong>75.8 us</strong></td>
-<td style="text-align: right;">86.9 us</td>
-<td style="text-align: right;">58.6 us</td>
+<td style="text-align: right;">87.4 us</td>
+<td style="text-align: right;">58.3 us</td>
 </tr>
 </tbody>
 </table>

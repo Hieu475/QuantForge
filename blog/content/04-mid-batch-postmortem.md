@@ -5,20 +5,20 @@ order: 4
 summary: Profiling, ablations and a hand-written Marlin-style kernel to find out what limits the generated kernels at medium batch size. Most hypotheses were wrong, and the negative results are the useful part.
 ---
 
-The kernel table in the [overview](01-overview.html) has one ugly region. At batch size 1 to 16 the generated kernels match Marlin; at 512 rows and more they reach 85 percent; but at **32, 64, 128 and 256 rows they are 88, 67, 69 and 76 percent of Marlin**. This regime matters in practice: it is what a server sees with a few concurrent requests or short prompts. This post is the investigation. The conclusion is not "here is the fix"; it is a list of things that are *not* the problem, with measurements.
+The kernel table in the [overview](01-overview.html) has one ugly region. At batch size 1 to 16 the generated kernels match Marlin; at 512 rows and more they reach 85 percent; but at **32, 64, 128 and 256 rows they are 87, 67, 69 and 76 percent of Marlin**. This regime matters in practice: it is what a server sees with a few concurrent requests or short prompts. This post is the investigation. The conclusion is not "here is the fix"; it is a list of things that are *not* the problem, with measurements.
 
 | M | Marlin (us) | QuantForge (us) | ratio |
 |---|--:|--:|--:|
-| 32 | 50.8 | 57.8 | 0.88 |
-| 64 | 58.6 | 86.9 | 0.67 |
-| 128 | 104.1 | 150.8 | 0.69 |
-| 256 | 198.7 | 261.1 | 0.76 |
+| 32 | 50.9 | 58.8 | 0.87 |
+| 64 | 58.3 | 87.4 | 0.67 |
+| 128 | 105.1 | 152.2 | 0.69 |
+| 256 | 201.0 | 263.0 | 0.76 |
 
 (K = N = 4096, group 128, weights from DRAM.) At M = 64 the arithmetic is 2.1 GFLOP, about 47 microseconds at the 45 TFLOP/s cuBLAS reaches on this card; Marlin does it in 59.
 
 ## Hypothesis 1: the schedule is wrong
 
-For M between 17 and 64 the first version used a 64-row tile intended for prefill. A sweep over block tile M (16, 32, 64, 128), warp tile, K tile, stages and look-ahead (up to about 190 configurations per M) found better ones: for 32 rows a 32-row block tile with a 128-deep K tile (**68.6 to 58.6 microseconds**), for 64 rows a 64-row tile with a 32 x 64 warp tile and one-tile look-ahead (**97 to 87 microseconds**). Both are now the defaults, and the autotuner searches the same space. That moved M = 32 from 0.75x to 0.88x and M = 64 from 0.61x to 0.67x of Marlin. Then the sweeps plateaued: at M = 64, the best eight configurations lie between 87 and 94 microseconds. Tiling is exhausted.
+For M between 17 and 64 the first version used a 64-row tile intended for prefill. A sweep over block tile M (16, 32, 64, 128), warp tile, K tile, stages and look-ahead (up to about 190 configurations per M) found better ones: for 32 rows a 32-row block tile with a 128-deep K tile (**68.6 to 58.6 microseconds**), for 64 rows a 64-row tile with a 32 x 64 warp tile and one-tile look-ahead (**97 to 87 microseconds**). Both are now the defaults, and the autotuner searches the same space. That moved M = 32 from 0.75x to 0.87x and M = 64 from 0.61x to 0.67x of Marlin. Then the sweeps plateaued: at M = 64, the best eight configurations lie between 87 and 94 microseconds. Tiling is exhausted.
 
 ## Hypothesis 2: not enough parallelism
 
@@ -65,8 +65,8 @@ Sweeping warps per block (2, 4, 8), K slices (1 to 8), A stages (2 to 4) and pre
 
 | M | prototype | generated kernel | Marlin |
 |---|--:|--:|--:|
-| 32 | 57.3 us | 57.8 us | 50.8 us |
-| 64 | **75.8 us** | 86.9 us | 58.6 us |
+| 32 | 57.3 us | 58.8 us | 50.9 us |
+| 64 | **75.8 us** | 87.4 us | 58.3 us |
 
 So **keeping B in registers is worth about 13 percent at M = 64 and nothing at M = 32** in a straightforward implementation, and the prototype is still 28 percent slower than Marlin at M = 64. It uses 254 registers per thread and runs one warp per scheduler, which leaves it latency-bound; closing the rest is occupancy and scheduling tuning of a hand-written kernel (register pressure, two blocks per SM, instruction scheduling), the kind of work that hand-written kernels receive, not something a change to the compiler's memory path would deliver by itself.
 

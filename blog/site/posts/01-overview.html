@@ -10,7 +10,7 @@
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href="../index.html">QuantForge Notes</a>
-  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a></nav>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/01-overview.html" hreflang="vi">Tiếng Việt</a></nav>
 </div></header>
 <main class="wrap">
 <article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge: generating INT4 / INT8 / FP8 GEMM kernels with MLIR</h1><p class="lede">What the project is, how the compiler pipeline is organised, and the full set of results: kernel time against Marlin, end-to-end decode speed on real models, and correctness evidence.</p><details class="toc"><summary>Contents</summary><div class="toc">
@@ -76,7 +76,7 @@
 </tr>
 </tbody>
 </table>
-<p>The result is a single kernel per GEMM. The dequantised f16 weights are never materialised in memory; that is what makes the INT4 kernels 2.5 to 4.8 times faster than a cuBLAS fp16 GEMM at decode.</p>
+<p>The result is a single kernel per GEMM. The dequantised f16 weights are never materialised in memory; that is what makes the INT4 kernels 3.2 to 3.7 times faster than a cuBLAS fp16 GEMM at decode.</p>
 <h3 id="runtime">Runtime<a class="headerlink" href="#runtime" title="Permanent link">#</a></h3>
 <p>The generated PTX is wrapped in a shared library and loaded through a small CUDA driver shim. On top of it:</p>
 <ul>
@@ -113,7 +113,7 @@
 </table>
 <h2 id="results-kernels-against-marlin">Results: kernels against Marlin<a class="headerlink" href="#results-kernels-against-marlin" title="Permanent link">#</a></h2>
 <p>All kernel numbers are <strong>device time from the CUPTI trace</strong>, best of many runs, with the weights read from DRAM: the L2 cache is flushed before every call by <em>reading</em> a 256 MB buffer (writing it leaves dirty lines that slow the next kernel by 20 to 50 percent), and the activations are touched again afterwards because in a real model the previous layer has just written them. Marlin is vLLM 0.25.1's <code>marlin_gemm</code> on the same INT4 values and scales. Group size 128.</p>
-<figure class="viz"><div class="viz-title">QuantForge speed relative to Marlin (higher is better)</div><svg class="chart" viewBox="0 0 760 402" role="img" aria-label="QuantForge speed relative to Marlin (higher is better)"><line class="grid" x1="150.0" y1="12" x2="150.0" y2="380"/><text class="tick" x="150.0" y="396" text-anchor="middle">0x</text><line class="grid" x1="240.0" y1="12" x2="240.0" y2="380"/><text class="tick" x="240.0" y="396" text-anchor="middle">0.25x</text><line class="grid" x1="330.0" y1="12" x2="330.0" y2="380"/><text class="tick" x="330.0" y="396" text-anchor="middle">0.5x</text><line class="grid" x1="420.0" y1="12" x2="420.0" y2="380"/><text class="tick" x="420.0" y="396" text-anchor="middle">0.75x</text><line class="grid" x1="510.0" y1="12" x2="510.0" y2="380"/><text class="tick" x="510.0" y="396" text-anchor="middle">1x</text><line class="grid" x1="600.0" y1="12" x2="600.0" y2="380"/><text class="tick" x="600.0" y="396" text-anchor="middle">1.25x</text><line class="grid" x1="690.0" y1="12" x2="690.0" y2="380"/><text class="tick" x="690.0" y="396" text-anchor="middle">1.5x</text><text class="lab" x="140" y="32.4" text-anchor="end">1 x 4096 x 4096</text><path class="s1" d="M150 18 H614.0 a4 4 0 0 1 4 4 V34 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 4096: 1.30x</title></path><text class="val" x="626.0" y="32.4">1.30x</text><text class="lab" x="140" y="62.4" text-anchor="end">4 x 4096 x 4096</text><path class="s1" d="M150 48 H614.0 a4 4 0 0 1 4 4 V64 a4 4 0 0 1 -4 4 H150 Z"><title>4 x 4096 x 4096: 1.30x</title></path><text class="val" x="626.0" y="62.4">1.30x</text><text class="lab" x="140" y="92.4" text-anchor="end">16 x 4096 x 4096</text><path class="s1" d="M150 78 H506.0 a4 4 0 0 1 4 4 V94 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 4096: 1.00x</title></path><text class="val" x="518.0" y="92.4">1.00x</text><text class="lab" x="140" y="122.4" text-anchor="end">1 x 11008 x 4096</text><path class="s1" d="M150 108 H484.4 a4 4 0 0 1 4 4 V124 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 11008 x 4096: 0.94x</title></path><text class="val" x="496.4" y="122.4">0.94x</text><text class="lab" x="140" y="152.4" text-anchor="end">1 x 4096 x 11008</text><path class="s1" d="M150 138 H473.6 a4 4 0 0 1 4 4 V154 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 11008: 0.91x</title></path><text class="val" x="485.6" y="152.4">0.91x</text><text class="lab" x="140" y="182.4" text-anchor="end">32 x 4096 x 4096</text><path class="s1" d="M150 168 H462.8 a4 4 0 0 1 4 4 V184 a4 4 0 0 1 -4 4 H150 Z"><title>32 x 4096 x 4096: 0.88x</title></path><text class="val" x="474.8" y="182.4">0.88x</text><text class="lab" x="140" y="212.4" text-anchor="end">16 x 4096 x 11008</text><path class="s1" d="M150 198 H455.6 a4 4 0 0 1 4 4 V214 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 11008: 0.86x</title></path><text class="val" x="467.6" y="212.4">0.86x</text><text class="lab" x="140" y="242.4" text-anchor="end">2048 x 4096 x 4096</text><path class="s1" d="M150 228 H455.6 a4 4 0 0 1 4 4 V244 a4 4 0 0 1 -4 4 H150 Z"><title>2048 x 4096 x 4096: 0.86x</title></path><text class="val" x="467.6" y="242.4">0.86x</text><text class="lab" x="140" y="272.4" text-anchor="end">512 x 4096 x 4096</text><path class="s1" d="M150 258 H452.0 a4 4 0 0 1 4 4 V274 a4 4 0 0 1 -4 4 H150 Z"><title>512 x 4096 x 4096: 0.85x</title></path><text class="val" x="464.0" y="272.4">0.85x</text><text class="lab" x="140" y="302.4" text-anchor="end">256 x 4096 x 4096</text><path class="s1" d="M150 288 H419.6 a4 4 0 0 1 4 4 V304 a4 4 0 0 1 -4 4 H150 Z"><title>256 x 4096 x 4096: 0.76x</title></path><text class="val" x="431.6" y="302.4">0.76x</text><text class="lab" x="140" y="332.4" text-anchor="end">128 x 4096 x 4096</text><path class="s1" d="M150 318 H394.4 a4 4 0 0 1 4 4 V334 a4 4 0 0 1 -4 4 H150 Z"><title>128 x 4096 x 4096: 0.69x</title></path><text class="val" x="406.4" y="332.4">0.69x</text><text class="lab" x="140" y="362.4" text-anchor="end">64 x 4096 x 4096</text><path class="s1" d="M150 348 H387.2 a4 4 0 0 1 4 4 V364 a4 4 0 0 1 -4 4 H150 Z"><title>64 x 4096 x 4096: 0.67x</title></path><text class="val" x="399.2" y="362.4">0.67x</text><line class="ref" x1="510.0" y1="10" x2="510.0" y2="380"/><text class="reflab" x="515.0" y="10">Marlin = 1.0</text></svg><figcaption>M x K x N, group size 128, weights read from DRAM (L2 flushed), device kernel time, RTX 4050 Laptop. The line is Marlin (vLLM 0.25.1) on the same INT4 weights.</figcaption></figure>
+<figure class="viz"><div class="viz-title">QuantForge speed relative to Marlin (higher is better)</div><svg class="chart" viewBox="0 0 760 402" role="img" aria-label="QuantForge speed relative to Marlin (higher is better)"><line class="grid" x1="150.0" y1="12" x2="150.0" y2="380"/><text class="tick" x="150.0" y="396" text-anchor="middle">0x</text><line class="grid" x1="258.0" y1="12" x2="258.0" y2="380"/><text class="tick" x="258.0" y="396" text-anchor="middle">0.25x</text><line class="grid" x1="366.0" y1="12" x2="366.0" y2="380"/><text class="tick" x="366.0" y="396" text-anchor="middle">0.5x</text><line class="grid" x1="474.0" y1="12" x2="474.0" y2="380"/><text class="tick" x="474.0" y="396" text-anchor="middle">0.75x</text><line class="grid" x1="582.0" y1="12" x2="582.0" y2="380"/><text class="tick" x="582.0" y="396" text-anchor="middle">1x</text><line class="grid" x1="690.0" y1="12" x2="690.0" y2="380"/><text class="tick" x="690.0" y="396" text-anchor="middle">1.25x</text><text class="lab" x="140" y="32.4" text-anchor="end">16 x 4096 x 4096</text><path class="s1" d="M150 18 H582.3 a4 4 0 0 1 4 4 V34 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 4096: 1.01x</title></path><text class="val" x="594.3" y="32.4">1.01x</text><text class="lab" x="140" y="62.4" text-anchor="end">1 x 4096 x 4096</text><path class="s1" d="M150 48 H573.7 a4 4 0 0 1 4 4 V64 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 4096: 0.99x</title></path><text class="val" x="585.7" y="62.4">0.99x</text><text class="lab" x="140" y="92.4" text-anchor="end">4 x 4096 x 4096</text><path class="s1" d="M150 78 H573.7 a4 4 0 0 1 4 4 V94 a4 4 0 0 1 -4 4 H150 Z"><title>4 x 4096 x 4096: 0.99x</title></path><text class="val" x="585.7" y="92.4">0.99x</text><text class="lab" x="140" y="122.4" text-anchor="end">1 x 11008 x 4096</text><path class="s1" d="M150 108 H565.0 a4 4 0 0 1 4 4 V124 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 11008 x 4096: 0.97x</title></path><text class="val" x="577.0" y="122.4">0.97x</text><text class="lab" x="140" y="152.4" text-anchor="end">32 x 4096 x 4096</text><path class="s1" d="M150 138 H521.8 a4 4 0 0 1 4 4 V154 a4 4 0 0 1 -4 4 H150 Z"><title>32 x 4096 x 4096: 0.87x</title></path><text class="val" x="533.8" y="152.4">0.87x</text><text class="lab" x="140" y="182.4" text-anchor="end">2048 x 4096 x 4096</text><path class="s1" d="M150 168 H517.5 a4 4 0 0 1 4 4 V184 a4 4 0 0 1 -4 4 H150 Z"><title>2048 x 4096 x 4096: 0.86x</title></path><text class="val" x="529.5" y="182.4">0.86x</text><text class="lab" x="140" y="212.4" text-anchor="end">1 x 4096 x 11008</text><path class="s1" d="M150 198 H513.2 a4 4 0 0 1 4 4 V214 a4 4 0 0 1 -4 4 H150 Z"><title>1 x 4096 x 11008: 0.85x</title></path><text class="val" x="525.2" y="212.4">0.85x</text><text class="lab" x="140" y="242.4" text-anchor="end">16 x 4096 x 11008</text><path class="s1" d="M150 228 H513.2 a4 4 0 0 1 4 4 V244 a4 4 0 0 1 -4 4 H150 Z"><title>16 x 4096 x 11008: 0.85x</title></path><text class="val" x="525.2" y="242.4">0.85x</text><text class="lab" x="140" y="272.4" text-anchor="end">512 x 4096 x 4096</text><path class="s1" d="M150 258 H513.2 a4 4 0 0 1 4 4 V274 a4 4 0 0 1 -4 4 H150 Z"><title>512 x 4096 x 4096: 0.85x</title></path><text class="val" x="525.2" y="272.4">0.85x</text><text class="lab" x="140" y="302.4" text-anchor="end">256 x 4096 x 4096</text><path class="s1" d="M150 288 H474.3 a4 4 0 0 1 4 4 V304 a4 4 0 0 1 -4 4 H150 Z"><title>256 x 4096 x 4096: 0.76x</title></path><text class="val" x="486.3" y="302.4">0.76x</text><text class="lab" x="140" y="332.4" text-anchor="end">128 x 4096 x 4096</text><path class="s1" d="M150 318 H444.1 a4 4 0 0 1 4 4 V334 a4 4 0 0 1 -4 4 H150 Z"><title>128 x 4096 x 4096: 0.69x</title></path><text class="val" x="456.1" y="332.4">0.69x</text><text class="lab" x="140" y="362.4" text-anchor="end">64 x 4096 x 4096</text><path class="s1" d="M150 348 H435.4 a4 4 0 0 1 4 4 V364 a4 4 0 0 1 -4 4 H150 Z"><title>64 x 4096 x 4096: 0.67x</title></path><text class="val" x="447.4" y="362.4">0.67x</text><line class="ref" x1="582.0" y1="10" x2="582.0" y2="380"/><text class="reflab" x="587.0" y="10">Marlin = 1.0</text></svg><figcaption>M x K x N, group size 128, weights read from DRAM (L2 flushed), device kernel time, RTX 4050 Laptop. The line is Marlin (vLLM 0.25.1) on the same INT4 weights.</figcaption></figure>
 <table>
 <thead>
 <tr>
@@ -127,110 +127,110 @@
 <tbody>
 <tr>
 <td>1 x 4096 x 4096</td>
-<td style="text-align: right;">49.4</td>
-<td style="text-align: right;">38.0</td>
-<td style="text-align: right;">180.8</td>
-<td style="text-align: right;">1.30x</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">180.9</td>
+<td style="text-align: right;">0.99x</td>
 </tr>
 <tr>
 <td>4 x 4096 x 4096</td>
 <td style="text-align: right;">49.4</td>
-<td style="text-align: right;">38.0</td>
-<td style="text-align: right;">181.7</td>
-<td style="text-align: right;">1.30x</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">181.5</td>
+<td style="text-align: right;">0.99x</td>
 </tr>
 <tr>
 <td>16 x 4096 x 4096</td>
 <td style="text-align: right;">50.0</td>
-<td style="text-align: right;">50.0</td>
-<td style="text-align: right;">183.0</td>
-<td style="text-align: right;">1.00x</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">182.3</td>
+<td style="text-align: right;">1.01x</td>
 </tr>
 <tr>
 <td>1 x 4096 x 11008</td>
-<td style="text-align: right;">126.7</td>
-<td style="text-align: right;">139.2</td>
-<td style="text-align: right;">482.3</td>
-<td style="text-align: right;">0.91x</td>
+<td style="text-align: right;">126.6</td>
+<td style="text-align: right;">149.3</td>
+<td style="text-align: right;">482.9</td>
+<td style="text-align: right;">0.85x</td>
 </tr>
 <tr>
 <td>1 x 11008 x 4096</td>
 <td style="text-align: right;">127.0</td>
-<td style="text-align: right;">135.1</td>
-<td style="text-align: right;">483.3</td>
-<td style="text-align: right;">0.94x</td>
+<td style="text-align: right;">131.0</td>
+<td style="text-align: right;">483.6</td>
+<td style="text-align: right;">0.97x</td>
 </tr>
 <tr>
 <td>16 x 4096 x 11008</td>
-<td style="text-align: right;">127.4</td>
-<td style="text-align: right;">148.9</td>
-<td style="text-align: right;">498.6</td>
-<td style="text-align: right;">0.86x</td>
+<td style="text-align: right;">127.2</td>
+<td style="text-align: right;">149.2</td>
+<td style="text-align: right;">498.5</td>
+<td style="text-align: right;">0.85x</td>
 </tr>
 <tr>
 <td>32 x 4096 x 4096</td>
-<td style="text-align: right;">50.8</td>
-<td style="text-align: right;">57.8</td>
+<td style="text-align: right;">50.9</td>
+<td style="text-align: right;">58.8</td>
 <td style="text-align: right;">181.0</td>
-<td style="text-align: right;">0.88x</td>
+<td style="text-align: right;">0.87x</td>
 </tr>
 <tr>
 <td>32 x 4096 x 11008</td>
-<td style="text-align: right;">129.8</td>
-<td style="text-align: right;">148.8</td>
-<td style="text-align: right;">497.1</td>
+<td style="text-align: right;">130.3</td>
+<td style="text-align: right;">149.3</td>
+<td style="text-align: right;">497.3</td>
 <td style="text-align: right;">0.87x</td>
 </tr>
 <tr>
 <td>64 x 4096 x 4096</td>
-<td style="text-align: right;">58.6</td>
-<td style="text-align: right;">86.9</td>
+<td style="text-align: right;">58.3</td>
+<td style="text-align: right;">87.4</td>
 <td style="text-align: right;">181.4</td>
 <td style="text-align: right;">0.67x</td>
 </tr>
 <tr>
 <td>64 x 4096 x 11008</td>
-<td style="text-align: right;">139.4</td>
-<td style="text-align: right;">197.9</td>
-<td style="text-align: right;">507.0</td>
+<td style="text-align: right;">139.9</td>
+<td style="text-align: right;">200.0</td>
+<td style="text-align: right;">506.9</td>
 <td style="text-align: right;">0.70x</td>
 </tr>
 <tr>
 <td>128 x 4096 x 4096</td>
-<td style="text-align: right;">104.1</td>
-<td style="text-align: right;">150.8</td>
+<td style="text-align: right;">105.1</td>
+<td style="text-align: right;">152.2</td>
 <td style="text-align: right;">188.7</td>
 <td style="text-align: right;">0.69x</td>
 </tr>
 <tr>
 <td>256 x 4096 x 4096</td>
-<td style="text-align: right;">198.7</td>
-<td style="text-align: right;">261.1</td>
-<td style="text-align: right;">207.2</td>
+<td style="text-align: right;">201.0</td>
+<td style="text-align: right;">263.0</td>
+<td style="text-align: right;">208.2</td>
 <td style="text-align: right;">0.76x</td>
 </tr>
 <tr>
 <td>512 x 4096 x 4096</td>
-<td style="text-align: right;">387.9</td>
-<td style="text-align: right;">456.7</td>
-<td style="text-align: right;">371.1</td>
+<td style="text-align: right;">391.5</td>
+<td style="text-align: right;">461.6</td>
+<td style="text-align: right;">373.4</td>
 <td style="text-align: right;">0.85x</td>
 </tr>
 <tr>
 <td>2048 x 4096 x 4096</td>
-<td style="text-align: right;">1514.6</td>
-<td style="text-align: right;">1764.6</td>
-<td style="text-align: right;">1427.1</td>
+<td style="text-align: right;">1532.1</td>
+<td style="text-align: right;">1775.8</td>
+<td style="text-align: right;">1453.0</td>
 <td style="text-align: right;">0.86x</td>
 </tr>
 </tbody>
 </table>
-<figure class="viz"><div class="viz-title">Kernel time at small and medium batch (microseconds, lower is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>Marlin</span><span class="lg"><i class="sw s2"></i>QuantForge</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Kernel time at small and medium batch (microseconds, lower is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">60</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">120</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">180</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">240</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">300</text><path class="s1" d="M75.2 268 V231.2 a4 4 0 0 1 4 -4 H105.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - Marlin: 49 us</title></path><text class="val" x="92.2" y="222.2" text-anchor="middle">49</text><path class="s2" d="M111.2 268 V240.6 a4 4 0 0 1 4 -4 H141.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - QuantForge: 38 us</title></path><text class="val" x="128.2" y="231.6" text-anchor="middle">38</text><text class="lab" x="110.2" y="286" text-anchor="middle">M=1</text><path class="s1" d="M191.5 268 V230.7 a4 4 0 0 1 4 -4 H221.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - Marlin: 50 us</title></path><text class="val" x="208.5" y="221.7" text-anchor="middle">50</text><path class="s2" d="M227.5 268 V230.7 a4 4 0 0 1 4 -4 H257.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - QuantForge: 50 us</title></path><text class="val" x="244.5" y="221.7" text-anchor="middle">50</text><text class="lab" x="226.5" y="286" text-anchor="middle">M=16</text><path class="s1" d="M307.8 268 V230.0 a4 4 0 0 1 4 -4 H337.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - Marlin: 51 us</title></path><text class="val" x="324.8" y="221.0" text-anchor="middle">51</text><path class="s2" d="M343.8 268 V224.2 a4 4 0 0 1 4 -4 H373.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - QuantForge: 58 us</title></path><text class="val" x="360.8" y="215.2" text-anchor="middle">58</text><text class="lab" x="342.8" y="286" text-anchor="middle">M=32</text><path class="s1" d="M424.2 268 V223.6 a4 4 0 0 1 4 -4 H454.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - Marlin: 59 us</title></path><text class="val" x="441.2" y="214.6" text-anchor="middle">59</text><path class="s2" d="M460.2 268 V200.2 a4 4 0 0 1 4 -4 H490.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - QuantForge: 87 us</title></path><text class="val" x="477.2" y="191.2" text-anchor="middle">87</text><text class="lab" x="459.2" y="286" text-anchor="middle">M=64</text><path class="s1" d="M540.5 268 V185.9 a4 4 0 0 1 4 -4 H570.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - Marlin: 104 us</title></path><text class="val" x="557.5" y="176.9" text-anchor="middle">104</text><path class="s2" d="M576.5 268 V147.3 a4 4 0 0 1 4 -4 H606.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - QuantForge: 151 us</title></path><text class="val" x="593.5" y="138.3" text-anchor="middle">151</text><text class="lab" x="575.5" y="286" text-anchor="middle">M=128</text><path class="s1" d="M656.8 268 V107.7 a4 4 0 0 1 4 -4 H686.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - Marlin: 199 us</title></path><text class="val" x="673.8" y="98.7" text-anchor="middle">199</text><path class="s2" d="M692.8 268 V56.2 a4 4 0 0 1 4 -4 H722.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - QuantForge: 261 us</title></path><text class="val" x="709.8" y="47.2" text-anchor="middle">261</text><text class="lab" x="691.8" y="286" text-anchor="middle">M=256</text></svg><figcaption>K = N = 4096, group size 128. Same method as above.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>Marlin</th><th>QuantForge</th></tr></thead><tbody><tr><th>M=1</th><td>49</td><td>38</td></tr><tr><th>M=16</th><td>50</td><td>50</td></tr><tr><th>M=32</th><td>51</td><td>58</td></tr><tr><th>M=64</th><td>59</td><td>87</td></tr><tr><th>M=128</th><td>104</td><td>151</td></tr><tr><th>M=256</th><td>199</td><td>261</td></tr></tbody></table></details></figure>
+<figure class="viz"><div class="viz-title">Kernel time at small and medium batch (microseconds, lower is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>Marlin</span><span class="lg"><i class="sw s2"></i>QuantForge</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Kernel time at small and medium batch (microseconds, lower is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">60</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">120</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">180</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">240</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">300</text><path class="s1" d="M75.2 268 V231.0 a4 4 0 0 1 4 -4 H105.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - Marlin: 50 us</title></path><text class="val" x="92.2" y="222.0" text-anchor="middle">50</text><path class="s2" d="M111.2 268 V230.7 a4 4 0 0 1 4 -4 H141.2 a4 4 0 0 1 4 4 V268 Z"><title>M=1 - QuantForge: 50 us</title></path><text class="val" x="128.2" y="221.7" text-anchor="middle">50</text><text class="lab" x="110.2" y="286" text-anchor="middle">M=1</text><path class="s1" d="M191.5 268 V230.7 a4 4 0 0 1 4 -4 H221.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - Marlin: 50 us</title></path><text class="val" x="208.5" y="221.7" text-anchor="middle">50</text><path class="s2" d="M227.5 268 V230.8 a4 4 0 0 1 4 -4 H257.5 a4 4 0 0 1 4 4 V268 Z"><title>M=16 - QuantForge: 50 us</title></path><text class="val" x="244.5" y="221.8" text-anchor="middle">50</text><text class="lab" x="226.5" y="286" text-anchor="middle">M=16</text><path class="s1" d="M307.8 268 V229.9 a4 4 0 0 1 4 -4 H337.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - Marlin: 51 us</title></path><text class="val" x="324.8" y="220.9" text-anchor="middle">51</text><path class="s2" d="M343.8 268 V223.4 a4 4 0 0 1 4 -4 H373.8 a4 4 0 0 1 4 4 V268 Z"><title>M=32 - QuantForge: 59 us</title></path><text class="val" x="360.8" y="214.4" text-anchor="middle">59</text><text class="lab" x="342.8" y="286" text-anchor="middle">M=32</text><path class="s1" d="M424.2 268 V223.8 a4 4 0 0 1 4 -4 H454.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - Marlin: 58 us</title></path><text class="val" x="441.2" y="214.8" text-anchor="middle">58</text><path class="s2" d="M460.2 268 V199.7 a4 4 0 0 1 4 -4 H490.2 a4 4 0 0 1 4 4 V268 Z"><title>M=64 - QuantForge: 87 us</title></path><text class="val" x="477.2" y="190.7" text-anchor="middle">87</text><text class="lab" x="459.2" y="286" text-anchor="middle">M=64</text><path class="s1" d="M540.5 268 V185.1 a4 4 0 0 1 4 -4 H570.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - Marlin: 105 us</title></path><text class="val" x="557.5" y="176.1" text-anchor="middle">105</text><path class="s2" d="M576.5 268 V146.2 a4 4 0 0 1 4 -4 H606.5 a4 4 0 0 1 4 4 V268 Z"><title>M=128 - QuantForge: 152 us</title></path><text class="val" x="593.5" y="137.2" text-anchor="middle">152</text><text class="lab" x="575.5" y="286" text-anchor="middle">M=128</text><path class="s1" d="M656.8 268 V105.8 a4 4 0 0 1 4 -4 H686.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - Marlin: 201 us</title></path><text class="val" x="673.8" y="96.8" text-anchor="middle">201</text><path class="s2" d="M692.8 268 V54.6 a4 4 0 0 1 4 -4 H722.8 a4 4 0 0 1 4 4 V268 Z"><title>M=256 - QuantForge: 263 us</title></path><text class="val" x="709.8" y="45.6" text-anchor="middle">263</text><text class="lab" x="691.8" y="286" text-anchor="middle">M=256</text></svg><figcaption>K = N = 4096, group size 128. Same method as above.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>Marlin</th><th>QuantForge</th></tr></thead><tbody><tr><th>M=1</th><td>50</td><td>50</td></tr><tr><th>M=16</th><td>50</td><td>50</td></tr><tr><th>M=32</th><td>51</td><td>59</td></tr><tr><th>M=64</th><td>58</td><td>87</td></tr><tr><th>M=128</th><td>105</td><td>152</td></tr><tr><th>M=256</th><td>201</td><td>263</td></tr></tbody></table></details></figure>
 <p>What the table says:</p>
 <ul>
-<li><strong>Decode (M up to 16)</strong>: at 4096 x 4096 the generated kernel is at or above Marlin (the 1.30x implies more than the measured DRAM read ceiling, so part of it is probably L2 residency that the flush did not remove; the wide shapes are the cleaner comparison, see <a href="02-decode-instruction-bound.html">the decode post</a>); for the wide 4096 x 11008 shapes it reaches 86 to 94 percent. The weights stream from DRAM at 150 to 175 GB/s on a card whose measured read ceiling is about 183 GB/s.</li>
+<li><strong>Decode (M up to 16)</strong>: at 4096 x 4096 the generated kernel is <strong>on par with Marlin</strong> (0.99 to 1.01x, about 50 microseconds, which is the DRAM limit: <code>ncu</code> measures 9.2 MB read for 8.65 MB of weights and scales, about 184 GB/s); on the wide 4096 x 11008 shapes it reaches 85 percent, on 1 x 11008 x 4096 97 percent. (An earlier version of this post reported 1.30x at 4096 x 4096; that figure did not survive re-measurement, see <a href="02-decode-instruction-bound.html">the decode post</a>.)</li>
 <li><strong>Prefill (M of 512 and more)</strong>: 85 to 86 percent of Marlin, about 20 to 25 percent slower than cuBLAS fp16, which reads four times the bytes but has no dequantisation to do: the kernel is compute-bound there and the dequantisation competes with the Tensor Cores for issue slots.</li>
-<li><strong>M between 32 and 256</strong> is the weak spot, 12 to 33 percent behind. <a href="04-mid-batch-postmortem.html">A separate post</a> investigates it in detail.</li>
+<li><strong>M between 32 and 256</strong> is the weak spot, 13 to 33 percent behind. <a href="04-mid-batch-postmortem.html">A separate post</a> investigates it in detail.</li>
 </ul>
 <h2 id="results-whole-models">Results: whole models<a class="headerlink" href="#results-whole-models" title="Permanent link">#</a></h2>
 <p>The kernels are only useful if a real model runs correctly and faster. <code>quantforge.nn.quantize_model</code> replaces the <code>nn.Linear</code> layers of any Hugging Face causal LM, fuses the q/k/v projections into one GEMM and the gate/up projections of a SiLU-gated MLP into one GEMM with a fused <code>silu(gate) * up</code> epilogue. The table is batch-1 decode with a CUDA graph, perplexity on 8 x 512 tokens of the Wikitext-2 test split, simple round-to-nearest INT4 (group 128) with an INT8 head.</p>
