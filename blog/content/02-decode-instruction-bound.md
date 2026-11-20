@@ -66,7 +66,25 @@ The ranking is informative. **Vectorised loads are the big one**: without 16-byt
 
 ## Step 5: wave quantisation on the wide shapes
 
-The wide shapes behave differently. During development a sweep of the grid size against the achieved bandwidth showed about 183 GB/s while the grid fits in the resident blocks of the GPU (80 blocks of 128 columns at K tile 128 on this card), and about 151 GB/s as soon as a partial second wave exists: a 4096 x 11008 layer has 86 column blocks for 80 slots. A smaller K tile (64 instead of 128, which lowers the shared memory per block) with the one-tile look-ahead recovers part of the loss. These are development-time measurements; the cold results on the wide shapes today are in the overview: 0.85 of Marlin for 1 x 4096 x 11008 and 0.97 for 1 x 11008 x 4096.
+The wide shapes behave differently. During development a sweep of the grid size against the achieved bandwidth showed about 183 GB/s while the grid fits in the resident blocks of the GPU (80 blocks of 128 columns at K tile 128 on this card), and about 151 GB/s as soon as a partial second wave exists: a 4096 x 11008 layer has 86 column blocks for 80 slots. A smaller K tile (64 instead of 128, which lowers the shared memory per block) with the one-tile look-ahead recovers part of the loss. These are development-time measurements; the cold results on the wide shapes are in the overview: 0.93 of Marlin for 1 x 4096 x 11008 after the follow-up below, and 0.97 for 1 x 11008 x 4096.
+
+### A follow-up: a K tile that follows the wave count (1 x 4096 x 11008: 150 to 135 microseconds)
+
+The wide shape was the one place where the decode kernel lost clearly (0.85 of Marlin, and 8 percent behind gemlite). A sweep of the output width N at K = 4096 with the two K tiles that matter showed why (cold L2, microseconds, `block-tile-n=128`, one-tile look-ahead):
+
+| N | column blocks | K tile 32 | K tile 128 |
+|--:|--:|--:|--:|
+| 9216 | 72 | 114 | 115 |
+| 10240 | 80 | **124** | 137 |
+| 10752 | 84 | **132** | 148 |
+| 11008 | 86 | **136** | 150 |
+| 11520 | 90 | 161 | 165 |
+| 12288 | 96 | **153** | 174 |
+| 13312 | 104 | 207 | **166** |
+| 14336 | 112 | 211 | **176** |
+| 16384 | 128 | 228 | **219** |
+
+With 128-deep K tiles the card holds 80 blocks at a time (4 per SM): 81 to 96 column blocks are just over one wave and the stragglers run alone. A 32-deep tile needs less shared memory per block, so all the blocks are resident and the layer runs in one wave, 8 to 12 percent faster. From about 104 blocks the second wave exists either way and the deeper tile's better efficiency wins again. The default schedule now uses the 32-deep tile for N between 10240 and 12288 (Llama-7B's 11008-wide MLP is the obvious case), the autotuner got the candidate, and the result is **1 x 4096 x 11008: 150 to 135.7 microseconds (0.93 of Marlin, 5 percent behind gemlite), 16 x 4096 x 11008: 149 to 135.5 (0.94)**. It is a rule fitted to this GPU's SM count and shared-memory size: on another card the window moves, which is what the autotuner is for.
 
 ## What to take from this
 

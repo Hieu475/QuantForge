@@ -20,7 +20,10 @@
 <li><a href="#step-2-the-scale-loads-that-were-loaded-eight-times-and-the-pass-that-stopped-matching">Step 2: the scale loads that were loaded eight times, and the pass that stopped matching</a></li>
 <li><a href="#step-3-dequantisation-in-two-instructions-per-two-weights">Step 3: dequantisation in two instructions per two weights</a></li>
 <li><a href="#step-4-an-ablation-measured-today-cold-l2-1-x-4096-x-4096">Step 4: an ablation, measured today (cold L2, 1 x 4096 x 4096)</a></li>
-<li><a href="#step-5-wave-quantisation-on-the-wide-shapes">Step 5: wave quantisation on the wide shapes</a></li>
+<li><a href="#step-5-wave-quantisation-on-the-wide-shapes">Step 5: wave quantisation on the wide shapes</a><ul>
+<li><a href="#a-follow-up-a-k-tile-that-follows-the-wave-count-1-x-4096-x-11008-150-to-135-microseconds">A follow-up: a K tile that follows the wave count (1 x 4096 x 11008: 150 to 135 microseconds)</a></li>
+</ul>
+</li>
 <li><a href="#what-to-take-from-this">What to take from this</a></li>
 </ul>
 </div>
@@ -101,7 +104,76 @@ weight  = diff * scale            // mul.f16x2: the only rounding
 <p>With the weights already in L2 (no flush) the full kernel takes 49 microseconds: at this size it is latency-bound (few warps, each with a long dependent chain), not bandwidth-bound, which is why cold and warm timings are so close.</p>
 <p>The ranking is informative. <strong>Vectorised loads are the big one</strong>: without 16-byte loads the kernel issues three times more load instructions and runs three times slower. The packed dequantisation and the one-tile look-ahead are each worth 16 to 22 percent. Passes that did <em>not</em> help at all in this regime: a second shared-memory stage for decode, sinking the dequantisation stores, look-ahead of two tiles or more (the loads are already early enough), and split-K.</p>
 <h2 id="step-5-wave-quantisation-on-the-wide-shapes">Step 5: wave quantisation on the wide shapes<a class="headerlink" href="#step-5-wave-quantisation-on-the-wide-shapes" title="Permanent link">#</a></h2>
-<p>The wide shapes behave differently. During development a sweep of the grid size against the achieved bandwidth showed about 183 GB/s while the grid fits in the resident blocks of the GPU (80 blocks of 128 columns at K tile 128 on this card), and about 151 GB/s as soon as a partial second wave exists: a 4096 x 11008 layer has 86 column blocks for 80 slots. A smaller K tile (64 instead of 128, which lowers the shared memory per block) with the one-tile look-ahead recovers part of the loss. These are development-time measurements; the cold results on the wide shapes today are in the overview: 0.85 of Marlin for 1 x 4096 x 11008 and 0.97 for 1 x 11008 x 4096.</p>
+<p>The wide shapes behave differently. During development a sweep of the grid size against the achieved bandwidth showed about 183 GB/s while the grid fits in the resident blocks of the GPU (80 blocks of 128 columns at K tile 128 on this card), and about 151 GB/s as soon as a partial second wave exists: a 4096 x 11008 layer has 86 column blocks for 80 slots. A smaller K tile (64 instead of 128, which lowers the shared memory per block) with the one-tile look-ahead recovers part of the loss. These are development-time measurements; the cold results on the wide shapes are in the overview: 0.93 of Marlin for 1 x 4096 x 11008 after the follow-up below, and 0.97 for 1 x 11008 x 4096.</p>
+<h3 id="a-follow-up-a-k-tile-that-follows-the-wave-count-1-x-4096-x-11008-150-to-135-microseconds">A follow-up: a K tile that follows the wave count (1 x 4096 x 11008: 150 to 135 microseconds)<a class="headerlink" href="#a-follow-up-a-k-tile-that-follows-the-wave-count-1-x-4096-x-11008-150-to-135-microseconds" title="Permanent link">#</a></h3>
+<p>The wide shape was the one place where the decode kernel lost clearly (0.85 of Marlin, and 8 percent behind gemlite). A sweep of the output width N at K = 4096 with the two K tiles that matter showed why (cold L2, microseconds, <code>block-tile-n=128</code>, one-tile look-ahead):</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">N</th>
+<th style="text-align: right;">column blocks</th>
+<th style="text-align: right;">K tile 32</th>
+<th style="text-align: right;">K tile 128</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">9216</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">115</td>
+</tr>
+<tr>
+<td style="text-align: right;">10240</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;"><strong>124</strong></td>
+<td style="text-align: right;">137</td>
+</tr>
+<tr>
+<td style="text-align: right;">10752</td>
+<td style="text-align: right;">84</td>
+<td style="text-align: right;"><strong>132</strong></td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr>
+<td style="text-align: right;">11008</td>
+<td style="text-align: right;">86</td>
+<td style="text-align: right;"><strong>136</strong></td>
+<td style="text-align: right;">150</td>
+</tr>
+<tr>
+<td style="text-align: right;">11520</td>
+<td style="text-align: right;">90</td>
+<td style="text-align: right;">161</td>
+<td style="text-align: right;">165</td>
+</tr>
+<tr>
+<td style="text-align: right;">12288</td>
+<td style="text-align: right;">96</td>
+<td style="text-align: right;"><strong>153</strong></td>
+<td style="text-align: right;">174</td>
+</tr>
+<tr>
+<td style="text-align: right;">13312</td>
+<td style="text-align: right;">104</td>
+<td style="text-align: right;">207</td>
+<td style="text-align: right;"><strong>166</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">14336</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">211</td>
+<td style="text-align: right;"><strong>176</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">228</td>
+<td style="text-align: right;"><strong>219</strong></td>
+</tr>
+</tbody>
+</table>
+<p>With 128-deep K tiles the card holds 80 blocks at a time (4 per SM): 81 to 96 column blocks are just over one wave and the stragglers run alone. A 32-deep tile needs less shared memory per block, so all the blocks are resident and the layer runs in one wave, 8 to 12 percent faster. From about 104 blocks the second wave exists either way and the deeper tile's better efficiency wins again. The default schedule now uses the 32-deep tile for N between 10240 and 12288 (Llama-7B's 11008-wide MLP is the obvious case), the autotuner got the candidate, and the result is <strong>1 x 4096 x 11008: 150 to 135.7 microseconds (0.93 of Marlin, 5 percent behind gemlite), 16 x 4096 x 11008: 149 to 135.5 (0.94)</strong>. It is a rule fitted to this GPU's SM count and shared-memory size: on another card the window moves, which is what the autotuner is for.</p>
 <h2 id="what-to-take-from-this">What to take from this<a class="headerlink" href="#what-to-take-from-this" title="Permanent link">#</a></h2>
 <ol>
 <li>At the DRAM limit a tie with a hand-written kernel is the right result, and a claim of beating it by 30 percent on a memory-bound kernel should be checked with <code>dram__bytes_read</code> before it is believed.</li>

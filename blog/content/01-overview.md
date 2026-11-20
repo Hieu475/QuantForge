@@ -71,9 +71,9 @@ All kernel numbers are **device time from the CUPTI trace**, best of many runs, 
 | 1 x 4096 x 4096 | 49.6 | 50.0 | 180.9 | 0.99x |
 | 4 x 4096 x 4096 | 49.4 | 49.8 | 181.5 | 0.99x |
 | 16 x 4096 x 4096 | 50.0 | 49.8 | 182.3 | 1.01x |
-| 1 x 4096 x 11008 | 126.6 | 149.3 | 482.9 | 0.85x |
-| 1 x 11008 x 4096 | 127.0 | 131.0 | 483.6 | 0.97x |
-| 16 x 4096 x 11008 | 127.2 | 149.2 | 498.5 | 0.85x |
+| 1 x 4096 x 11008 | 126.8 | 135.7 | 482.4 | 0.93x |
+| 1 x 11008 x 4096 | 127.2 | 131.1 | 484.0 | 0.97x |
+| 16 x 4096 x 11008 | 127.7 | 135.5 | 499.9 | 0.94x |
 | 32 x 4096 x 4096 | 50.9 | 58.8 | 181.0 | 0.87x |
 | 32 x 4096 x 11008 | 130.3 | 149.3 | 497.3 | 0.87x |
 | 64 x 4096 x 4096 | 58.3 | 87.4 | 181.4 | 0.67x |
@@ -87,7 +87,7 @@ All kernel numbers are **device time from the CUPTI trace**, best of many runs, 
 
 What the table says:
 
-* **Decode (M up to 16)**: at 4096 x 4096 the generated kernel is **on par with Marlin** (0.99 to 1.01x, about 50 microseconds, which is the DRAM limit: `ncu` measures 9.2 MB read for 8.65 MB of weights and scales, about 184 GB/s); on the wide 4096 x 11008 shapes it reaches 85 percent, on 1 x 11008 x 4096 97 percent. (An earlier version of this post reported 1.30x at 4096 x 4096; that figure did not survive re-measurement, see [the decode post](02-decode-instruction-bound.html).)
+* **Decode (M up to 16)**: at 4096 x 4096 the generated kernel is **on par with Marlin** (0.99 to 1.01x, about 50 microseconds, which is the DRAM limit: `ncu` measures 9.2 MB read for 8.65 MB of weights and scales, about 184 GB/s); on the wide 4096 x 11008 shapes it reaches 93 to 94 percent (it was 85 percent until a wave-aware K tile was added, see [the decode post](02-decode-instruction-bound.html)), on 1 x 11008 x 4096 97 percent. (An earlier version of this post reported 1.30x at 4096 x 4096; that figure did not survive re-measurement, see [the decode post](02-decode-instruction-bound.html).)
 * **Prefill (M of 512 and more)**: 85 to 86 percent of Marlin, about 20 to 25 percent slower than cuBLAS fp16, which reads four times the bytes but has no dequantisation to do: the kernel is compute-bound there and the dequantisation competes with the Tensor Cores for issue slots.
 * **M between 32 and 256** is the weak spot, 13 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail.
 
@@ -97,22 +97,22 @@ Is Marlin the only fair yardstick? The same method (L2 flushed, device time, int
 
 | M x K x N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
 |---|--:|--:|--:|--:|--:|
-| 1 x 4096 x 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
-| 4 x 4096 x 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
-| 16 x 4096 x 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
-| 32 x 4096 x 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
-| 64 x 4096 x 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
-| 128 x 4096 x 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
-| 256 x 4096 x 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
-| 512 x 4096 x 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
-| 2048 x 4096 x 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
-| 1 x 4096 x 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 x 4096 x 4096 | 50.0 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 x 4096 x 4096 | 49.8 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 x 4096 x 4096 | **49.8** | 50.0 | 61.4 | 156.8 | 182.6 |
+| 32 x 4096 x 4096 | 58.8 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 x 4096 x 4096 | 87.4 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 x 4096 x 4096 | 152.2 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 x 4096 x 4096 | 263.0 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 x 4096 x 4096 | 461.6 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 x 4096 x 4096 | 1775.8 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 x 4096 x 11008 | 135.7 | **126.8** | 129.3 | 139.6 | 482.4 |
 | 1 x 11008 x 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
 
 Reading it:
 
 * **QuantForge is on par with gemlite at batch 1** (49.9 against 49.3 microseconds) and **clearly ahead from batch 4 up**: gemlite needs 100 microseconds at M = 4 and 61 at M = 16, where QuantForge needs 50. Its prefill kernel is about 15 percent slower than QuantForge's.
-* gemlite is **faster on the wide decode shape** 1 x 4096 x 11008 (129 against 150 microseconds): the weak point of QuantForge's decode kernel is the grid / wave behaviour on wide layers, not the 4096 x 4096 case.
+* gemlite is still **5 percent faster on the wide decode shape** 1 x 4096 x 11008 (129 against 136 microseconds, after the improvement; it was 150): the weak point of QuantForge's decode kernel is the grid / wave behaviour on wide layers, not the 4096 x 4096 case.
 * Marlin is the fastest kernel from M = 32 up, as before; bitsandbytes' NF4 path is slower everywhere except the wide decode shapes, where it is within 8 to 15 percent.
 * All three INT4 kernels hit the same ~50 microsecond DRAM limit at 4096 x 4096 batch 1, which is the correct outcome for a memory-bound kernel.
 
@@ -133,6 +133,19 @@ The kernels are only useful if a real model runs correctly and faster. `quantfor
 | Mistral-7B-Instruct-v0.3 (from an NF4 checkpoint) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | 4.65 GB peak |
 
 A 3B and a 7B model run on a 6 GB card that cannot even hold them in fp16. The perplexity cost of round-to-nearest 4-bit is real (1 to 4 points); [the GPTQ post](05-gptq-and-checkpoints.html) shows how much of it a smarter quantiser recovers. The speed-up shrinks as the model grows because the lm_head, attention and the roughly 1400 small kernels of the Hugging Face graph take a larger share of each step.
+
+### Run-to-run spread
+
+The single numbers above are the best of their session, so here is how much they move. Batch-1 decode with a CUDA graph, 7 repetitions with fp16 and INT4 (plus an INT8 head) interleaved so that clock drift hits both equally, mean and standard deviation of one session:
+
+| model | fp16 (tokens/s) | INT4 + INT8 head (tokens/s) | speed-up |
+|---|--:|--:|--:|
+| Qwen2.5-0.5B | 120.2 +- 0.6 | 197.1 +- 1.6 | 1.64x +- 0.02 |
+| Qwen2.5-1.5B | 47.9 +- 2.1 | 91.3 +- 5.4 | 1.91x +- 0.07 |
+| Llama-3.2-1B | 62.5 +- 3.3 | 132.0 +- 7.3 | 2.11x +- 0.12 |
+| OLMo-2-1B | 57.2 +- 2.6 | 128.9 +- 7.7 | 2.26x +- 0.16 |
+
+Absolute speeds move by 5 to 10 percent inside a session and by up to 15 percent between sessions (the GPU also drives a desktop), so the table further up, whose numbers come from the faster sessions, should be read as "about 200" and not "209". The **speed-up** against fp16 is far more stable (a few percent). The kernel times against Marlin were repeated in 5 independent invocations: 1 x 4096 x 4096 gives a ratio of 0.990 +- 0.000 (Marlin 49.7 +- 0.1 microseconds, QuantForge 50.2 +- 0.1), 1 x 4096 x 11008 gives 0.930 +- 0.000, 64 x 4096 x 4096 gives 0.676 +- 0.005 and 2048 x 4096 x 4096 gives 0.842 +- 0.011; only the long prefill kernels drift (about 1.5 percent, with the GPU temperature, both kernels together). The ratios in the kernel table are therefore reproducible to the digits shown.
 
 ### End to end against vLLM
 

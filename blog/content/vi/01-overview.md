@@ -71,9 +71,9 @@ Mọi số kernel là **thời gian device từ trace CUPTI**, tốt nhất củ
 | 1 x 4096 x 4096 | 49.6 | 50.0 | 180.9 | 0.99x |
 | 4 x 4096 x 4096 | 49.4 | 49.8 | 181.5 | 0.99x |
 | 16 x 4096 x 4096 | 50.0 | 49.8 | 182.3 | 1.01x |
-| 1 x 4096 x 11008 | 126.6 | 149.3 | 482.9 | 0.85x |
-| 1 x 11008 x 4096 | 127.0 | 131.0 | 483.6 | 0.97x |
-| 16 x 4096 x 11008 | 127.2 | 149.2 | 498.5 | 0.85x |
+| 1 x 4096 x 11008 | 126.8 | 135.7 | 482.4 | 0.93x |
+| 1 x 11008 x 4096 | 127.2 | 131.1 | 484.0 | 0.97x |
+| 16 x 4096 x 11008 | 127.7 | 135.5 | 499.9 | 0.94x |
 | 32 x 4096 x 4096 | 50.9 | 58.8 | 181.0 | 0.87x |
 | 32 x 4096 x 11008 | 130.3 | 149.3 | 497.3 | 0.87x |
 | 64 x 4096 x 4096 | 58.3 | 87.4 | 181.4 | 0.67x |
@@ -87,7 +87,7 @@ Mọi số kernel là **thời gian device từ trace CUPTI**, tốt nhất củ
 
 Bảng nói lên điều gì:
 
-* **Decode (M tới 16)**: ở 4096 x 4096 kernel sinh ra **ngang Marlin** (0.99 đến 1.01x, khoảng 50 micro giây, đúng là giới hạn DRAM: `ncu` đo được 9.2 MB đọc cho 8.65 MB weight và scale, khoảng 184 GB/s); với shape rộng 4096 x 11008 đạt 85 phần trăm, với 1 x 11008 x 4096 đạt 97 phần trăm. (Phiên bản đầu của bài này báo 1.30x ở 4096 x 4096; con số đó không qua được lần đo lại, xem [bài về decode](02-decode-instruction-bound.html).)
+* **Decode (M tới 16)**: ở 4096 x 4096 kernel sinh ra **ngang Marlin** (0.99 đến 1.01x, khoảng 50 micro giây, đúng là giới hạn DRAM: `ncu` đo được 9.2 MB đọc cho 8.65 MB weight và scale, khoảng 184 GB/s); với shape rộng 4096 x 11008 đạt 93 đến 94 phần trăm (trước đây là 85 phần trăm, cho đến khi thêm K tile nhận biết wave, xem [bài về decode](02-decode-instruction-bound.html)), với 1 x 11008 x 4096 đạt 97 phần trăm. (Phiên bản đầu của bài này báo 1.30x ở 4096 x 4096; con số đó không qua được lần đo lại, xem [bài về decode](02-decode-instruction-bound.html).)
 * **Prefill (M từ 512 trở lên)**: 85 đến 86 phần trăm của Marlin, chậm hơn cuBLAS fp16 khoảng 20 đến 25 phần trăm, trong khi cuBLAS đọc nhiều gấp bốn lần byte nhưng không phải dequantise: ở đây kernel bị giới hạn bởi tính toán và dequantisation tranh slot issue với Tensor Core.
 * **M từ 32 đến 256** là điểm yếu, chậm hơn 13 đến 33 phần trăm. [Một bài riêng](04-mid-batch-postmortem.html) điều tra chi tiết.
 
@@ -97,22 +97,22 @@ Marlin có phải là thước đo công bằng duy nhất? Cùng phương pháp
 
 | M x K x N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
 |---|--:|--:|--:|--:|--:|
-| 1 x 4096 x 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
-| 4 x 4096 x 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
-| 16 x 4096 x 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
-| 32 x 4096 x 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
-| 64 x 4096 x 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
-| 128 x 4096 x 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
-| 256 x 4096 x 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
-| 512 x 4096 x 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
-| 2048 x 4096 x 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
-| 1 x 4096 x 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 x 4096 x 4096 | 50.0 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 x 4096 x 4096 | 49.8 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 x 4096 x 4096 | **49.8** | 50.0 | 61.4 | 156.8 | 182.6 |
+| 32 x 4096 x 4096 | 58.8 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 x 4096 x 4096 | 87.4 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 x 4096 x 4096 | 152.2 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 x 4096 x 4096 | 263.0 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 x 4096 x 4096 | 461.6 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 x 4096 x 4096 | 1775.8 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 x 4096 x 11008 | 135.7 | **126.8** | 129.3 | 139.6 | 482.4 |
 | 1 x 11008 x 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
 
 Đọc bảng:
 
 * **QuantForge ngang gemlite ở batch 1** (49.9 so với 49.3 micro giây) và **hơn rõ rệt từ batch 4 trở lên**: gemlite cần 100 micro giây ở M = 4 và 61 ở M = 16, trong khi QuantForge cần 50. Kernel prefill của nó chậm hơn của QuantForge khoảng 15 phần trăm.
-* gemlite **nhanh hơn ở shape decode rộng** 1 x 4096 x 11008 (129 so với 150 micro giây): điểm yếu của kernel decode QuantForge là hành vi lưới / wave trên layer rộng, không phải trường hợp 4096 x 4096.
+* gemlite vẫn **nhanh hơn 5 phần trăm ở shape decode rộng** 1 x 4096 x 11008 (129 so với 136 micro giây, sau khi cải thiện; trước đó là 150): điểm yếu của kernel decode QuantForge là hành vi lưới / wave trên layer rộng, không phải trường hợp 4096 x 4096.
 * Marlin là kernel nhanh nhất từ M = 32 trở lên, như trước; đường NF4 của bitsandbytes chậm hơn ở mọi nơi trừ các shape decode rộng, nơi nó nằm trong 8 đến 15 phần trăm.
 * Cả ba kernel INT4 chạm cùng giới hạn DRAM khoảng 50 micro giây ở 4096 x 4096 batch 1, đúng là kết quả cần có cho một kernel bị giới hạn bộ nhớ.
 
@@ -133,6 +133,19 @@ Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `
 | Mistral-7B-Instruct-v0.3 (từ checkpoint NF4) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | đỉnh 4.65 GB |
 
 Một model 3B và một model 7B chạy được trên card 6 GB vốn không chứa nổi chúng ở fp16. Cái giá về perplexity của 4 bit round-to-nearest là có thật (1 đến 4 điểm); [bài về GPTQ](05-gptq-and-checkpoints.html) cho thấy một quantiser thông minh hơn lấy lại được bao nhiêu. Mức tăng tốc giảm khi model lớn lên, vì lm_head, attention và khoảng 1400 kernel nhỏ của đồ thị Hugging Face chiếm phần lớn hơn của mỗi bước.
+
+### Độ dao động giữa các lần chạy
+
+Các con số đơn lẻ ở trên là tốt nhất trong phiên của chúng, nên đây là mức chúng dao động. Decode batch 1 với CUDA graph, 7 lần lặp với fp16 và INT4 (cộng head INT8) xen kẽ để trôi xung nhịp ảnh hưởng đều cho cả hai, trung bình và độ lệch chuẩn trong một phiên:
+
+| model | fp16 (token/s) | INT4 + head INT8 (token/s) | mức tăng tốc |
+|---|--:|--:|--:|
+| Qwen2.5-0.5B | 120.2 +- 0.6 | 197.1 +- 1.6 | 1.64x +- 0.02 |
+| Qwen2.5-1.5B | 47.9 +- 2.1 | 91.3 +- 5.4 | 1.91x +- 0.07 |
+| Llama-3.2-1B | 62.5 +- 3.3 | 132.0 +- 7.3 | 2.11x +- 0.12 |
+| OLMo-2-1B | 57.2 +- 2.6 | 128.9 +- 7.7 | 2.26x +- 0.16 |
+
+Tốc độ tuyệt đối dao động 5 đến 10 phần trăm trong một phiên và tới 15 phần trăm giữa các phiên (GPU còn chạy desktop), nên bảng ở trên, với các số lấy từ những phiên nhanh hơn, nên đọc là "khoảng 200" chứ không phải "209". **Mức tăng tốc** so với fp16 ổn định hơn nhiều (vài phần trăm). Thời gian kernel so với Marlin được lặp lại trong 5 lần gọi độc lập: 1 x 4096 x 4096 cho tỷ lệ 0.990 +- 0.000 (Marlin 49.7 +- 0.1 micro giây, QuantForge 50.2 +- 0.1), 1 x 4096 x 11008 cho 0.930 +- 0.000, 64 x 4096 x 4096 cho 0.676 +- 0.005 và 2048 x 4096 x 4096 cho 0.842 +- 0.011; chỉ các kernel prefill dài trôi (khoảng 1.5 phần trăm, theo nhiệt độ GPU, cả hai kernel cùng lúc). Vì vậy các tỷ lệ trong bảng kernel tái hiện được đến các chữ số đã nêu.
 
 ### Đầu-cuối so với vLLM
 

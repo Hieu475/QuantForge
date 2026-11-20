@@ -35,9 +35,9 @@ come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop 
 | 1 × 4096 × 4096 | 49.6 | 50.0 | 180.9 | 0.99× |
 | 4 × 4096 × 4096 | 49.4 | 49.8 | 181.5 | 0.99× |
 | 16 × 4096 × 4096 | 50.0 | 49.8 | 182.3 | 1.01× |
-| 1 × 4096 × 11008 | 126.6 | 149.3 | 482.9 | 0.85× |
-| 1 × 11008 × 4096 | 127.0 | 131.0 | 483.6 | 0.97× |
-| 16 × 4096 × 11008 | 127.2 | 149.2 | 498.5 | 0.85× |
+| 1 × 4096 × 11008 | 126.8 | 135.7 | 482.4 | 0.93× |
+| 1 × 11008 × 4096 | 127.2 | 131.1 | 484.0 | 0.97× |
+| 16 × 4096 × 11008 | 127.7 | 135.5 | 499.9 | 0.94× |
 | 32 × 4096 × 4096 | 50.9 | 58.8 | 181.0 | 0.87× |
 | 32 × 4096 × 11008 | 130.3 | 149.3 | 497.3 | 0.87× |
 | 64 × 4096 × 4096 | 58.3 | 87.4 | 181.4 | 0.67× |
@@ -56,20 +56,20 @@ only); cuBLAS reads the pre-dequantised fp16 weights (4× the bytes).
 
 | M × K × N | QuantForge | Marlin | gemlite (Triton) | bitsandbytes NF4 | cuBLAS fp16 |
 |---|--:|--:|--:|--:|--:|
-| 1 × 4096 × 4096 | 49.9 | 49.3 | **49.3** | 55.9 | 180.8 |
-| 4 × 4096 × 4096 | 50.1 | **49.3** | 100.0 | 155.1 | 181.7 |
-| 16 × 4096 × 4096 | 50.0 | **50.0** | 61.4 | 156.8 | 182.6 |
-| 32 × 4096 × 4096 | 58.7 | **50.9** | 71.0 | 160.0 | 180.9 |
-| 64 × 4096 × 4096 | 87.7 | **57.8** | 89.8 | 194.3 | 181.5 |
-| 128 × 4096 × 4096 | 151.4 | **104.4** | 159.2 | 241.0 | 188.3 |
-| 256 × 4096 × 4096 | 262.5 | **199.6** | 300.3 | 457.6 | 207.6 |
-| 512 × 4096 × 4096 | 459.8 | **388.9** | 529.9 | 600.9 | 371.1 |
-| 2048 × 4096 × 4096 | 1768.1 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
-| 1 × 4096 × 11008 | 149.5 | **126.8** | 129.3 | 139.6 | 482.4 |
+| 1 × 4096 × 4096 | 50.0 | 49.3 | **49.3** | 55.9 | 180.8 |
+| 4 × 4096 × 4096 | 49.8 | **49.3** | 100.0 | 155.1 | 181.7 |
+| 16 × 4096 × 4096 | **49.8** | 50.0 | 61.4 | 156.8 | 182.6 |
+| 32 × 4096 × 4096 | 58.8 | **50.9** | 71.0 | 160.0 | 180.9 |
+| 64 × 4096 × 4096 | 87.4 | **57.8** | 89.8 | 194.3 | 181.5 |
+| 128 × 4096 × 4096 | 152.2 | **104.4** | 159.2 | 241.0 | 188.3 |
+| 256 × 4096 × 4096 | 263.0 | **199.6** | 300.3 | 457.6 | 207.6 |
+| 512 × 4096 × 4096 | 461.6 | **388.9** | 529.9 | 600.9 | 371.1 |
+| 2048 × 4096 × 4096 | 1775.8 | **1527.5** | 2002.7 | 1711.1 | 1457.4 |
+| 1 × 4096 × 11008 | 135.7 | **126.8** | 129.3 | 139.6 | 482.4 |
 | 1 × 11008 × 4096 | 131.1 | **127.1** | 129.2 | 146.4 | 484.2 |
 
 QuantForge is on par with gemlite at M = 1 (49.9 / 49.3 µs), ahead of it for M = 4 … 2048 (gemlite needs 100 µs at M = 4 and
-61 µs at M = 16 where QuantForge needs 50), and behind it on the wide decode shape 1 × 4096 × 11008 (149.5 against 129.3 µs). Marlin is
+61 µs at M = 16 where QuantForge needs 50), and 5 % behind it on the wide decode shape 1 × 4096 × 11008 (135.7 against 129.4 µs, after the wave-aware K tile described in `PIPELINE.md`; it was 149.5 µs before). Marlin is
 the fastest kernel from M = 32 up. The Triton kernel's strength is its autotuned decode path; its prefill kernel is ~15 % slower than
 QuantForge's.
 
@@ -84,8 +84,7 @@ QuantForge on par with Marlin at batch 1. Running the QuantForge kernels *inside
 comparison and is not done.
 
 QuantForge is 3.2–3.7× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of the bytes) and
-0.67–1.01× of Marlin. **The "≥ 90 % of Marlin" goal is reached for decode (M ≤ 16) at 4096 × 4096 (0.99–1.01×) and for
-1 × 11008 × 4096 (0.97×); it is not reached for 1 × 4096 × 11008 and 16 × 4096 × 11008 (0.85×), for M = 32 … 256 (0.67–0.87×;
+0.67–1.01× of Marlin. **The "≥ 90 % of Marlin" goal is reached for decode (M ≤ 16): 4096 × 4096 (0.99–1.01×), 1 × 11008 × 4096 (0.97×), 1 × 4096 × 11008 (0.93×) and 16 × 4096 × 11008 (0.94×); it is not reached for M = 32 … 256 (0.67–0.87×;
 M = 64 / 128 are the worst: the kernel is limited by the Tensor Core / `ldmatrix` path at ~50 % tensor-pipe activity, not
 by DRAM, while Marlin stays memory-bound up to M = 64) and for the prefill GEMMs (0.85–0.86×)**. Activations are
 re-touched after the L2 flush (they are L2-resident in a real model, written by the previous layer). At prefill sizes the
@@ -274,6 +273,46 @@ not work.) Options that did not help consistently, hence off by default: `clip=T
 OLMo and Qwen-1.5B, ruins Llama), `act_order=True` (the layers lose the q/k/v fusion), larger damping (0.1 turns Llama into 58 ppl
 before the cap) and more calibration windows.
 
+**How robust is it?** (`benchmarks/hf_gptq.py --seed/--train`, `benchmarks/arc_eval.py`; whole Wikitext-2 test split)
+
+| check | Qwen2.5-0.5B | Llama-3.2-1B | Qwen2.5-1.5B |
+|---|--:|--:|--:|
+| RTN INT4 | 22.91 | 22.28 | 14.30 |
+| GPTQ, Wikitext-2 calibration, 3 seeds (windows from the first 20 000 train rows) | 20.35 / 20.31 / 20.46 (sd 0.08) | 20.10 / 19.97 / 19.81 (sd 0.15) | 13.38 (one seed) |
+| GPTQ, calibration on a different corpus (cnn_dailymail articles) | 20.67 | 20.17 | 13.54 |
+
+The spread between calibration seeds (0.1-0.15) is an order of magnitude smaller than the gap to RTN (2-3 points); calibrating on another
+domain costs 0.07-0.3 points on Wikitext-2 and still beats RTN by 2 points or more (the numbers above are *in-domain* for the first row).
+Qwen2.5-3B (does not fit in fp16 on the 6 GB card): RTN 13.13, GPTQ 11.97 (297 s calibration). Zero-shot ARC accuracy (lm-evaluation-harness scoring, `acc` / `acc_norm`,
+%; standard error 1.0 pp on ARC-Easy, n = 2376, 1.4 pp on ARC-Challenge, n = 1172):
+
+| model | variant | ARC-Easy | ARC-Challenge |
+|---|---|--:|--:|
+| Qwen2.5-0.5B | fp16 / RTN / GPTQ | 65.6 / 62.5 / 62.0 · 59.2 / 59.3 / 60.9 | 30.7 / 31.7 / 28.6 · 33.8 / 32.3 / 32.2 |
+| Llama-3.2-1B | fp16 / RTN / GPTQ | 69.0 / 64.3 / 66.2 · 63.8 / 60.4 / 61.2 | 34.6 / 33.5 / 34.4 · 37.9 / 35.3 / 36.3 |
+| OLMo-2-1B | fp16 / RTN / GPTQ | 71.8 / 71.2 / 70.9 · 71.0 / 68.3 / 70.2 | 41.0 / 39.8 / 40.3 · 42.0 / 40.7 / 43.0 |
+| Qwen2.5-1.5B | fp16 / RTN / GPTQ | 76.8 / 65.6 / **75.0** · 76.0 / 62.3 / **74.3** | 43.5 / 37.0 / **42.1** · 46.7 / 39.7 / **45.1** |
+
+(each cell: `acc` triple, then `acc_norm` triple.) Perplexity understated the damage of round-to-nearest on Qwen2.5-1.5B: it loses 11 points on ARC-Easy
+(76.8 -> 65.6) and GPTQ gets back to within 2 points; for the other three models the differences between the variants are mostly within the
+standard error, i.e. these small models lose little on ARC at INT4 either way.
+
+**Run-to-run spread** (`benchmarks/decode_repeat.py`, `benchmarks/kernel_repeat.py`). Batch-1 CUDA-graph decode, 7 repetitions with fp16 and INT4
+(+ INT8 head) interleaved, mean +- standard deviation, one session:
+
+| model | fp16 (tok/s) | INT4 + INT8 head (tok/s) | speed-up |
+|---|--:|--:|--:|
+| Qwen2.5-0.5B | 120.2 +- 0.6 | 197.1 +- 1.6 | 1.64x +- 0.02 |
+| Qwen2.5-1.5B | 47.9 +- 2.1 | 91.3 +- 5.4 | 1.91x +- 0.07 |
+| Llama-3.2-1B | 62.5 +- 3.3 | 132.0 +- 7.3 | 2.11x +- 0.12 |
+| OLMo-2-1B | 57.2 +- 2.6 | 128.9 +- 7.7 | 2.26x +- 0.16 |
+
+Absolute speeds drift by 5-10 % within a session and by up to 15 % between sessions (the GPU is shared with a desktop; the single numbers
+quoted elsewhere in this README come from the faster sessions), the *speed-up* is stable to about 5 %. Kernel time against Marlin, 5 independent
+invocations of `compare_marlin.py --autotune`: 1 x 4096 x 4096 ratio 0.990 +- 0.000 (Marlin 49.7 +- 0.1 us, QuantForge 50.2 +- 0.1), 1 x 4096 x 11008
+0.930 +- 0.000, 64 x 4096 x 4096 0.676 +- 0.005, 2048 x 4096 x 4096 0.842 +- 0.011 (the long prefill kernels drift by ~1.5 % with the GPU temperature,
+both kernels together).
+
 ### As a PyTorch op
 
 ```python
@@ -393,7 +432,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 
 ## Limitations
 
-* **Speed:** 0.85–1.01× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050 (decode 4096² on par, the wide decode shapes 0.85–0.97×), but only **0.67–0.87× at
+* **Speed:** 0.85–1.01× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050 (decode 4096² on par, the wide decode shapes 0.93–0.97×), but only **0.67–0.87× at
   M = 32 … 256** (see the table above). The gap is not DRAM, tile choice or dequantisation arithmetic (ablated:
   1–3 %); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 75.8 µs at M = 64 (compiler
   87, Marlin 59), see `PIPELINE.md` -- closing it needs tuning of a hand-written kernel, which is not done.

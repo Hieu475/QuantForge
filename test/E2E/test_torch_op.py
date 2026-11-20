@@ -281,7 +281,8 @@ def test_default_decode_schedule_depends_on_width_and_is_correct():
 
     assert "block-tile-k=128" in qt._decode_opts(28672) and "block-tile-k=128" in qt._decode_opts(8192)
     assert "block-tile-k=64" in qt._decode_opts(6144) and "block-tile-k=64" in qt._decode_opts(896)
-    for (K, N, G) in [(256, 8192, 128), (256, 256, 128)]:
+    assert "block-tile-k=32" in qt._decode_opts(11008) and "block-tile-k=128" in qt._decode_opts(14336)
+    for (K, N, G) in [(256, 8192, 128), (256, 256, 128), (256, 10240, 128)]:
         act, packed, scale, zp, ref = _case(3, K, N, G)
         assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), (K, N)
 

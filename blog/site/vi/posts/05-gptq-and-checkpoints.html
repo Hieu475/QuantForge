@@ -19,6 +19,7 @@
 <li><a href="#gptq-trong-thu-vien">GPTQ trong thư viện</a><ul>
 <li><a href="#mot-cai-bay-phien-ban-au-cua-bang-nay-a-sai">Một cái bẫy: phiên bản đầu của bảng này đã sai</a></li>
 <li><a href="#nhung-thu-khong-giup-nen-mac-inh-tat">Những thứ không giúp (nên mặc định tắt)</a></li>
+<li><a href="#o-ben-vung-en-au">Độ bền vững đến đâu?</a></li>
 </ul>
 </li>
 <li><a href="#checkpoint-awq-va-gptq-that">Checkpoint AWQ và GPTQ thật</a><ul>
@@ -112,6 +113,155 @@
 <li>damping lớn hơn: trước khi có giới hạn token, 0.1 biến Llama thành model có perplexity 58 (giới hạn token làm kết quả ít nhạy với nó hơn nhiều);</li>
 <li>nhiều cửa sổ hiệu chỉnh hơn (256) hoặc dài hơn (2048 token): không có mức tăng nhất quán.</li>
 </ul>
+<h3 id="o-ben-vung-en-au">Độ bền vững đến đâu?<a class="headerlink" href="#o-ben-vung-en-au" title="Permanent link">#</a></h3>
+<p>Ba kiểm tra ngoài một con số perplexity duy nhất (đều trên toàn bộ tập test Wikitext-2, GPTQ với các giá trị mặc định):</p>
+<table>
+<thead>
+<tr>
+<th>kiểm tra</th>
+<th style="text-align: right;">Qwen2.5-0.5B</th>
+<th style="text-align: right;">Llama-3.2-1B</th>
+<th style="text-align: right;">Qwen2.5-1.5B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTN INT4</td>
+<td style="text-align: right;">22.91</td>
+<td style="text-align: right;">22.28</td>
+<td style="text-align: right;">14.30</td>
+</tr>
+<tr>
+<td>GPTQ, 3 seed hiệu chỉnh</td>
+<td style="text-align: right;">20.35 / 20.31 / 20.46 (sd 0.08)</td>
+<td style="text-align: right;">20.10 / 19.97 / 19.81 (sd 0.15)</td>
+<td style="text-align: right;">13.38 (một seed)</td>
+</tr>
+<tr>
+<td>GPTQ, hiệu chỉnh trên bài báo cnn_dailymail thay vì Wikitext</td>
+<td style="text-align: right;">20.67</td>
+<td style="text-align: right;">20.17</td>
+<td style="text-align: right;">13.54</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Seed:</strong> độ lệch giữa các cửa sổ hiệu chỉnh ngẫu nhiên là 0.1 đến 0.15 điểm perplexity, nhỏ hơn một bậc so với khoảng cách tới RTN.</li>
+<li><strong>Miền khác:</strong> hiệu chỉnh trên báo chí và test trên Wikipedia tốn 0.07 đến 0.3 điểm và vẫn thắng RTN từ hai điểm trở lên. Lưu ý các số Wikitext-trên-Wikitext trong bảng chính là <em>trong miền</em>, hơi có lợi cho GPTQ.</li>
+<li><strong>Model lớn hơn:</strong> Qwen2.5-3B (không vừa fp16 trên card này nên không có mốc fp16): RTN 13.13, GPTQ <strong>11.97</strong>, hiệu chỉnh mất 297 giây.</li>
+</ul>
+<p><strong>Một task thay vì độ hợp lý.</strong> Độ chính xác ARC zero-shot (cách chấm của lm-evaluation-harness: <code>acc</code> chọn đáp án có log-likelihood cao nhất, <code>acc_norm</code> chọn cao nhất trên mỗi ký tự), tính bằng phần trăm. Sai số chuẩn là 1.0 điểm với ARC-Easy (2376 câu) và 1.4 với ARC-Challenge (1172 câu):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th>biến thể</th>
+<th style="text-align: right;">ARC-Easy acc</th>
+<th style="text-align: right;">ARC-Easy acc_norm</th>
+<th style="text-align: right;">ARC-Challenge acc</th>
+<th style="text-align: right;">ARC-Challenge acc_norm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td>fp16</td>
+<td style="text-align: right;">65.6</td>
+<td style="text-align: right;">59.2</td>
+<td style="text-align: right;">30.7</td>
+<td style="text-align: right;">33.8</td>
+</tr>
+<tr>
+<td></td>
+<td>RTN</td>
+<td style="text-align: right;">62.5</td>
+<td style="text-align: right;">59.3</td>
+<td style="text-align: right;">31.7</td>
+<td style="text-align: right;">32.3</td>
+</tr>
+<tr>
+<td></td>
+<td>GPTQ</td>
+<td style="text-align: right;">62.0</td>
+<td style="text-align: right;">60.9</td>
+<td style="text-align: right;">28.6</td>
+<td style="text-align: right;">32.2</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td>fp16</td>
+<td style="text-align: right;">69.0</td>
+<td style="text-align: right;">63.8</td>
+<td style="text-align: right;">34.6</td>
+<td style="text-align: right;">37.9</td>
+</tr>
+<tr>
+<td></td>
+<td>RTN</td>
+<td style="text-align: right;">64.3</td>
+<td style="text-align: right;">60.4</td>
+<td style="text-align: right;">33.5</td>
+<td style="text-align: right;">35.3</td>
+</tr>
+<tr>
+<td></td>
+<td>GPTQ</td>
+<td style="text-align: right;">66.2</td>
+<td style="text-align: right;">61.2</td>
+<td style="text-align: right;">34.4</td>
+<td style="text-align: right;">36.3</td>
+</tr>
+<tr>
+<td>OLMo-2-1B</td>
+<td>fp16</td>
+<td style="text-align: right;">71.8</td>
+<td style="text-align: right;">71.0</td>
+<td style="text-align: right;">41.0</td>
+<td style="text-align: right;">42.0</td>
+</tr>
+<tr>
+<td></td>
+<td>RTN</td>
+<td style="text-align: right;">71.2</td>
+<td style="text-align: right;">68.3</td>
+<td style="text-align: right;">39.8</td>
+<td style="text-align: right;">40.7</td>
+</tr>
+<tr>
+<td></td>
+<td>GPTQ</td>
+<td style="text-align: right;">70.9</td>
+<td style="text-align: right;">70.2</td>
+<td style="text-align: right;">40.3</td>
+<td style="text-align: right;">43.0</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td>fp16</td>
+<td style="text-align: right;">76.8</td>
+<td style="text-align: right;">76.0</td>
+<td style="text-align: right;">43.5</td>
+<td style="text-align: right;">46.7</td>
+</tr>
+<tr>
+<td></td>
+<td>RTN</td>
+<td style="text-align: right;">65.6</td>
+<td style="text-align: right;">62.3</td>
+<td style="text-align: right;">37.0</td>
+<td style="text-align: right;">39.7</td>
+</tr>
+<tr>
+<td></td>
+<td>GPTQ</td>
+<td style="text-align: right;"><strong>75.0</strong></td>
+<td style="text-align: right;"><strong>74.3</strong></td>
+<td style="text-align: right;"><strong>42.1</strong></td>
+<td style="text-align: right;"><strong>45.1</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Điều bất ngờ là <strong>Qwen2.5-1.5B</strong>: round-to-nearest mất 11 điểm trên ARC-Easy (76.8 xuống 65.6) và 6.5 điểm trên ARC-Challenge, nhiều hơn hẳn mức tăng perplexity khiêm tốn của nó (12.66 lên 14.30) gợi ý, và GPTQ đưa nó về trong phạm vi 2 điểm của fp16. Với ba model còn lại, chênh lệch giữa fp16, RTN và GPTQ phần lớn nằm trong sai số chuẩn: ở INT4 các model nhỏ này mất ít trên ARC dù theo cách nào. Nói cách khác, một bảng perplexity một mình có thể che giấu một vấn đề chất lượng thật, và cũng có thể thổi phồng một vấn đề.</p>
 <h2 id="checkpoint-awq-va-gptq-that">Checkpoint AWQ và GPTQ thật<a class="headerlink" href="#checkpoint-awq-va-gptq-that" title="Permanent link">#</a></h2>
 <p>Hầu hết model 4 bit trên Hub là file AWQ hoặc GPTQ. <code>quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")</code> chuyển các tensor đóng gói int32 sang layout của kernel (<code>quant.from_gptq</code>, <code>quant.from_awq</code>), hỗ trợ checkpoint GPTQ <code>desc_act</code> bằng cách hoán vị hàng offline (hoán vị activation được áp bằng một phép gather nhỏ lúc chạy) và quy ước zero-point <code>gptq_v2</code>.</p>
 <p>Kiểm chứng với bản sinh đôi dense (cùng weight đã dequantise trong các layer <code>nn.Linear</code> thường), Qwen2.5-0.5B-Instruct, 16 x 512 token test:</p>

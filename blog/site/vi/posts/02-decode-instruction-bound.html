@@ -20,7 +20,10 @@
 <li><a href="#buoc-2-cac-load-scale-bi-load-tam-lan-va-pass-ngung-khop">Bước 2: các load scale bị load tám lần, và pass ngừng khớp</a></li>
 <li><a href="#buoc-3-dequantisation-bang-hai-lenh-cho-hai-weight">Bước 3: dequantisation bằng hai lệnh cho hai weight</a></li>
 <li><a href="#buoc-4-bang-ablation-o-hom-nay-l2-lanh-1-x-4096-x-4096">Bước 4: bảng ablation, đo hôm nay (L2 lạnh, 1 x 4096 x 4096)</a></li>
-<li><a href="#buoc-5-wave-quantisation-tren-cac-shape-rong">Bước 5: wave quantisation trên các shape rộng</a></li>
+<li><a href="#buoc-5-wave-quantisation-tren-cac-shape-rong">Bước 5: wave quantisation trên các shape rộng</a><ul>
+<li><a href="#bo-sung-k-tile-i-theo-so-wave-1-x-4096-x-11008-tu-150-xuong-135-micro-giay">Bổ sung: K tile đi theo số wave (1 x 4096 x 11008: từ 150 xuống 135 micro giây)</a></li>
+</ul>
+</li>
 <li><a href="#rut-ra-gi">Rút ra gì</a></li>
 </ul>
 </div>
@@ -101,7 +104,76 @@ weight  = diff * scale            // mul.f16x2: phép làm tròn duy nhất
 <p>Khi weight đã nằm sẵn trong L2 (không flush) kernel đầy đủ mất 49 micro giây: ở kích thước này nó bị giới hạn bởi độ trễ (ít warp, mỗi warp có chuỗi phụ thuộc dài), không phải bởi băng thông, nên thời gian lạnh và ấm gần như bằng nhau.</p>
 <p>Thứ hạng mang nhiều thông tin. <strong>Load vector hóa là cái lớn nhất</strong>: không có load 16 byte kernel phát lệnh load nhiều gấp ba và chạy chậm gấp ba. Dequantisation đóng gói và look-ahead một tile mỗi cái đáng 16 đến 22 phần trăm. Các pass hoàn toàn <em>không giúp</em> trong chế độ này: stage shared-memory thứ hai cho decode, đẩy các store dequantisation xuống, look-ahead hai tile trở lên (các load đã đủ sớm) và split-K.</p>
 <h2 id="buoc-5-wave-quantisation-tren-cac-shape-rong">Bước 5: wave quantisation trên các shape rộng<a class="headerlink" href="#buoc-5-wave-quantisation-tren-cac-shape-rong" title="Permanent link">#</a></h2>
-<p>Các shape rộng cư xử khác. Trong lúc phát triển, một lần quét kích thước lưới theo băng thông đạt được cho thấy khoảng 183 GB/s khi lưới vừa các block đang cư trú của GPU (80 block 128 cột với K tile 128 trên card này), và khoảng 151 GB/s ngay khi có làn thứ hai không đầy: layer 4096 x 11008 có 86 block cột cho 80 slot. K tile nhỏ hơn (64 thay vì 128, giảm shared memory mỗi block) cùng look-ahead một tile lấy lại một phần mất mát. Đây là số đo thời phát triển; kết quả lạnh hôm nay trên các shape rộng nằm ở bài tổng quan: 0.85 của Marlin cho 1 x 4096 x 11008 và 0.97 cho 1 x 11008 x 4096.</p>
+<p>Các shape rộng cư xử khác. Trong lúc phát triển, một lần quét kích thước lưới theo băng thông đạt được cho thấy khoảng 183 GB/s khi lưới vừa các block đang cư trú của GPU (80 block 128 cột với K tile 128 trên card này), và khoảng 151 GB/s ngay khi có làn thứ hai không đầy: layer 4096 x 11008 có 86 block cột cho 80 slot. K tile nhỏ hơn (64 thay vì 128, giảm shared memory mỗi block) cùng look-ahead một tile lấy lại một phần mất mát. Đây là số đo thời phát triển; kết quả lạnh trên các shape rộng nằm ở bài tổng quan: 0.93 của Marlin cho 1 x 4096 x 11008 sau phần bổ sung bên dưới, và 0.97 cho 1 x 11008 x 4096.</p>
+<h3 id="bo-sung-k-tile-i-theo-so-wave-1-x-4096-x-11008-tu-150-xuong-135-micro-giay">Bổ sung: K tile đi theo số wave (1 x 4096 x 11008: từ 150 xuống 135 micro giây)<a class="headerlink" href="#bo-sung-k-tile-i-theo-so-wave-1-x-4096-x-11008-tu-150-xuong-135-micro-giay" title="Permanent link">#</a></h3>
+<p>Shape rộng là nơi duy nhất kernel decode thua rõ (0.85 của Marlin, và chậm hơn gemlite 8 phần trăm). Một lần quét độ rộng đầu ra N ở K = 4096 với hai K tile quan trọng cho thấy lý do (L2 lạnh, micro giây, <code>block-tile-n=128</code>, look-ahead một tile):</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">N</th>
+<th style="text-align: right;">số block cột</th>
+<th style="text-align: right;">K tile 32</th>
+<th style="text-align: right;">K tile 128</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">9216</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">115</td>
+</tr>
+<tr>
+<td style="text-align: right;">10240</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;"><strong>124</strong></td>
+<td style="text-align: right;">137</td>
+</tr>
+<tr>
+<td style="text-align: right;">10752</td>
+<td style="text-align: right;">84</td>
+<td style="text-align: right;"><strong>132</strong></td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr>
+<td style="text-align: right;">11008</td>
+<td style="text-align: right;">86</td>
+<td style="text-align: right;"><strong>136</strong></td>
+<td style="text-align: right;">150</td>
+</tr>
+<tr>
+<td style="text-align: right;">11520</td>
+<td style="text-align: right;">90</td>
+<td style="text-align: right;">161</td>
+<td style="text-align: right;">165</td>
+</tr>
+<tr>
+<td style="text-align: right;">12288</td>
+<td style="text-align: right;">96</td>
+<td style="text-align: right;"><strong>153</strong></td>
+<td style="text-align: right;">174</td>
+</tr>
+<tr>
+<td style="text-align: right;">13312</td>
+<td style="text-align: right;">104</td>
+<td style="text-align: right;">207</td>
+<td style="text-align: right;"><strong>166</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">14336</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">211</td>
+<td style="text-align: right;"><strong>176</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">228</td>
+<td style="text-align: right;"><strong>219</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Với K tile sâu 128 card giữ 80 block cùng lúc (4 mỗi SM): 81 đến 96 block cột chỉ vượt một wave một chút và các block lẻ chạy một mình. K tile sâu 32 cần ít shared memory hơn mỗi block, nên mọi block đều cư trú và layer chạy trong một wave, nhanh hơn 8 đến 12 phần trăm. Từ khoảng 104 block, wave thứ hai tồn tại dù chọn tile nào và hiệu quả tốt hơn của tile sâu lại thắng. Schedule mặc định giờ dùng tile sâu 32 cho N từ 10240 đến 12288 (MLP rộng 11008 của Llama-7B là trường hợp hiển nhiên), autotuner có thêm ứng viên đó, và kết quả là <strong>1 x 4096 x 11008: từ 150 xuống 135.7 micro giây (0.93 của Marlin, chậm hơn gemlite 5 phần trăm), 16 x 4096 x 11008: từ 149 xuống 135.5 (0.94)</strong>. Đây là quy tắc khớp với số SM và dung lượng shared memory của GPU này: trên card khác cửa sổ sẽ dịch chuyển, và đó là việc của autotuner.</p>
 <h2 id="rut-ra-gi">Rút ra gì<a class="headerlink" href="#rut-ra-gi" title="Permanent link">#</a></h2>
 <ol>
 <li>Ở giới hạn DRAM, hòa với một kernel viết tay là kết quả đúng, và tuyên bố hơn nó 30 phần trăm trên một kernel bị giới hạn bộ nhớ cần được kiểm tra bằng <code>dram__bytes_read</code> trước khi tin.</li>

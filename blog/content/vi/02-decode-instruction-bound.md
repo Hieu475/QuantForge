@@ -66,7 +66,25 @@ Thứ hạng mang nhiều thông tin. **Load vector hóa là cái lớn nhất**
 
 ## Bước 5: wave quantisation trên các shape rộng
 
-Các shape rộng cư xử khác. Trong lúc phát triển, một lần quét kích thước lưới theo băng thông đạt được cho thấy khoảng 183 GB/s khi lưới vừa các block đang cư trú của GPU (80 block 128 cột với K tile 128 trên card này), và khoảng 151 GB/s ngay khi có làn thứ hai không đầy: layer 4096 x 11008 có 86 block cột cho 80 slot. K tile nhỏ hơn (64 thay vì 128, giảm shared memory mỗi block) cùng look-ahead một tile lấy lại một phần mất mát. Đây là số đo thời phát triển; kết quả lạnh hôm nay trên các shape rộng nằm ở bài tổng quan: 0.85 của Marlin cho 1 x 4096 x 11008 và 0.97 cho 1 x 11008 x 4096.
+Các shape rộng cư xử khác. Trong lúc phát triển, một lần quét kích thước lưới theo băng thông đạt được cho thấy khoảng 183 GB/s khi lưới vừa các block đang cư trú của GPU (80 block 128 cột với K tile 128 trên card này), và khoảng 151 GB/s ngay khi có làn thứ hai không đầy: layer 4096 x 11008 có 86 block cột cho 80 slot. K tile nhỏ hơn (64 thay vì 128, giảm shared memory mỗi block) cùng look-ahead một tile lấy lại một phần mất mát. Đây là số đo thời phát triển; kết quả lạnh trên các shape rộng nằm ở bài tổng quan: 0.93 của Marlin cho 1 x 4096 x 11008 sau phần bổ sung bên dưới, và 0.97 cho 1 x 11008 x 4096.
+
+### Bổ sung: K tile đi theo số wave (1 x 4096 x 11008: từ 150 xuống 135 micro giây)
+
+Shape rộng là nơi duy nhất kernel decode thua rõ (0.85 của Marlin, và chậm hơn gemlite 8 phần trăm). Một lần quét độ rộng đầu ra N ở K = 4096 với hai K tile quan trọng cho thấy lý do (L2 lạnh, micro giây, `block-tile-n=128`, look-ahead một tile):
+
+| N | số block cột | K tile 32 | K tile 128 |
+|--:|--:|--:|--:|
+| 9216 | 72 | 114 | 115 |
+| 10240 | 80 | **124** | 137 |
+| 10752 | 84 | **132** | 148 |
+| 11008 | 86 | **136** | 150 |
+| 11520 | 90 | 161 | 165 |
+| 12288 | 96 | **153** | 174 |
+| 13312 | 104 | 207 | **166** |
+| 14336 | 112 | 211 | **176** |
+| 16384 | 128 | 228 | **219** |
+
+Với K tile sâu 128 card giữ 80 block cùng lúc (4 mỗi SM): 81 đến 96 block cột chỉ vượt một wave một chút và các block lẻ chạy một mình. K tile sâu 32 cần ít shared memory hơn mỗi block, nên mọi block đều cư trú và layer chạy trong một wave, nhanh hơn 8 đến 12 phần trăm. Từ khoảng 104 block, wave thứ hai tồn tại dù chọn tile nào và hiệu quả tốt hơn của tile sâu lại thắng. Schedule mặc định giờ dùng tile sâu 32 cho N từ 10240 đến 12288 (MLP rộng 11008 của Llama-7B là trường hợp hiển nhiên), autotuner có thêm ứng viên đó, và kết quả là **1 x 4096 x 11008: từ 150 xuống 135.7 micro giây (0.93 của Marlin, chậm hơn gemlite 5 phần trăm), 16 x 4096 x 11008: từ 149 xuống 135.5 (0.94)**. Đây là quy tắc khớp với số SM và dung lượng shared memory của GPU này: trên card khác cửa sổ sẽ dịch chuyển, và đó là việc của autotuner.
 
 ## Rút ra gì
 

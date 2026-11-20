@@ -52,6 +52,39 @@ A fixed list of layers is not a fix: forcing RTN on the massive-activation layer
 * larger damping: before the token cap, 0.1 turned Llama into a model with perplexity 58 (the cap makes the result much less sensitive to it);
 * more calibration windows (256) or longer ones (2048 tokens): no consistent gain.
 
+### How robust is it?
+
+Three checks beyond a single perplexity number (all on the whole Wikitext-2 test split, GPTQ with the defaults):
+
+| check | Qwen2.5-0.5B | Llama-3.2-1B | Qwen2.5-1.5B |
+|---|--:|--:|--:|
+| RTN INT4 | 22.91 | 22.28 | 14.30 |
+| GPTQ, 3 calibration seeds | 20.35 / 20.31 / 20.46 (sd 0.08) | 20.10 / 19.97 / 19.81 (sd 0.15) | 13.38 (one seed) |
+| GPTQ, calibrated on cnn_dailymail articles instead of Wikitext | 20.67 | 20.17 | 13.54 |
+
+* **Seeds:** the spread between random calibration windows is 0.1 to 0.15 perplexity points, an order of magnitude below the gap to RTN.
+* **Another domain:** calibrating on news articles and testing on Wikipedia costs 0.07 to 0.3 points and still beats RTN by two points or more. Note that the Wikitext-on-Wikitext numbers in the main table are *in-domain*, which flatters GPTQ slightly.
+* **A bigger model:** Qwen2.5-3B (which does not fit in fp16 on this card, so there is no fp16 reference): RTN 13.13, GPTQ **11.97**, 297 seconds of calibration.
+
+**A task instead of a likelihood.** Zero-shot ARC accuracy (the scoring of lm-evaluation-harness: `acc` picks the choice with the highest log-likelihood, `acc_norm` the highest per character), in percent. The standard error is 1.0 points on ARC-Easy (2376 questions) and 1.4 on ARC-Challenge (1172):
+
+| model | variant | ARC-Easy acc | ARC-Easy acc_norm | ARC-Challenge acc | ARC-Challenge acc_norm |
+|---|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B | fp16 | 65.6 | 59.2 | 30.7 | 33.8 |
+| | RTN | 62.5 | 59.3 | 31.7 | 32.3 |
+| | GPTQ | 62.0 | 60.9 | 28.6 | 32.2 |
+| Llama-3.2-1B | fp16 | 69.0 | 63.8 | 34.6 | 37.9 |
+| | RTN | 64.3 | 60.4 | 33.5 | 35.3 |
+| | GPTQ | 66.2 | 61.2 | 34.4 | 36.3 |
+| OLMo-2-1B | fp16 | 71.8 | 71.0 | 41.0 | 42.0 |
+| | RTN | 71.2 | 68.3 | 39.8 | 40.7 |
+| | GPTQ | 70.9 | 70.2 | 40.3 | 43.0 |
+| Qwen2.5-1.5B | fp16 | 76.8 | 76.0 | 43.5 | 46.7 |
+| | RTN | 65.6 | 62.3 | 37.0 | 39.7 |
+| | GPTQ | **75.0** | **74.3** | **42.1** | **45.1** |
+
+The surprise is **Qwen2.5-1.5B**: round-to-nearest loses 11 points on ARC-Easy (76.8 to 65.6) and 6.5 on ARC-Challenge, much more than its modest perplexity increase (12.66 to 14.30) suggests, and GPTQ brings it back to within 2 points of fp16. For the other three models the differences between fp16, RTN and GPTQ are mostly within the standard error: at INT4 these small models lose little on ARC either way. In other words, a perplexity table alone can hide a real quality problem, and it can also overstate one.
+
 ## Real AWQ and GPTQ checkpoints
 
 Most 4-bit models on the Hub are AWQ or GPTQ files. `quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")` converts the int32-packed tensors into the kernel layout (`quant.from_gptq`, `quant.from_awq`), supports GPTQ `desc_act` checkpoints by permuting the rows offline (the activation permutation is applied by one small gather at run time) and the `gptq_v2` zero-point convention.

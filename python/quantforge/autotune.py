@@ -74,11 +74,15 @@ def candidates(M: int, bits: int = 4) -> list[str]:
         # one tile of look-ahead for the weight loads (rotating registers): -19 % on
         # K >> N shapes (few blocks, long K loop), neutral elsewhere; deeper never helped
         for bn, wn in ((64, 16), (128, 16)):
-            for bk in (64, 128):  # a smaller K tile = less smem per block = more resident blocks
+            for bk in (32, 64, 128):  # a smaller K tile = less smem per block = more resident blocks
                 out.append(f"decode=true block-tile-n={bn} warp-tile-n={wn} block-tile-k={bk} "
                            f"smem-stages=1 prefetch-distance=1")
             out.append(f"decode=true block-tile-n={bn} warp-tile-n={wn} block-tile-k=128 "
                        f"smem-stages=2 sink-dequant-stores=true prefetch-distance=1")
+        # wide outputs whose grid is just above one wave (N = 10240 .. 12288 at 128 columns per block): a 32-deep K tile
+        # makes every block resident (1 x 4096 x 11008: 135 us against 150 us for the 128-deep tile); 256-column blocks
+        # with the same tile also reach one wave
+        out.append("decode=true block-tile-n=256 warp-tile-n=32 block-tile-k=32 smem-stages=1 prefetch-distance=1")
         return out
     out = [""]
     for opts in ("block-tile-k=64", "smem-stages=1", "block-tile-k=64 smem-stages=1",
@@ -141,7 +145,7 @@ def _m_bucket(M: int) -> str:
     return ">4096"
 
 
-_CANDIDATES_VERSION = 2   # bump when `candidates` changes so that stale winners are re-tuned
+_CANDIDATES_VERSION = 3   # bump when `candidates` changes so that stale winners are re-tuned
 
 
 def cache_key(M, K, N, group_size, bits, gpu, acc, fp8=False):

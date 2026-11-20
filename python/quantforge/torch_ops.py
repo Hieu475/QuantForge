@@ -36,11 +36,14 @@ from .e2e import W4A16Gemm
 __all__ = ["w4a16_linear", "set_autotune", "clear_cache", "bucket_rows", "CPP_RUNTIME"]
 
 def _decode_opts(N: int) -> str:
-    """Default schedule of an M <= 16 call. The K tile is the only knob that matters across LLM layer
-    shapes: 128 wins clearly for wide outputs (N = 14336: +18 %, the fused gate/up N = 28672: +28 %,
-    N = 8192..11008: +2..7 %), 64 for narrow ones (N = 2048: +15 %, N = 6144: +10 %); measured on the
-    RTX 4050 (benchmarks in the commit message). `set_autotune(True)` replaces the rule by a search."""
-    bk = 128 if N >= 8192 else 64
+    """Default schedule of an M <= 16 call. The K tile is the knob that matters across LLM layer shapes: 128 wins for
+    wide outputs (N = 14336: +18 %, the fused gate/up N = 28672: +28 %), 64 for narrow ones (N = 2048: +15 %,
+    N = 6144: +10 %). One exception, from a sweep over N at K = 4096 (RTX 4050, 20 SMs, 80 resident 128-column
+    blocks): with 81 to 96 column blocks (N = 10240 .. 12288, e.g. the 11008-wide MLP of Llama-7B) the grid is only
+    slightly larger than one wave of the 128-deep K tile, and a 32-deep tile (smaller shared memory per block, so all
+    blocks are resident) is 8-12 % faster (1 x 4096 x 11008: 150 -> 135 us); from ~104 blocks up it loses again.
+    `set_autotune(True)` replaces the rule by a search."""
+    bk = 32 if 10240 <= N <= 12288 else 128 if N >= 8192 else 64
     return f"decode=true block-tile-n=128 warp-tile-n=16 block-tile-k={bk} smem-stages=1 prefetch-distance=1"
 
 

@@ -277,3 +277,11 @@ weight and picks the W8A16 kernel from `packed.shape[1] == scale.shape[1]`) is t
 ppl 24.08 with group 128 (fp16 head 24.09), 214 tok/s (+16 %); group 32: 24.09, 209 tok/s, Mistral-7B-Instruct-v0.3 (NF4 -> INT4, `hf_bnb_to_quantforge.py --quant-head 128 --head-bits 8`, back to
 back runs): ppl 8.507 vs 8.506, 35.3 vs 34.4 tok/s (HF generate), 34.9 vs 34.2 (graph) = +2-3 %, as predicted
 by 134 MB / 160 GB/s ~ 0.8 ms of a 28 ms step, and 0.27 GB less VRAM (4.07 GB), the 1400 unfused HF kernels (10 %).
+
+## Wave-aware K tile for wide decode layers (2026-11-20)
+
+Sweep of N at K = 4096 (cold L2, `block-tile-n=128`, `prefetch-distance=1`): the 128-deep K tile holds 80 resident blocks on the
+RTX 4050, and for 81 to 96 column blocks (N = 10240 .. 12288) the 32-deep tile (all blocks resident, one wave) is 8-12 % faster
+(N = 11008: 136 against 150 us); at 104 blocks and more the deep tile wins again. `_decode_opts` uses bk = 32 for
+10240 <= N <= 12288, 128 for N >= 8192 otherwise, 64 below; the autotuner has bk = 32 candidates (candidates version 3).
+1 x 4096 x 11008: 149.5 -> 135.7 us (0.93 of Marlin), 16 x 4096 x 11008: 149.2 -> 135.5 us (0.94).

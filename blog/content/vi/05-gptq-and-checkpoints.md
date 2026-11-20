@@ -52,6 +52,39 @@ Một danh sách layer cố định không phải cách sửa: ép RTN cho các 
 * damping lớn hơn: trước khi có giới hạn token, 0.1 biến Llama thành model có perplexity 58 (giới hạn token làm kết quả ít nhạy với nó hơn nhiều);
 * nhiều cửa sổ hiệu chỉnh hơn (256) hoặc dài hơn (2048 token): không có mức tăng nhất quán.
 
+### Độ bền vững đến đâu?
+
+Ba kiểm tra ngoài một con số perplexity duy nhất (đều trên toàn bộ tập test Wikitext-2, GPTQ với các giá trị mặc định):
+
+| kiểm tra | Qwen2.5-0.5B | Llama-3.2-1B | Qwen2.5-1.5B |
+|---|--:|--:|--:|
+| RTN INT4 | 22.91 | 22.28 | 14.30 |
+| GPTQ, 3 seed hiệu chỉnh | 20.35 / 20.31 / 20.46 (sd 0.08) | 20.10 / 19.97 / 19.81 (sd 0.15) | 13.38 (một seed) |
+| GPTQ, hiệu chỉnh trên bài báo cnn_dailymail thay vì Wikitext | 20.67 | 20.17 | 13.54 |
+
+* **Seed:** độ lệch giữa các cửa sổ hiệu chỉnh ngẫu nhiên là 0.1 đến 0.15 điểm perplexity, nhỏ hơn một bậc so với khoảng cách tới RTN.
+* **Miền khác:** hiệu chỉnh trên báo chí và test trên Wikipedia tốn 0.07 đến 0.3 điểm và vẫn thắng RTN từ hai điểm trở lên. Lưu ý các số Wikitext-trên-Wikitext trong bảng chính là *trong miền*, hơi có lợi cho GPTQ.
+* **Model lớn hơn:** Qwen2.5-3B (không vừa fp16 trên card này nên không có mốc fp16): RTN 13.13, GPTQ **11.97**, hiệu chỉnh mất 297 giây.
+
+**Một task thay vì độ hợp lý.** Độ chính xác ARC zero-shot (cách chấm của lm-evaluation-harness: `acc` chọn đáp án có log-likelihood cao nhất, `acc_norm` chọn cao nhất trên mỗi ký tự), tính bằng phần trăm. Sai số chuẩn là 1.0 điểm với ARC-Easy (2376 câu) và 1.4 với ARC-Challenge (1172 câu):
+
+| model | biến thể | ARC-Easy acc | ARC-Easy acc_norm | ARC-Challenge acc | ARC-Challenge acc_norm |
+|---|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B | fp16 | 65.6 | 59.2 | 30.7 | 33.8 |
+| | RTN | 62.5 | 59.3 | 31.7 | 32.3 |
+| | GPTQ | 62.0 | 60.9 | 28.6 | 32.2 |
+| Llama-3.2-1B | fp16 | 69.0 | 63.8 | 34.6 | 37.9 |
+| | RTN | 64.3 | 60.4 | 33.5 | 35.3 |
+| | GPTQ | 66.2 | 61.2 | 34.4 | 36.3 |
+| OLMo-2-1B | fp16 | 71.8 | 71.0 | 41.0 | 42.0 |
+| | RTN | 71.2 | 68.3 | 39.8 | 40.7 |
+| | GPTQ | 70.9 | 70.2 | 40.3 | 43.0 |
+| Qwen2.5-1.5B | fp16 | 76.8 | 76.0 | 43.5 | 46.7 |
+| | RTN | 65.6 | 62.3 | 37.0 | 39.7 |
+| | GPTQ | **75.0** | **74.3** | **42.1** | **45.1** |
+
+Điều bất ngờ là **Qwen2.5-1.5B**: round-to-nearest mất 11 điểm trên ARC-Easy (76.8 xuống 65.6) và 6.5 điểm trên ARC-Challenge, nhiều hơn hẳn mức tăng perplexity khiêm tốn của nó (12.66 lên 14.30) gợi ý, và GPTQ đưa nó về trong phạm vi 2 điểm của fp16. Với ba model còn lại, chênh lệch giữa fp16, RTN và GPTQ phần lớn nằm trong sai số chuẩn: ở INT4 các model nhỏ này mất ít trên ARC dù theo cách nào. Nói cách khác, một bảng perplexity một mình có thể che giấu một vấn đề chất lượng thật, và cũng có thể thổi phồng một vấn đề.
+
 ## Checkpoint AWQ và GPTQ thật
 
 Hầu hết model 4 bit trên Hub là file AWQ hoặc GPTQ. `quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")` chuyển các tensor đóng gói int32 sang layout của kernel (`quant.from_gptq`, `quant.from_awq`), hỗ trợ checkpoint GPTQ `desc_act` bằng cách hoán vị hàng offline (hoán vị activation được áp bằng một phép gather nhỏ lúc chạy) và quy ước zero-point `gptq_v2`.

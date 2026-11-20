@@ -27,7 +27,8 @@ from qwen_end_to_end import perplexity  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--train", required=True)
+    ap.add_argument("--train", required=True, help="parquet with the calibration text (column --calib-column)")
+    ap.add_argument("--calib-column", default="text")
     ap.add_argument("--text", required=True)
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0, help="seed of the calibration windows")
@@ -48,7 +49,7 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(ns.model)
     test = tok("\n\n".join(pd.read_parquet(ns.text)["text"]), return_tensors="pt").input_ids[0][: (ns.nseq * ns.seqlen) if ns.nseq else None]
-    calib = qgptq.calibration_ids(tok, "\n\n".join(pd.read_parquet(ns.train)["text"]), ns.nsamples, ns.calib_len, ns.seed)
+    calib = qgptq.calibration_ids(tok, "\n\n".join(pd.read_parquet(ns.train)[ns.calib_column].iloc[:20000]), ns.nsamples, ns.calib_len, ns.seed)
     prompt = "Explain in one paragraph why the sky is blue."
 
     def load():
