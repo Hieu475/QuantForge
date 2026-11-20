@@ -126,13 +126,13 @@ T = {
     },
     "e2e_speed": {
         "en": ("Batch-1 decode speed with CUDA graphs (tokens per second, higher is better)",
-               "RTX 4050 Laptop, 6 GB. Round-to-nearest INT4, group size 128. Qwen2.5-3B and Phi-3.5 do not fit in fp16 on this card."),
+               "RTX 4050 Laptop, 6 GB; mean of 7 interleaved runs of one session (spread in the table below). Round-to-nearest INT4, group size 128. Qwen2.5-3B and Phi-3.5 do not fit in fp16 on this card."),
         "vi": ("Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)",
-               "RTX 4050 Laptop, 6 GB. INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này."),
+               "RTX 4050 Laptop, 6 GB; trung bình 7 lần chạy xen kẽ trong một phiên (độ dao động ở bảng bên dưới). INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này."),
     },
     "gptq_ppl": {
         "en": ("Wikitext-2 perplexity of the quantised models (lower is better)",
-               "Whole Wikitext-2 test split (564-584 windows of 512 tokens); GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants."),
+               "Whole Wikitext-2 test split (564-584 windows of 512 tokens); GPTQ calibrated on 128 windows of 512 tokens from the train split (token cap 10); INT8 head in both variants."),
         "vi": ("Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)",
                "Toàn bộ tập test Wikitext-2 (564-584 cửa sổ 512 token); GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể."),
     },
@@ -153,10 +153,10 @@ def chart(name):
                              300, unit=" us", decimals=0, note=note)
     if name == "e2e_speed":
         return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
-                             [(lg["fp16"], [129, 49, 63, 60]), (lg["qf"], [209, 97, 142, 138])], 240, decimals=0, note=note)
+                             [(lg["fp16"], [120, 48, 63, 57]), (lg["qf"], [197, 91, 132, 129])], 240, decimals=0, note=note)
     if name == "gptq_ppl":
         return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
-                             [(lg["rtn"], [22.91, 14.30, 22.28, 19.02]), (lg["gptq"], [20.20, 13.38, 20.12, 18.35])],
+                             [(lg["rtn"], [22.91, 14.30, 22.28, 19.02]), (lg["gptq"], [20.45, 13.38, 20.21, 18.13])],
                              25, decimals=2, markers=[18.79, 12.66, 17.91, 17.24], marker_label=lg["ref"], note=note)
     raise KeyError(name)
 

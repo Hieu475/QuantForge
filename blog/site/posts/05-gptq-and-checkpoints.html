@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps - QuantForge Notes</title>
-<meta name="description" content="Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 38 to 66 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.">
+<meta name="description" content="Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 47 to 60 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.">
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -13,11 +13,11 @@
   <nav><a href="../index.html">Posts</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/05-gptq-and-checkpoints.html" hreflang="vi">Tiếng Việt</a></nav>
 </div></header>
 <main class="wrap">
-<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps</h1><p class="lede">Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 38 to 66 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps</h1><p class="lede">Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 47 to 60 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.</p><details class="toc"><summary>Contents</summary><div class="toc">
 <ul>
 <li><a href="#round-to-nearest-the-baseline">Round-to-nearest: the baseline</a></li>
 <li><a href="#gptq-in-the-library">GPTQ in the library</a><ul>
-<li><a href="#a-pitfall-the-first-version-of-this-table-was-wrong">A pitfall: the first version of this table was wrong</a></li>
+<li><a href="#a-pitfall-the-first-version-of-this-table-was-wrong-and-so-was-the-second">A pitfall: the first version of this table was wrong, and so was the second</a></li>
 <li><a href="#things-that-did-not-help-so-they-are-off-by-default">Things that did not help (so they are off by default)</a></li>
 <li><a href="#how-robust-is-it">How robust is it?</a></li>
 </ul>
@@ -36,25 +36,25 @@
 <p><code>quantforge.gptq.quantize_model_gptq</code> implements sequential GPTQ (Frantar et al.) producing exactly the layouts the kernels consume:</p>
 <ol>
 <li>the decoder layers are run on 128 calibration windows of 512 tokens; the hidden states entering the first layer are captured with a stand-in module that records its inputs and aborts the forward pass;</li>
-<li>layer by layer, a forward pre-hook on every Linear accumulates the Hessian of its input, <code>H = 2 X^T X / n</code>, while the layer processes the calibration activations (with every token's norm capped at 30 times the median, see the pitfall below);</li>
+<li>layer by layer, a forward pre-hook on every Linear accumulates the Hessian of its input, <code>H = 2 X^T X / n</code>, while the layer processes the calibration activations (with every token's norm capped at 10 times the median, see the pitfall below);</li>
 <li>each Linear is quantised column by column; the error of every rounded column, scaled by the diagonal of the inverse Cholesky factor of <code>H</code>, is pushed onto the columns not yet quantised;</li>
 <li>the group scale and zero point are computed from the <em>updated</em> weights at the start of each group, with the scale rounded to f16 <strong>before</strong> the error is propagated so the optimisation sees the weights the kernel will actually use;</li>
 <li>the quantised layer is run again on the calibration set; its outputs are the inputs of the next layer (so later layers see the quantisation noise of earlier ones).</li>
 </ol>
-<p>Calibration takes 42 seconds for Qwen2.5-0.5B and 121 seconds for 1.5B on the 6 GB laptop GPU. Memory is bounded by one layer, its Hessians (the largest, <code>down_proj</code>, is <code>intermediate x intermediate</code> in f32) and the stored activations.</p>
+<p>Calibration takes 49 seconds for Qwen2.5-0.5B and about 150 seconds for 1.5B on the 6 GB laptop GPU. Memory is bounded by one layer, its Hessians (the largest, <code>down_proj</code>, is <code>intermediate x intermediate</code> in f32) and the stored activations.</p>
 <figure class="viz"><div class="viz-title">Wikitext-2 perplexity of the quantised models (lower is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>RTN INT4</span><span class="lg"><i class="sw s2"></i>GPTQ INT4</span><span class="lg"><i class="sw mk"></i>fp16 reference</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Wikitext-2 perplexity of the quantised models (lower is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">5</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">10</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">15</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">20</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">25</text><path class="s1" d="M104.2 268 V44.7 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - RTN INT4: 22.91</title></path><text class="val" x="121.2" y="35.7" text-anchor="middle">22.91</text><path class="s2" d="M140.2 268 V71.6 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - GPTQ INT4: 20.20</title></path><text class="val" x="157.2" y="62.6" text-anchor="middle">20.20</text><line class="marker" x1="99.2" y1="81.6" x2="179.2" y2="81.6"><title>Qwen2.5
+0.5B - RTN INT4: 22.91</title></path><text class="val" x="121.2" y="35.7" text-anchor="middle">22.91</text><path class="s2" d="M140.2 268 V69.1 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - GPTQ INT4: 20.45</title></path><text class="val" x="157.2" y="60.1" text-anchor="middle">20.45</text><line class="marker" x1="99.2" y1="81.6" x2="179.2" y2="81.6"><title>Qwen2.5
 0.5B - fp16 reference: 18.79</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V130.1 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
 1.5B - RTN INT4: 14.30</title></path><text class="val" x="295.8" y="121.1" text-anchor="middle">14.30</text><path class="s2" d="M314.8 268 V139.3 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
 1.5B - GPTQ INT4: 13.38</title></path><text class="val" x="331.8" y="130.3" text-anchor="middle">13.38</text><line class="marker" x1="273.8" y1="142.4" x2="353.8" y2="142.4"><title>Qwen2.5
 1.5B - fp16 reference: 12.66</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V51.0 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - RTN INT4: 22.28</title></path><text class="val" x="470.2" y="42.0" text-anchor="middle">22.28</text><path class="s2" d="M489.2 268 V72.4 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - GPTQ INT4: 20.12</title></path><text class="val" x="506.2" y="63.4" text-anchor="middle">20.12</text><line class="marker" x1="448.2" y1="90.3" x2="528.2" y2="90.3"><title>Llama-3.2
+1B - RTN INT4: 22.28</title></path><text class="val" x="470.2" y="42.0" text-anchor="middle">22.28</text><path class="s2" d="M489.2 268 V71.5 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - GPTQ INT4: 20.21</title></path><text class="val" x="506.2" y="62.5" text-anchor="middle">20.21</text><line class="marker" x1="448.2" y1="90.3" x2="528.2" y2="90.3"><title>Llama-3.2
 1B - fp16 reference: 17.91</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V83.3 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - RTN INT4: 19.02</title></path><text class="val" x="644.8" y="74.3" text-anchor="middle">19.02</text><path class="s2" d="M663.8 268 V90.0 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - GPTQ INT4: 18.35</title></path><text class="val" x="680.8" y="81.0" text-anchor="middle">18.35</text><line class="marker" x1="622.8" y1="97.0" x2="702.8" y2="97.0"><title>OLMo-2
-1B - fp16 reference: 17.24</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>Whole Wikitext-2 test split (564-584 windows of 512 tokens); GPTQ calibrated on 128 windows of 512 tokens from the train split; INT8 head in both variants.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>fp16 reference</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>22.91</td><td>20.20</td><td>18.79</td></tr><tr><th>Qwen2.5 1.5B</th><td>14.30</td><td>13.38</td><td>12.66</td></tr><tr><th>Llama-3.2 1B</th><td>22.28</td><td>20.12</td><td>17.91</td></tr><tr><th>OLMo-2 1B</th><td>19.02</td><td>18.35</td><td>17.24</td></tr></tbody></table></details></figure>
+1B - RTN INT4: 19.02</title></path><text class="val" x="644.8" y="74.3" text-anchor="middle">19.02</text><path class="s2" d="M663.8 268 V92.2 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - GPTQ INT4: 18.13</title></path><text class="val" x="680.8" y="83.2" text-anchor="middle">18.13</text><line class="marker" x1="622.8" y1="97.0" x2="702.8" y2="97.0"><title>OLMo-2
+1B - fp16 reference: 17.24</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>Whole Wikitext-2 test split (564-584 windows of 512 tokens); GPTQ calibrated on 128 windows of 512 tokens from the train split (token cap 10); INT8 head in both variants.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>RTN INT4</th><th>GPTQ INT4</th><th>fp16 reference</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>22.91</td><td>20.45</td><td>18.79</td></tr><tr><th>Qwen2.5 1.5B</th><td>14.30</td><td>13.38</td><td>12.66</td></tr><tr><th>Llama-3.2 1B</th><td>22.28</td><td>20.21</td><td>17.91</td></tr><tr><th>OLMo-2 1B</th><td>19.02</td><td>18.13</td><td>17.24</td></tr></tbody></table></details></figure>
 <table>
 <thead>
 <tr>
@@ -70,8 +70,8 @@
 <td>Qwen2.5-0.5B-Instruct</td>
 <td style="text-align: right;">18.79</td>
 <td style="text-align: right;">22.91</td>
-<td style="text-align: right;"><strong>20.20</strong></td>
-<td style="text-align: right;">66 %</td>
+<td style="text-align: right;"><strong>20.45</strong></td>
+<td style="text-align: right;">60 %</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B-Instruct</td>
@@ -84,20 +84,27 @@
 <td>Llama-3.2-1B-Instruct</td>
 <td style="text-align: right;">17.91</td>
 <td style="text-align: right;">22.28</td>
-<td style="text-align: right;"><strong>20.12</strong></td>
-<td style="text-align: right;">49 %</td>
+<td style="text-align: right;"><strong>20.21</strong></td>
+<td style="text-align: right;">47 %</td>
 </tr>
 <tr>
 <td>OLMo-2-0425-1B-Instruct</td>
 <td style="text-align: right;">17.24</td>
 <td style="text-align: right;">19.02</td>
-<td style="text-align: right;"><strong>18.35</strong></td>
-<td style="text-align: right;">38 %</td>
+<td style="text-align: right;"><strong>18.13</strong></td>
+<td style="text-align: right;">50 %</td>
+</tr>
+<tr>
+<td>Qwen2.5-3B-Instruct (no fp16 reference: does not fit)</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;">13.13</td>
+<td style="text-align: right;"><strong>12.06</strong></td>
+<td style="text-align: right;">-</td>
 </tr>
 </tbody>
 </table>
-<p>These are perplexities on the <strong>whole</strong> Wikitext-2 test split (564 to 584 windows of 512 tokens); calibration uses windows of the <em>train</em> split. Decode speed does not change (the layout is the same): about 226 tokens/s for either variant on Qwen2.5-0.5B.</p>
-<h3 id="a-pitfall-the-first-version-of-this-table-was-wrong">A pitfall: the first version of this table was wrong<a class="headerlink" href="#a-pitfall-the-first-version-of-this-table-was-wrong" title="Permanent link">#</a></h3>
+<p>These are perplexities on the <strong>whole</strong> Wikitext-2 test split (564 to 584 windows of 512 tokens); calibration uses 128 windows drawn from the first 20 000 rows of the <em>train</em> split. Decode speed does not change (the layout is the same).</p>
+<h3 id="a-pitfall-the-first-version-of-this-table-was-wrong-and-so-was-the-second">A pitfall: the first version of this table was wrong, and so was the second<a class="headerlink" href="#a-pitfall-the-first-version-of-this-table-was-wrong-and-so-was-the-second" title="Permanent link">#</a></h3>
 <p>My first measurement used only the first 8 test windows (4096 tokens), and on those GPTQ beat round-to-nearest on every model. Re-measuring on the whole test split showed that on <strong>Llama-3.2-1B GPTQ was worse than RTN (24.08 against 22.28)</strong> and on Qwen2.5-1.5B it recovered only 24 percent of the loss. Eight windows are simply too few for a method whose failures are rare. The investigation, in four steps:</p>
 <ol>
 <li><strong>Per-window losses</strong> (<code>benchmarks/ppl_per_window.py</code>): GPTQ was better than RTN in 83 percent of the windows (median gap -0.11 nats), but in a few windows it was completely broken, with a loss of 9 to 10 per token instead of about 3. A handful of such windows dominates the average.</li>
@@ -105,7 +112,39 @@
 <li><strong>Which layer?</strong> Quantising only <code>layers.1.mlp.down_proj</code> with RTN (all the others with GPTQ) brought Llama from 24.08 to 20.26. That layer creates the <em>massive activation</em> of the attention-sink token: its input contains one token whose norm is <strong>675 times the median</strong> (790 times in Qwen2.5-1.5B). In the same layer GPTQ's mean error over the calibration tokens was 2.5 to 5 times lower than RTN's, as designed, so a check of the average error cannot see the problem.</li>
 <li><strong>Why</strong>: that single token dominates the Hessian <code>H = 2 X^T X / n</code>, the error compensation is tuned to it, and the other tokens, and sink tokens in other positions, pay for it.</li>
 </ol>
-<p>A fixed list of layers is not a fix: forcing RTN on the massive-activation layers helps Llama (20.26) and Qwen-1.5B (13.47) but hurts Qwen-0.5B (20.83 against 20.20). What works for all three is a <strong>cap on the token norm in the Hessian</strong>: before a calibration token enters <code>H</code>, its norm is limited to 30 times the median token norm. The massive token still takes part, but with a bounded weight. Results: Llama 24.08 to <strong>20.12</strong>, Qwen-1.5B 13.91 to <strong>13.38</strong>, Qwen-0.5B unchanged (20.21 to 20.20). It is the default (<code>token_clip=30</code>).</p>
+<p>A fixed list of layers is not a fix: forcing RTN on the massive-activation layers helps Llama (20.26) and Qwen-1.5B (13.47) but hurts Qwen-0.5B (20.83 against 20.20). What works for all three is a <strong>cap on the token norm in the Hessian</strong>: before a calibration token enters <code>H</code>, its norm is limited to a multiple of the median token norm. The massive token still takes part, but with a bounded weight.</p>
+<p><strong>The second version was wrong too.</strong> I first chose a cap of 30, which fixed the whole-split perplexity (Llama 24.08 to 20.12). A slow regression test that I then wrote, on the five windows that had been broken, showed that <strong>one of them was still broken</strong> (window 70: loss 5.9 against 3.0 for fp16), although the perplexity of the whole split could not tell. A per-window analysis of all 564 windows settled the choice:</p>
+<table>
+<thead>
+<tr>
+<th>cap</th>
+<th style="text-align: right;">whole-split ppl</th>
+<th style="text-align: right;">windows where GPTQ is worse than RTN</th>
+<th style="text-align: right;">worst window against RTN</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>30</td>
+<td style="text-align: right;">20.123</td>
+<td style="text-align: right;">2 (1 %)</td>
+<td style="text-align: right;">+2.76 nats</td>
+</tr>
+<tr>
+<td><strong>10</strong></td>
+<td style="text-align: right;">20.192</td>
+<td style="text-align: right;"><strong>0</strong></td>
+<td style="text-align: right;">none</td>
+</tr>
+<tr>
+<td>5</td>
+<td style="text-align: right;">20.328</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">none</td>
+</tr>
+</tbody>
+</table>
+<p>The default is therefore <strong>10</strong> (<code>token_clip=10</code>): it costs about 0.07 perplexity points against 30 and removes the rare catastrophic windows. Lesson: for a method whose failures are rare, an average is the wrong acceptance criterion; the test that matters looks at the worst case.</p>
 <h3 id="things-that-did-not-help-so-they-are-off-by-default">Things that did not help (so they are off by default)<a class="headerlink" href="#things-that-did-not-help-so-they-are-off-by-default" title="Permanent link">#</a></h3>
 <ul>
 <li>per-group range clipping (<code>clip=True</code>): helps OLMo and Qwen-1.5B, ruins Llama-3.2-1B (30.9 on the first 8 windows against 23.4 without it): the weight-space rounding error it minimises is not the layer-output error GPTQ minimises;</li>
@@ -114,7 +153,7 @@
 <li>more calibration windows (256) or longer ones (2048 tokens): no consistent gain.</li>
 </ul>
 <h3 id="how-robust-is-it">How robust is it?<a class="headerlink" href="#how-robust-is-it" title="Permanent link">#</a></h3>
-<p>Three checks beyond a single perplexity number (all on the whole Wikitext-2 test split, GPTQ with the defaults):</p>
+<p>Three checks beyond a single perplexity number (whole Wikitext-2 test split, GPTQ with the defaults):</p>
 <table>
 <thead>
 <tr>
@@ -133,24 +172,24 @@
 </tr>
 <tr>
 <td>GPTQ, 3 calibration seeds</td>
-<td style="text-align: right;">20.35 / 20.31 / 20.46 (sd 0.08)</td>
-<td style="text-align: right;">20.10 / 19.97 / 19.81 (sd 0.15)</td>
+<td style="text-align: right;">20.45 / 20.46 / 20.48 (sd 0.01)</td>
+<td style="text-align: right;">20.21 / 20.22 / 20.25 (sd 0.02)</td>
 <td style="text-align: right;">13.38 (one seed)</td>
 </tr>
 <tr>
 <td>GPTQ, calibrated on cnn_dailymail articles instead of Wikitext</td>
-<td style="text-align: right;">20.67</td>
-<td style="text-align: right;">20.17</td>
-<td style="text-align: right;">13.54</td>
+<td style="text-align: right;">20.70</td>
+<td style="text-align: right;">20.43</td>
+<td style="text-align: right;">13.65</td>
 </tr>
 </tbody>
 </table>
 <ul>
-<li><strong>Seeds:</strong> the spread between random calibration windows is 0.1 to 0.15 perplexity points, an order of magnitude below the gap to RTN.</li>
-<li><strong>Another domain:</strong> calibrating on news articles and testing on Wikipedia costs 0.07 to 0.3 points and still beats RTN by two points or more. Note that the Wikitext-on-Wikitext numbers in the main table are <em>in-domain</em>, which flatters GPTQ slightly.</li>
-<li><strong>A bigger model:</strong> Qwen2.5-3B (which does not fit in fp16 on this card, so there is no fp16 reference): RTN 13.13, GPTQ <strong>11.97</strong>, 297 seconds of calibration.</li>
+<li><strong>Seeds:</strong> the spread between random calibration windows is 0.01 to 0.02 perplexity points, far below the gap to RTN. It was 0.08 to 0.15 with a cap of 30: bounding the influence of the massive token also stabilises the result.</li>
+<li><strong>Another domain:</strong> calibrating on news articles and testing on Wikipedia costs 0.2 to 0.3 points and still beats RTN by two points or more. The Wikitext-on-Wikitext numbers in the main table are <em>in-domain</em>, which flatters GPTQ slightly.</li>
+<li><strong>A bigger model:</strong> Qwen2.5-3B (no fp16 reference: it does not fit on this card): RTN 13.13, GPTQ <strong>12.06</strong>, 300 seconds of calibration.</li>
 </ul>
-<p><strong>A task instead of a likelihood.</strong> Zero-shot ARC accuracy (the scoring of lm-evaluation-harness: <code>acc</code> picks the choice with the highest log-likelihood, <code>acc_norm</code> the highest per character), in percent. The standard error is 1.0 points on ARC-Easy (2376 questions) and 1.4 on ARC-Challenge (1172):</p>
+<p><strong>A task instead of a likelihood.</strong> Zero-shot ARC accuracy of the GPTQ models next to fp16 and RTN (lm-evaluation-harness scoring: <code>acc</code> picks the choice with the highest log-likelihood, <code>acc_norm</code> the highest per character), in percent. Standard error: 1.0 points on ARC-Easy (2376 questions), 1.4 on ARC-Challenge (1172):</p>
 <table>
 <thead>
 <tr>
@@ -182,10 +221,10 @@
 <tr>
 <td></td>
 <td>GPTQ</td>
-<td style="text-align: right;">62.0</td>
-<td style="text-align: right;">60.9</td>
-<td style="text-align: right;">28.6</td>
-<td style="text-align: right;">32.2</td>
+<td style="text-align: right;">63.3</td>
+<td style="text-align: right;">60.5</td>
+<td style="text-align: right;">29.4</td>
+<td style="text-align: right;">33.0</td>
 </tr>
 <tr>
 <td>Llama-3.2-1B</td>
@@ -206,10 +245,10 @@
 <tr>
 <td></td>
 <td>GPTQ</td>
-<td style="text-align: right;">66.2</td>
-<td style="text-align: right;">61.2</td>
-<td style="text-align: right;">34.4</td>
-<td style="text-align: right;">36.3</td>
+<td style="text-align: right;">66.4</td>
+<td style="text-align: right;">62.5</td>
+<td style="text-align: right;">33.2</td>
+<td style="text-align: right;">36.9</td>
 </tr>
 <tr>
 <td>OLMo-2-1B</td>
@@ -230,10 +269,10 @@
 <tr>
 <td></td>
 <td>GPTQ</td>
-<td style="text-align: right;">70.9</td>
-<td style="text-align: right;">70.2</td>
-<td style="text-align: right;">40.3</td>
-<td style="text-align: right;">43.0</td>
+<td style="text-align: right;">70.4</td>
+<td style="text-align: right;">69.5</td>
+<td style="text-align: right;">39.3</td>
+<td style="text-align: right;">42.2</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B</td>
@@ -254,14 +293,14 @@
 <tr>
 <td></td>
 <td>GPTQ</td>
-<td style="text-align: right;"><strong>75.0</strong></td>
-<td style="text-align: right;"><strong>74.3</strong></td>
-<td style="text-align: right;"><strong>42.1</strong></td>
-<td style="text-align: right;"><strong>45.1</strong></td>
+<td style="text-align: right;"><strong>73.1</strong></td>
+<td style="text-align: right;"><strong>72.0</strong></td>
+<td style="text-align: right;"><strong>40.5</strong></td>
+<td style="text-align: right;"><strong>44.0</strong></td>
 </tr>
 </tbody>
 </table>
-<p>The surprise is <strong>Qwen2.5-1.5B</strong>: round-to-nearest loses 11 points on ARC-Easy (76.8 to 65.6) and 6.5 on ARC-Challenge, much more than its modest perplexity increase (12.66 to 14.30) suggests, and GPTQ brings it back to within 2 points of fp16. For the other three models the differences between fp16, RTN and GPTQ are mostly within the standard error: at INT4 these small models lose little on ARC either way. In other words, a perplexity table alone can hide a real quality problem, and it can also overstate one.</p>
+<p>The surprise is <strong>Qwen2.5-1.5B</strong>: round-to-nearest loses 11 points on ARC-Easy (76.8 to 65.6) and 6.5 on ARC-Challenge, much more than its modest perplexity increase (12.66 to 14.30) suggests, and GPTQ gets back 7.5 and 3.5 points of them. (With the earlier cap of 30 it got back 9.4 and 5.1: the differences are about two standard errors, so I would not call the cap of 10 worse on this model, but the data do not exclude it.) For the other three models the differences between fp16, RTN and GPTQ are mostly within the standard error: at INT4 these small models lose little on ARC either way. A perplexity table alone can hide a real quality problem, and it can also overstate one.</p>
 <h2 id="real-awq-and-gptq-checkpoints">Real AWQ and GPTQ checkpoints<a class="headerlink" href="#real-awq-and-gptq-checkpoints" title="Permanent link">#</a></h2>
 <p>Most 4-bit models on the Hub are AWQ or GPTQ files. <code>quantforge.nn.load_quantized_checkpoint(model, "model.safetensors", method="gptq" | "awq")</code> converts the int32-packed tensors into the kernel layout (<code>quant.from_gptq</code>, <code>quant.from_awq</code>), supports GPTQ <code>desc_act</code> checkpoints by permuting the rows offline (the activation permutation is applied by one small gather at run time) and the <code>gptq_v2</code> zero-point convention.</p>
 <p>Verification against a dense twin (the same dequantised weights in ordinary <code>nn.Linear</code> layers), Qwen2.5-0.5B-Instruct, 16 x 512 test tokens:</p>

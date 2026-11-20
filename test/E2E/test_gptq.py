@@ -91,3 +91,26 @@ def test_token_clip_keeps_a_massive_token_from_dominating_the_hessian():
         deq = (q.float() - zero.float().repeat_interleave(128, 0)) * scale.float().repeat_interleave(128, 0)
         errs[clip] = ((typical @ deq - typical @ w.t()) ** 2).mean().item()
     assert errs[30.0] < errs[0.0], errs
+
+
+def test_defaults_that_guard_against_the_massive_activation_failure():
+    """GPTQ was once worse than RTN on Llama-3.2-1B because a single massive-activation token dominated the Hessian;
+    the token-norm cap is the fix and must stay on by default (see the GPTQ post of the blog)."""
+    import inspect
+
+    import quantforge.gptq as qg
+
+    assert inspect.signature(qg.quantize_model_gptq).parameters["token_clip"].default == 10.0
+
+
+def test_outlier_ratio_is_reported_for_every_linear():
+    transformers = pytest.importorskip("transformers")
+    _require_gpu()
+    import quantforge.gptq as qg
+
+    torch.manual_seed(0)
+    cfg = transformers.LlamaConfig(vocab_size=512, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128)
+    model = transformers.LlamaForCausalLM(cfg).half().eval()
+    st = qg.quantize_model_gptq(model, torch.randint(0, 512, (8, 64)), group_size=64, verbose=False)
+    assert len(st["outlier_ratio"]) == 14 and all(r >= 1.0 for r in st["outlier_ratio"].values())

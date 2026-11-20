@@ -118,18 +118,18 @@ Marlin có phải là thước đo công bằng duy nhất? Cùng phương pháp
 
 ## Kết quả: toàn bộ model
 
-Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `quantforge.nn.quantize_model` thay các layer `nn.Linear` của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp `silu(gate) * up`. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token đầu của tập test Wikitext-2 (chỉ 8 cửa sổ: các giá trị trên toàn tập, thấp hơn 1 đến 2 điểm ở mọi model, nằm trong [bài về GPTQ](05-gptq-and-checkpoints.html)), INT4 round-to-nearest đơn giản (group 128) với head INT8.
+Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. `quantforge.nn.quantize_model` thay các layer `nn.Linear` của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp `silu(gate) * up`. Bảng là decode batch 1 với CUDA graph, perplexity trên toàn bộ tập test Wikitext-2 (dòng Phi: chỉ 8 cửa sổ đầu), INT4 round-to-nearest đơn giản (group 128) với head INT8.
 
 {{chart:e2e_speed}}
 
 | model | ppl fp16 | tok/s fp16 | ppl INT4 | tok/s INT4 | weight fp16 -> INT4 |
 |---|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B-Instruct | 19.93 | 129 | 24.08 | 209 | 0.72 -> 0.19 GB |
-| Qwen2.5-1.5B-Instruct | 13.48 | 49 | 15.31 | 97 | 2.62 -> 0.69 GB |
-| Qwen2.5-3B-Instruct | không vừa 6 GB | | 14.29 | 61 | 5.55 -> 1.45 GB |
-| Llama-3.2-1B-Instruct | 20.15 | 63 | 24.42 | 142 | 1.95 -> 0.51 GB |
-| OLMo-2-0425-1B-Instruct | 19.32 | 60 | 21.31 | 138 | 2.15 -> 0.56 GB |
-| Phi-3.5-mini-instruct (3.8B) | không vừa | | 9.62 | chưa đo | 7.25 -> 1.90 GB |
+| Qwen2.5-0.5B-Instruct | 18.79 | 120 | 22.91 | 197 | 0.72 -> 0.19 GB |
+| Qwen2.5-1.5B-Instruct | 12.66 | 48 | 14.30 | 91 | 2.62 -> 0.69 GB |
+| Qwen2.5-3B-Instruct | không vừa 6 GB | | 13.13 | ~61 | 5.55 -> 1.45 GB |
+| Llama-3.2-1B-Instruct | 17.91 | 63 | 22.28 | 132 | 1.95 -> 0.51 GB |
+| OLMo-2-0425-1B-Instruct | 17.24 | 57 | 19.02 | 129 | 2.15 -> 0.56 GB |
+| Phi-3.5-mini-instruct (3.8B) | không vừa | | 9.62 (8 cửa sổ) | chưa đo | 7.25 -> 1.90 GB |
 | Mistral-7B-Instruct-v0.3 (từ checkpoint NF4) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | đỉnh 4.65 GB |
 
 Một model 3B và một model 7B chạy được trên card 6 GB vốn không chứa nổi chúng ở fp16. Cái giá về perplexity của 4 bit round-to-nearest là có thật (1 đến 4 điểm); [bài về GPTQ](05-gptq-and-checkpoints.html) cho thấy một quantiser thông minh hơn lấy lại được bao nhiêu. Mức tăng tốc giảm khi model lớn lên, vì lm_head, attention và khoảng 1400 kernel nhỏ của đồ thị Hugging Face chiếm phần lớn hơn của mỗi bước.

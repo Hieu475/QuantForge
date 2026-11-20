@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--text", required=True)
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--group-size", type=int, default=128)
+    ap.add_argument("--token-clip", type=float, default=None, help="GPTQ token-norm cap (default: the library default)")
     ns = ap.parse_args()
     import pandas as pd
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -50,7 +51,7 @@ def main():
     m = load().cuda(); res["fp16"] = window_losses(m, ids, ns.seqlen); del m; gc.collect(); torch.cuda.empty_cache()
     m = load(); qnn.quantize_model(m, "int4", ns.group_size); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
     res["RTN"] = window_losses(m, ids, ns.seqlen); del m; gc.collect(); torch.cuda.empty_cache()
-    m = load(); qgptq.quantize_model_gptq(m, calib, ns.group_size, verbose=False); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
+    m = load(); qgptq.quantize_model_gptq(m, calib, ns.group_size, verbose=False, **({} if ns.token_clip is None else {"token_clip": ns.token_clip})); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
     res["GPTQ"] = window_losses(m, ids, ns.seqlen)
     n = len(res["fp16"])
     for name, l in res.items():

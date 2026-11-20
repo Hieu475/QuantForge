@@ -142,17 +142,18 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
 def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: int = 128,
                         damp: float = 0.01, act_order: bool = False, blocksize: int = 128, clip: bool = False,
                         fuse: bool = True, device="cuda", verbose: bool = True, rtn: tuple = (),
-                        token_clip: float = 30.0) -> dict:
+                        token_clip: float = 10.0) -> dict:
     """GPTQ-quantise every Linear inside the decoder layers of `model` (fp16, e.g. loaded on the CPU) to
     INT4 and replace them with :class:`QuantLinear`. ``calib_ids`` is ``[nsamples, seqlen]`` token ids
     (see :func:`calibration_ids`); the ``lm_head`` / embeddings are left alone (use
     ``quantize_model(model, 'int8', only=('lm_head',), fuse=False)`` for the head afterwards).
-    ``token_clip`` (default 30, 0 = off): before a calibration token enters the Hessian its norm is capped at
+    ``token_clip`` (default 10, 0 = off): before a calibration token enters the Hessian its norm is capped at
     ``token_clip`` times the median token norm. A few "massive activation" tokens (the attention sink; the inputs of the
     ``down_proj`` of one early layer have a token 300 to 800 times the median norm in Llama-3.2 and Qwen2.5) otherwise
     dominate the Hessian, and the compensation then ruins other tokens: without the cap GPTQ was *worse than
-    round-to-nearest* on the whole Wikitext-2 test set for Llama-3.2-1B (24.08 against 22.28; with the cap 20.12) and gave
-    half of the possible gain on Qwen2.5-1.5B (13.91; with the cap 13.38).
+    round-to-nearest* on the whole Wikitext-2 test set for Llama-3.2-1B (24.08 against 22.28; with the cap 20.19). A cap of 30
+    fixed the average but left rare windows broken (window 70: loss 5.9 against 3.0 for fp16); 10 leaves none (0 of 564 windows
+    worse than round-to-nearest) and costs 0.07 perplexity points against 30; 5 costs 0.2.
 
     ``rtn``: exact names ``"<layer index>.<module path>"`` (e.g. ``"1.mlp.down_proj"``) of Linears that are quantised
     with plain round-to-nearest instead of GPTQ (see the note on massive-activation layers in the blog / README).

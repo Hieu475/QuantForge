@@ -351,16 +351,16 @@
 <li>Cả ba kernel INT4 chạm cùng giới hạn DRAM khoảng 50 micro giây ở 4096 x 4096 batch 1, đúng là kết quả cần có cho một kernel bị giới hạn bộ nhớ.</li>
 </ul>
 <h2 id="ket-qua-toan-bo-model">Kết quả: toàn bộ model<a class="headerlink" href="#ket-qua-toan-bo-model" title="Permanent link">#</a></h2>
-<p>Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. <code>quantforge.nn.quantize_model</code> thay các layer <code>nn.Linear</code> của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp <code>silu(gate) * up</code>. Bảng là decode batch 1 với CUDA graph, perplexity trên 8 x 512 token đầu của tập test Wikitext-2 (chỉ 8 cửa sổ: các giá trị trên toàn tập, thấp hơn 1 đến 2 điểm ở mọi model, nằm trong <a href="05-gptq-and-checkpoints.html">bài về GPTQ</a>), INT4 round-to-nearest đơn giản (group 128) với head INT8.</p>
-<figure class="viz"><div class="viz-title">Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>fp16 (Hugging Face)</span><span class="lg"><i class="sw s2"></i>QuantForge INT4 + head INT8</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">48</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">96</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">144</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">192</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">240</text><path class="s1" d="M104.2 268 V138.7 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - fp16 (Hugging Face): 129</title></path><text class="val" x="121.2" y="129.7" text-anchor="middle">129</text><path class="s2" d="M140.2 268 V56.0 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-0.5B - QuantForge INT4 + head INT8: 209</title></path><text class="val" x="157.2" y="47.0" text-anchor="middle">209</text><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V221.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-1.5B - fp16 (Hugging Face): 49</title></path><text class="val" x="295.8" y="212.4" text-anchor="middle">49</text><path class="s2" d="M314.8 268 V171.8 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
-1.5B - QuantForge INT4 + head INT8: 97</title></path><text class="val" x="331.8" y="162.8" text-anchor="middle">97</text><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V206.9 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - fp16 (Hugging Face): 63</title></path><text class="val" x="470.2" y="197.9" text-anchor="middle">63</text><path class="s2" d="M489.2 268 V125.3 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
-1B - QuantForge INT4 + head INT8: 142</title></path><text class="val" x="506.2" y="116.3" text-anchor="middle">142</text><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V210.0 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - fp16 (Hugging Face): 60</title></path><text class="val" x="644.8" y="201.0" text-anchor="middle">60</text><path class="s2" d="M663.8 268 V129.4 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
-1B - QuantForge INT4 + head INT8: 138</title></path><text class="val" x="680.8" y="120.4" text-anchor="middle">138</text><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>RTX 4050 Laptop, 6 GB. INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>fp16 (Hugging Face)</th><th>QuantForge INT4 + head INT8</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>129</td><td>209</td></tr><tr><th>Qwen2.5 1.5B</th><td>49</td><td>97</td></tr><tr><th>Llama-3.2 1B</th><td>63</td><td>142</td></tr><tr><th>OLMo-2 1B</th><td>60</td><td>138</td></tr></tbody></table></details></figure>
+<p>Kernel chỉ hữu ích nếu một model thật chạy đúng và nhanh hơn. <code>quantforge.nn.quantize_model</code> thay các layer <code>nn.Linear</code> của bất kỳ causal LM Hugging Face nào, gộp các phép chiếu q/k/v thành một GEMM và các phép chiếu gate/up của MLP SiLU-gated thành một GEMM với epilogue gộp <code>silu(gate) * up</code>. Bảng là decode batch 1 với CUDA graph, perplexity trên toàn bộ tập test Wikitext-2 (dòng Phi: chỉ 8 cửa sổ đầu), INT4 round-to-nearest đơn giản (group 128) với head INT8.</p>
+<figure class="viz"><div class="viz-title">Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>fp16 (Hugging Face)</span><span class="lg"><i class="sw s2"></i>QuantForge INT4 + head INT8</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Tốc độ decode batch 1 với CUDA graph (token mỗi giây, càng cao càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">48</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">96</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">144</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">192</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">240</text><path class="s1" d="M104.2 268 V148.0 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - fp16 (Hugging Face): 120</title></path><text class="val" x="121.2" y="139.0" text-anchor="middle">120</text><path class="s2" d="M140.2 268 V68.4 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - QuantForge INT4 + head INT8: 197</title></path><text class="val" x="157.2" y="59.4" text-anchor="middle">197</text><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M278.8 268 V222.4 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - fp16 (Hugging Face): 48</title></path><text class="val" x="295.8" y="213.4" text-anchor="middle">48</text><path class="s2" d="M314.8 268 V178.0 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - QuantForge INT4 + head INT8: 91</title></path><text class="val" x="331.8" y="169.0" text-anchor="middle">91</text><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M453.2 268 V206.9 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - fp16 (Hugging Face): 63</title></path><text class="val" x="470.2" y="197.9" text-anchor="middle">63</text><path class="s2" d="M489.2 268 V135.6 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - QuantForge INT4 + head INT8: 132</title></path><text class="val" x="506.2" y="126.6" text-anchor="middle">132</text><text class="lab" x="488.2" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V213.1 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - fp16 (Hugging Face): 57</title></path><text class="val" x="644.8" y="204.1" text-anchor="middle">57</text><path class="s2" d="M663.8 268 V138.7 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - QuantForge INT4 + head INT8: 129</title></path><text class="val" x="680.8" y="129.7" text-anchor="middle">129</text><text class="lab" x="662.8" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>RTX 4050 Laptop, 6 GB; trung bình 7 lần chạy xen kẽ trong một phiên (độ dao động ở bảng bên dưới). INT4 round-to-nearest, group size 128. Qwen2.5-3B và Phi-3.5 không vừa fp16 trên card này.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>fp16 (Hugging Face)</th><th>QuantForge INT4 + head INT8</th></tr></thead><tbody><tr><th>Qwen2.5 0.5B</th><td>120</td><td>197</td></tr><tr><th>Qwen2.5 1.5B</th><td>48</td><td>91</td></tr><tr><th>Llama-3.2 1B</th><td>63</td><td>132</td></tr><tr><th>OLMo-2 1B</th><td>57</td><td>129</td></tr></tbody></table></details></figure>
 <table>
 <thead>
 <tr>
@@ -375,49 +375,49 @@
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B-Instruct</td>
-<td style="text-align: right;">19.93</td>
-<td style="text-align: right;">129</td>
-<td style="text-align: right;">24.08</td>
-<td style="text-align: right;">209</td>
+<td style="text-align: right;">18.79</td>
+<td style="text-align: right;">120</td>
+<td style="text-align: right;">22.91</td>
+<td style="text-align: right;">197</td>
 <td style="text-align: right;">0.72 -&gt; 0.19 GB</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B-Instruct</td>
-<td style="text-align: right;">13.48</td>
-<td style="text-align: right;">49</td>
-<td style="text-align: right;">15.31</td>
-<td style="text-align: right;">97</td>
+<td style="text-align: right;">12.66</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">14.30</td>
+<td style="text-align: right;">91</td>
 <td style="text-align: right;">2.62 -&gt; 0.69 GB</td>
 </tr>
 <tr>
 <td>Qwen2.5-3B-Instruct</td>
 <td style="text-align: right;">không vừa 6 GB</td>
 <td style="text-align: right;"></td>
-<td style="text-align: right;">14.29</td>
-<td style="text-align: right;">61</td>
+<td style="text-align: right;">13.13</td>
+<td style="text-align: right;">~61</td>
 <td style="text-align: right;">5.55 -&gt; 1.45 GB</td>
 </tr>
 <tr>
 <td>Llama-3.2-1B-Instruct</td>
-<td style="text-align: right;">20.15</td>
+<td style="text-align: right;">17.91</td>
 <td style="text-align: right;">63</td>
-<td style="text-align: right;">24.42</td>
-<td style="text-align: right;">142</td>
+<td style="text-align: right;">22.28</td>
+<td style="text-align: right;">132</td>
 <td style="text-align: right;">1.95 -&gt; 0.51 GB</td>
 </tr>
 <tr>
 <td>OLMo-2-0425-1B-Instruct</td>
-<td style="text-align: right;">19.32</td>
-<td style="text-align: right;">60</td>
-<td style="text-align: right;">21.31</td>
-<td style="text-align: right;">138</td>
+<td style="text-align: right;">17.24</td>
+<td style="text-align: right;">57</td>
+<td style="text-align: right;">19.02</td>
+<td style="text-align: right;">129</td>
 <td style="text-align: right;">2.15 -&gt; 0.56 GB</td>
 </tr>
 <tr>
 <td>Phi-3.5-mini-instruct (3.8B)</td>
 <td style="text-align: right;">không vừa</td>
 <td style="text-align: right;"></td>
-<td style="text-align: right;">9.62</td>
+<td style="text-align: right;">9.62 (8 cửa sổ)</td>
 <td style="text-align: right;">chưa đo</td>
 <td style="text-align: right;">7.25 -&gt; 1.90 GB</td>
 </tr>

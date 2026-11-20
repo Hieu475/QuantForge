@@ -118,18 +118,18 @@ Reading it:
 
 ## Results: whole models
 
-The kernels are only useful if a real model runs correctly and faster. `quantforge.nn.quantize_model` replaces the `nn.Linear` layers of any Hugging Face causal LM, fuses the q/k/v projections into one GEMM and the gate/up projections of a SiLU-gated MLP into one GEMM with a fused `silu(gate) * up` epilogue. The table is batch-1 decode with a CUDA graph, perplexity on the first 8 x 512 tokens of the Wikitext-2 test split (only 8 windows: the whole-split values, 1 to 2 points lower for every model, are in [the GPTQ post](05-gptq-and-checkpoints.html)), simple round-to-nearest INT4 (group 128) with an INT8 head.
+The kernels are only useful if a real model runs correctly and faster. `quantforge.nn.quantize_model` replaces the `nn.Linear` layers of any Hugging Face causal LM, fuses the q/k/v projections into one GEMM and the gate/up projections of a SiLU-gated MLP into one GEMM with a fused `silu(gate) * up` epilogue. The table is batch-1 decode with a CUDA graph, perplexity on the whole Wikitext-2 test split (the Phi row: first 8 windows only), simple round-to-nearest INT4 (group 128) with an INT8 head.
 
 {{chart:e2e_speed}}
 
 | model | fp16 ppl | fp16 tok/s | INT4 ppl | INT4 tok/s | weights fp16 -> INT4 |
 |---|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B-Instruct | 19.93 | 129 | 24.08 | 209 | 0.72 -> 0.19 GB |
-| Qwen2.5-1.5B-Instruct | 13.48 | 49 | 15.31 | 97 | 2.62 -> 0.69 GB |
-| Qwen2.5-3B-Instruct | does not fit in 6 GB | | 14.29 | 61 | 5.55 -> 1.45 GB |
-| Llama-3.2-1B-Instruct | 20.15 | 63 | 24.42 | 142 | 1.95 -> 0.51 GB |
-| OLMo-2-0425-1B-Instruct | 19.32 | 60 | 21.31 | 138 | 2.15 -> 0.56 GB |
-| Phi-3.5-mini-instruct (3.8B) | does not fit | | 9.62 | not measured | 7.25 -> 1.90 GB |
+| Qwen2.5-0.5B-Instruct | 18.79 | 120 | 22.91 | 197 | 0.72 -> 0.19 GB |
+| Qwen2.5-1.5B-Instruct | 12.66 | 48 | 14.30 | 91 | 2.62 -> 0.69 GB |
+| Qwen2.5-3B-Instruct | does not fit in 6 GB | | 13.13 | ~61 | 5.55 -> 1.45 GB |
+| Llama-3.2-1B-Instruct | 17.91 | 63 | 22.28 | 132 | 1.95 -> 0.51 GB |
+| OLMo-2-0425-1B-Instruct | 17.24 | 57 | 19.02 | 129 | 2.15 -> 0.56 GB |
+| Phi-3.5-mini-instruct (3.8B) | does not fit | | 9.62 (8 windows) | not measured | 7.25 -> 1.90 GB |
 | Mistral-7B-Instruct-v0.3 (from an NF4 checkpoint) | | | 8.51 (bitsandbytes NF4: 8.37) | 35.3 (bitsandbytes: 36.0) | 4.65 GB peak |
 
 A 3B and a 7B model run on a 6 GB card that cannot even hold them in fp16. The perplexity cost of round-to-nearest 4-bit is real (1 to 4 points); [the GPTQ post](05-gptq-and-checkpoints.html) shows how much of it a smarter quantiser recovers. The speed-up shrinks as the model grows because the lm_head, attention and the roughly 1400 small kernels of the Hugging Face graph take a larger share of each step.

@@ -49,7 +49,7 @@ come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop 
 
 ### Against other kernels (gemlite, bitsandbytes)
 
-Same method as above (`benchmarks/compare_baselines.py`, [`benchmarks/baselines_rtx4050_sm89.json`](benchmarks/baselines_rtx4050_sm89.json)),
+Same method as above (`benchmarks/compare_baselines.py`, [`benchmarks/compare_baselines_rtx4050_sm89.json`](benchmarks/compare_baselines_rtx4050_sm89.json)),
 kernel time in µs, the fastest of the three INT4 kernels in bold. gemlite is a Triton W4A16 kernel (0.6.0, its own autotuner,
 same INT4 weights and scales); bitsandbytes uses its NF4 code book on the same fp16 matrix (a different quantiser, listed for speed
 only); cuBLAS reads the pre-dequantised fp16 weights (4× the bytes).
@@ -137,7 +137,7 @@ ctest --test-dir build -L lit                     # same, via CTest
 # python with torch + pytest). Skipped automatically when unavailable.
 QUANTFORGE_BUILD_DIR=$PWD/build python -m pytest -v
 scripts/ci_gpu_preflight.sh                       # checks a (CI) machine: toolchain, CUDA, torch, RAM
-scripts/sanitize.sh                               # compute-sanitizer memcheck + racecheck (22 pipeline variants)
+scripts/sanitize.sh                               # compute-sanitizer memcheck + racecheck (27 pipeline variants, 54 runs)
 python python/quantforge/benchmark.py --cold --group-size 128 --shape 1x4096x4096 \
     "decode=true" --compare benchmarks/baseline_decode_rtx4050_sm89.json   # perf regression (--cold: DRAM weights)
 scripts/check.sh --gpu --sanitize                 # everything
@@ -216,24 +216,25 @@ vs 26.335, 59/59 greedy tokens identical, 182 tok/s CUDA-graph decode; AWQ ppl 2
 **a real FP8 checkpoint** (`RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic`, `method="fp8"`, per-channel scales expanded to group 128)
 ppl 22.543 vs 22.543 for its twin and 22.441 for the fp16 base model (greedy decoding diverges after 28 of 59 tokens: near-ties
 flip under the different fp16 rounding of the twin's matmul; the logits agree to 99.4 % top-1).
-Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (RTN, group 128, wikitext-2 8 x 512,
-CUDA-graph decode on the 6 GB RTX 4050):
+Example with perplexity and decode speed: `benchmarks/hf_quantize_model.py` (RTN INT4, group 128, INT8 head). Perplexity on the
+**whole** Wikitext-2 test split (the Phi row: first 8 windows only, marked *); decode speed is the mean of 7 interleaved CUDA-graph
+runs in one session on the 6 GB RTX 4050 (`benchmarks/decode_repeat.py`, spread in the table below):
 
-| model | fp16 | INT4 | INT4 + INT8 head |
-|---|---|---|---|
-| Qwen2.5-0.5B-Instruct | ppl 19.93, 129 tok/s | 24.09, 183 tok/s | 24.08, 209 tok/s |
-| Qwen2.5-1.5B-Instruct | 13.48, 49 tok/s (3.1 GB) | - | 15.31, 97 tok/s (1.5 GB) |
-| Qwen2.5-3B-Instruct | does not fit in 6 GB | - | 14.29, 61 tok/s (2.5 GB) |
-| Llama-3.2-1B-Instruct | 20.15, 63 tok/s (2.5 GB) | - | 24.42, 142 tok/s (1.3 GB) |
-| OLMo-2-0425-1B-Instruct | 19.32, 60 tok/s (3.0 GB) | - | 21.31, 138 tok/s (1.2 GB) |
-| Phi-3.5-mini-instruct (3.8B) | does not fit in 6 GB | - | 9.62, 2.2 GB (gate_up_proj fused into swiglu; CUDA-graph capture fails inside HF's LongRoPE) |
+| model | fp16 | INT4 + INT8 head |
+|---|---|---|
+| Qwen2.5-0.5B-Instruct | ppl 18.79, 120 tok/s | 22.91, 197 tok/s |
+| Qwen2.5-1.5B-Instruct | 12.66, 48 tok/s (3.1 GB) | 14.30, 91 tok/s (1.5 GB) |
+| Qwen2.5-3B-Instruct | does not fit in 6 GB | 13.13, ~61 tok/s (2.5 GB; speed from an earlier session) |
+| Llama-3.2-1B-Instruct | 17.91, 63 tok/s (2.5 GB) | 22.28, 132 tok/s (1.3 GB) |
+| OLMo-2-0425-1B-Instruct | 17.24, 57 tok/s (3.0 GB) | 19.02, 129 tok/s (1.2 GB) |
+| Phi-3.5-mini-instruct (3.8B) | does not fit in 6 GB | 9.62 *, 2.2 GB (gate_up_proj fused into swiglu; CUDA-graph capture fails inside HF's LongRoPE) |
 
 `--compile` (`torch.compile` of the quantised model before the CUDA-graph capture, which fuses HF's norm / rotary /
 elementwise kernels) adds ~10 % on the 0.5B model (206 -> 226 tok/s, 86 of 96 greedy tokens identical: fp16 rounding
 differs), 4 % on Qwen2.5-1.5B (97 -> 101) and 3 % on Llama-3.2-1B (142 -> 146); the share of those kernels shrinks as
 the GEMMs grow.
 
-(RTN INT4 costs 1-4 perplexity points; quantise with GPTQ / AWQ and wrap the result with
+(RTN INT4 costs 2-4 perplexity points on these models; quantise with GPTQ / AWQ and wrap the result with
 `QuantLinear.from_quantized` for a better quality.) Layers are quantised in row chunks, so the 150k-row
 `lm_head` of a 3B model needs no fp32 copy of itself on the GPU.
 
@@ -247,16 +248,18 @@ qnn.quantize_model(model, "int8", only=("lm_head",), fuse=False)                
 ```
 
 Sequential GPTQ (Hessian of every Linear input from the already quantised blocks, column-wise error compensation
-through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated). 42 s for Qwen2.5-0.5B,
-121 s for 1.5B on the RTX 4050. Wikitext-2 perplexity on the **whole test split** (564-584 windows of 512 tokens;
-calibration: 128 x 512 tokens of the *train* split; INT8 head; `benchmarks/hf_gptq.py --nseq 0 --fp16`):
+through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated, calibration token norms capped at
+10x the median, see below). 49 s for Qwen2.5-0.5B, ~150 s for 1.5B, 300 s for 3B on the RTX 4050. Wikitext-2 perplexity on the
+**whole test split** (564-584 windows of 512 tokens; calibration: 128 x 512 tokens from the first 20 000 rows of the *train* split;
+INT8 head; `benchmarks/hf_gptq.py --nseq 0 --fp16`):
 
 | model | fp16 | RTN INT4 | GPTQ INT4 | share of the RTN loss recovered |
 |---|--:|--:|--:|--:|
-| Qwen2.5-0.5B-Instruct | 18.79 | 22.91 | **20.20** | 66 % |
+| Qwen2.5-0.5B-Instruct | 18.79 | 22.91 | **20.45** | 60 % |
 | Qwen2.5-1.5B-Instruct | 12.66 | 14.30 | **13.38** | 56 % |
-| Llama-3.2-1B-Instruct | 17.91 | 22.28 | **20.12** | 49 % |
-| OLMo-2-0425-1B-Instruct | 17.24 | 19.02 | **18.35** | 38 % |
+| Llama-3.2-1B-Instruct | 17.91 | 22.28 | **20.21** | 47 % |
+| OLMo-2-0425-1B-Instruct | 17.24 | 19.02 | **18.13** | 50 % |
+| Qwen2.5-3B-Instruct (no fp16 reference: does not fit) | - | 13.13 | **12.06** | - |
 
 The speed of the kernels does not change (same layout).
 
@@ -266,36 +269,37 @@ whole test split it was *worse than RTN on Llama-3.2-1B* (24.08 against 22.28) a
 (loss 9-10 per token instead of ~3), and a layer-by-layer comparison traced it to `layers.1.mlp.down_proj`: the layer that
 creates the "massive activation" of the attention-sink token (its input has a token 675x the median norm in Llama-3.2,
 790x in Qwen2.5-1.5B). That token dominates the Hessian and the error compensation then damages other tokens. Capping every
-calibration token's norm at 30x the median before it enters the Hessian (`token_clip=30`, the default) fixes it without
-touching the models that were fine: Llama 24.08 -> 20.12, Qwen-1.5B 13.91 -> 13.38, Qwen-0.5B 20.21 -> 20.20. (Quantising just
-that one layer with RTN also fixes Llama, 20.26, and Qwen-1.5B, 13.47, but *hurts* Qwen-0.5B, 20.83, so a fixed list of layers does
-not work.) Options that did not help consistently, hence off by default: `clip=True` (per-group range shrinking: helps
-OLMo and Qwen-1.5B, ruins Llama), `act_order=True` (the layers lose the q/k/v fusion), larger damping (0.1 turns Llama into 58 ppl
-before the cap) and more calibration windows.
+calibration token's norm at a multiple of the median before it enters the Hessian (`token_clip`) fixes it. A cap of 30 fixed the
+whole-split perplexity (Llama 20.12) but a slow regression test on the windows that had been broken (`test/E2E/test_gptq_real_model.py`)
+showed one still broken (window 70: loss 5.9 against 3.0 for fp16); a per-window analysis of all 564 windows found no window worse than
+round-to-nearest at a cap of 10 (30: two windows, one by 2.8 nats; 5: none, but 0.2 ppl worse), so **10 is the default**
+(`token_clip=10`; cost: ~0.07 ppl against 30). Quantising just the massive-activation layer with RTN also fixes Llama, but *hurts*
+Qwen-0.5B, so a fixed list of layers does not work. Options that did not help consistently, hence off by default: `clip=True`
+(per-group range shrinking), `act_order=True` (the layers lose the q/k/v fusion), larger damping, more calibration windows.
 
-**How robust is it?** (`benchmarks/hf_gptq.py --seed/--train`, `benchmarks/arc_eval.py`; whole Wikitext-2 test split)
+**How robust is it?** (`benchmarks/hf_gptq.py --seed/--train`, `benchmarks/arc_eval.py`; whole Wikitext-2 test split, cap 10)
 
 | check | Qwen2.5-0.5B | Llama-3.2-1B | Qwen2.5-1.5B |
 |---|--:|--:|--:|
 | RTN INT4 | 22.91 | 22.28 | 14.30 |
-| GPTQ, Wikitext-2 calibration, 3 seeds (windows from the first 20 000 train rows) | 20.35 / 20.31 / 20.46 (sd 0.08) | 20.10 / 19.97 / 19.81 (sd 0.15) | 13.38 (one seed) |
-| GPTQ, calibration on a different corpus (cnn_dailymail articles) | 20.67 | 20.17 | 13.54 |
+| GPTQ, Wikitext-2 calibration, 3 seeds | 20.45 / 20.46 / 20.48 (sd 0.01) | 20.21 / 20.22 / 20.25 (sd 0.02) | 13.38 (one seed) |
+| GPTQ, calibration on a different corpus (cnn_dailymail articles) | 20.70 | 20.43 | 13.65 |
 
-The spread between calibration seeds (0.1-0.15) is an order of magnitude smaller than the gap to RTN (2-3 points); calibrating on another
-domain costs 0.07-0.3 points on Wikitext-2 and still beats RTN by 2 points or more (the numbers above are *in-domain* for the first row).
-Qwen2.5-3B (does not fit in fp16 on the 6 GB card): RTN 13.13, GPTQ 11.97 (297 s calibration). Zero-shot ARC accuracy (lm-evaluation-harness scoring, `acc` / `acc_norm`,
-%; standard error 1.0 pp on ARC-Easy, n = 2376, 1.4 pp on ARC-Challenge, n = 1172):
+The spread between calibration seeds is 0.01-0.02 (it was 0.08-0.15 with a cap of 30: the cap also stabilises the result); calibrating on
+another domain costs 0.2-0.3 points on Wikitext-2 and still beats RTN by 2 points or more (the numbers in the first row are *in-domain*).
+Zero-shot ARC accuracy of the GPTQ models (lm-evaluation-harness scoring, `acc` / `acc_norm`, %; standard error 1.0 pp on ARC-Easy, n = 2376,
+1.4 pp on ARC-Challenge, n = 1172):
 
 | model | variant | ARC-Easy | ARC-Challenge |
 |---|---|--:|--:|
-| Qwen2.5-0.5B | fp16 / RTN / GPTQ | 65.6 / 62.5 / 62.0 · 59.2 / 59.3 / 60.9 | 30.7 / 31.7 / 28.6 · 33.8 / 32.3 / 32.2 |
-| Llama-3.2-1B | fp16 / RTN / GPTQ | 69.0 / 64.3 / 66.2 · 63.8 / 60.4 / 61.2 | 34.6 / 33.5 / 34.4 · 37.9 / 35.3 / 36.3 |
-| OLMo-2-1B | fp16 / RTN / GPTQ | 71.8 / 71.2 / 70.9 · 71.0 / 68.3 / 70.2 | 41.0 / 39.8 / 40.3 · 42.0 / 40.7 / 43.0 |
-| Qwen2.5-1.5B | fp16 / RTN / GPTQ | 76.8 / 65.6 / **75.0** · 76.0 / 62.3 / **74.3** | 43.5 / 37.0 / **42.1** · 46.7 / 39.7 / **45.1** |
+| Qwen2.5-0.5B | fp16 / RTN / GPTQ | 65.6 / 62.5 / 63.3 · 59.2 / 59.3 / 60.5 | 30.7 / 31.7 / 29.4 · 33.8 / 32.3 / 33.0 |
+| Llama-3.2-1B | fp16 / RTN / GPTQ | 69.0 / 64.3 / 66.4 · 63.8 / 60.4 / 62.5 | 34.6 / 33.5 / 33.2 · 37.9 / 35.3 / 36.9 |
+| OLMo-2-1B | fp16 / RTN / GPTQ | 71.8 / 71.2 / 70.4 · 71.0 / 68.3 / 69.5 | 41.0 / 39.8 / 39.3 · 42.0 / 40.7 / 42.2 |
+| Qwen2.5-1.5B | fp16 / RTN / GPTQ | 76.8 / 65.6 / **73.1** · 76.0 / 62.3 / **72.0** | 43.5 / 37.0 / **40.5** · 46.7 / 39.7 / **44.0** |
 
 (each cell: `acc` triple, then `acc_norm` triple.) Perplexity understated the damage of round-to-nearest on Qwen2.5-1.5B: it loses 11 points on ARC-Easy
-(76.8 -> 65.6) and GPTQ gets back to within 2 points; for the other three models the differences between the variants are mostly within the
-standard error, i.e. these small models lose little on ARC at INT4 either way.
+(76.8 -> 65.6) and GPTQ gets back 7.5 of them (73.1; 75.0 with a cap of 30, within about 2 standard errors); for the other three models the differences
+between the variants are mostly within the standard error, i.e. these small models lose little on ARC at INT4 either way.
 
 **Run-to-run spread** (`benchmarks/decode_repeat.py`, `benchmarks/kernel_repeat.py`). Batch-1 CUDA-graph decode, 7 repetitions with fp16 and INT4
 (+ INT8 head) interleaved, mean +- standard deviation, one session:

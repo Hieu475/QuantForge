@@ -2,7 +2,7 @@
 title: Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps
 date: 2026-11-20
 order: 5
-summary: Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 38 to 66 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.
+summary: Round-to-nearest INT4 costs 2 to 4 perplexity points. A GPTQ implementation recovers 47 to 60 percent of that, after a debugging story about massive activations that made it worse than RTN on Llama. Real AWQ, GPTQ (including act-order) and FP8 checkpoints are loaded and verified.
 ---
 
 Fast kernels are only half of a quantisation story: the other half is how much quality the 4-bit weights lose. The library therefore has two ways to obtain weights, a one-line round-to-nearest quantiser and a calibrated one, and it can load checkpoints produced by other tools.
@@ -16,25 +16,26 @@ Fast kernels are only half of a quantisation story: the other half is how much q
 `quantforge.gptq.quantize_model_gptq` implements sequential GPTQ (Frantar et al.) producing exactly the layouts the kernels consume:
 
 1. the decoder layers are run on 128 calibration windows of 512 tokens; the hidden states entering the first layer are captured with a stand-in module that records its inputs and aborts the forward pass;
-2. layer by layer, a forward pre-hook on every Linear accumulates the Hessian of its input, `H = 2 X^T X / n`, while the layer processes the calibration activations (with every token's norm capped at 30 times the median, see the pitfall below);
+2. layer by layer, a forward pre-hook on every Linear accumulates the Hessian of its input, `H = 2 X^T X / n`, while the layer processes the calibration activations (with every token's norm capped at 10 times the median, see the pitfall below);
 3. each Linear is quantised column by column; the error of every rounded column, scaled by the diagonal of the inverse Cholesky factor of `H`, is pushed onto the columns not yet quantised;
 4. the group scale and zero point are computed from the *updated* weights at the start of each group, with the scale rounded to f16 **before** the error is propagated so the optimisation sees the weights the kernel will actually use;
 5. the quantised layer is run again on the calibration set; its outputs are the inputs of the next layer (so later layers see the quantisation noise of earlier ones).
 
-Calibration takes 42 seconds for Qwen2.5-0.5B and 121 seconds for 1.5B on the 6 GB laptop GPU. Memory is bounded by one layer, its Hessians (the largest, `down_proj`, is `intermediate x intermediate` in f32) and the stored activations.
+Calibration takes 49 seconds for Qwen2.5-0.5B and about 150 seconds for 1.5B on the 6 GB laptop GPU. Memory is bounded by one layer, its Hessians (the largest, `down_proj`, is `intermediate x intermediate` in f32) and the stored activations.
 
 {{chart:gptq_ppl}}
 
 | model | fp16 | RTN INT4 | GPTQ INT4 | share of the RTN loss recovered |
 |---|--:|--:|--:|--:|
-| Qwen2.5-0.5B-Instruct | 18.79 | 22.91 | **20.20** | 66 % |
+| Qwen2.5-0.5B-Instruct | 18.79 | 22.91 | **20.45** | 60 % |
 | Qwen2.5-1.5B-Instruct | 12.66 | 14.30 | **13.38** | 56 % |
-| Llama-3.2-1B-Instruct | 17.91 | 22.28 | **20.12** | 49 % |
-| OLMo-2-0425-1B-Instruct | 17.24 | 19.02 | **18.35** | 38 % |
+| Llama-3.2-1B-Instruct | 17.91 | 22.28 | **20.21** | 47 % |
+| OLMo-2-0425-1B-Instruct | 17.24 | 19.02 | **18.13** | 50 % |
+| Qwen2.5-3B-Instruct (no fp16 reference: does not fit) | - | 13.13 | **12.06** | - |
 
-These are perplexities on the **whole** Wikitext-2 test split (564 to 584 windows of 512 tokens); calibration uses windows of the *train* split. Decode speed does not change (the layout is the same): about 226 tokens/s for either variant on Qwen2.5-0.5B.
+These are perplexities on the **whole** Wikitext-2 test split (564 to 584 windows of 512 tokens); calibration uses 128 windows drawn from the first 20 000 rows of the *train* split. Decode speed does not change (the layout is the same).
 
-### A pitfall: the first version of this table was wrong
+### A pitfall: the first version of this table was wrong, and so was the second
 
 My first measurement used only the first 8 test windows (4096 tokens), and on those GPTQ beat round-to-nearest on every model. Re-measuring on the whole test split showed that on **Llama-3.2-1B GPTQ was worse than RTN (24.08 against 22.28)** and on Qwen2.5-1.5B it recovered only 24 percent of the loss. Eight windows are simply too few for a method whose failures are rare. The investigation, in four steps:
 
@@ -43,7 +44,17 @@ My first measurement used only the first 8 test windows (4096 tokens), and on th
 3. **Which layer?** Quantising only `layers.1.mlp.down_proj` with RTN (all the others with GPTQ) brought Llama from 24.08 to 20.26. That layer creates the *massive activation* of the attention-sink token: its input contains one token whose norm is **675 times the median** (790 times in Qwen2.5-1.5B). In the same layer GPTQ's mean error over the calibration tokens was 2.5 to 5 times lower than RTN's, as designed, so a check of the average error cannot see the problem.
 4. **Why**: that single token dominates the Hessian `H = 2 X^T X / n`, the error compensation is tuned to it, and the other tokens, and sink tokens in other positions, pay for it.
 
-A fixed list of layers is not a fix: forcing RTN on the massive-activation layers helps Llama (20.26) and Qwen-1.5B (13.47) but hurts Qwen-0.5B (20.83 against 20.20). What works for all three is a **cap on the token norm in the Hessian**: before a calibration token enters `H`, its norm is limited to 30 times the median token norm. The massive token still takes part, but with a bounded weight. Results: Llama 24.08 to **20.12**, Qwen-1.5B 13.91 to **13.38**, Qwen-0.5B unchanged (20.21 to 20.20). It is the default (`token_clip=30`).
+A fixed list of layers is not a fix: forcing RTN on the massive-activation layers helps Llama (20.26) and Qwen-1.5B (13.47) but hurts Qwen-0.5B (20.83 against 20.20). What works for all three is a **cap on the token norm in the Hessian**: before a calibration token enters `H`, its norm is limited to a multiple of the median token norm. The massive token still takes part, but with a bounded weight.
+
+**The second version was wrong too.** I first chose a cap of 30, which fixed the whole-split perplexity (Llama 24.08 to 20.12). A slow regression test that I then wrote, on the five windows that had been broken, showed that **one of them was still broken** (window 70: loss 5.9 against 3.0 for fp16), although the perplexity of the whole split could not tell. A per-window analysis of all 564 windows settled the choice:
+
+| cap | whole-split ppl | windows where GPTQ is worse than RTN | worst window against RTN |
+|---|--:|--:|--:|
+| 30 | 20.123 | 2 (1 %) | +2.76 nats |
+| **10** | 20.192 | **0** | none |
+| 5 | 20.328 | 0 | none |
+
+The default is therefore **10** (`token_clip=10`): it costs about 0.07 perplexity points against 30 and removes the rare catastrophic windows. Lesson: for a method whose failures are rare, an average is the wrong acceptance criterion; the test that matters looks at the worst case.
 
 ### Things that did not help (so they are off by default)
 
@@ -54,36 +65,36 @@ A fixed list of layers is not a fix: forcing RTN on the massive-activation layer
 
 ### How robust is it?
 
-Three checks beyond a single perplexity number (all on the whole Wikitext-2 test split, GPTQ with the defaults):
+Three checks beyond a single perplexity number (whole Wikitext-2 test split, GPTQ with the defaults):
 
 | check | Qwen2.5-0.5B | Llama-3.2-1B | Qwen2.5-1.5B |
 |---|--:|--:|--:|
 | RTN INT4 | 22.91 | 22.28 | 14.30 |
-| GPTQ, 3 calibration seeds | 20.35 / 20.31 / 20.46 (sd 0.08) | 20.10 / 19.97 / 19.81 (sd 0.15) | 13.38 (one seed) |
-| GPTQ, calibrated on cnn_dailymail articles instead of Wikitext | 20.67 | 20.17 | 13.54 |
+| GPTQ, 3 calibration seeds | 20.45 / 20.46 / 20.48 (sd 0.01) | 20.21 / 20.22 / 20.25 (sd 0.02) | 13.38 (one seed) |
+| GPTQ, calibrated on cnn_dailymail articles instead of Wikitext | 20.70 | 20.43 | 13.65 |
 
-* **Seeds:** the spread between random calibration windows is 0.1 to 0.15 perplexity points, an order of magnitude below the gap to RTN.
-* **Another domain:** calibrating on news articles and testing on Wikipedia costs 0.07 to 0.3 points and still beats RTN by two points or more. Note that the Wikitext-on-Wikitext numbers in the main table are *in-domain*, which flatters GPTQ slightly.
-* **A bigger model:** Qwen2.5-3B (which does not fit in fp16 on this card, so there is no fp16 reference): RTN 13.13, GPTQ **11.97**, 297 seconds of calibration.
+* **Seeds:** the spread between random calibration windows is 0.01 to 0.02 perplexity points, far below the gap to RTN. It was 0.08 to 0.15 with a cap of 30: bounding the influence of the massive token also stabilises the result.
+* **Another domain:** calibrating on news articles and testing on Wikipedia costs 0.2 to 0.3 points and still beats RTN by two points or more. The Wikitext-on-Wikitext numbers in the main table are *in-domain*, which flatters GPTQ slightly.
+* **A bigger model:** Qwen2.5-3B (no fp16 reference: it does not fit on this card): RTN 13.13, GPTQ **12.06**, 300 seconds of calibration.
 
-**A task instead of a likelihood.** Zero-shot ARC accuracy (the scoring of lm-evaluation-harness: `acc` picks the choice with the highest log-likelihood, `acc_norm` the highest per character), in percent. The standard error is 1.0 points on ARC-Easy (2376 questions) and 1.4 on ARC-Challenge (1172):
+**A task instead of a likelihood.** Zero-shot ARC accuracy of the GPTQ models next to fp16 and RTN (lm-evaluation-harness scoring: `acc` picks the choice with the highest log-likelihood, `acc_norm` the highest per character), in percent. Standard error: 1.0 points on ARC-Easy (2376 questions), 1.4 on ARC-Challenge (1172):
 
 | model | variant | ARC-Easy acc | ARC-Easy acc_norm | ARC-Challenge acc | ARC-Challenge acc_norm |
 |---|---|--:|--:|--:|--:|
 | Qwen2.5-0.5B | fp16 | 65.6 | 59.2 | 30.7 | 33.8 |
 | | RTN | 62.5 | 59.3 | 31.7 | 32.3 |
-| | GPTQ | 62.0 | 60.9 | 28.6 | 32.2 |
+| | GPTQ | 63.3 | 60.5 | 29.4 | 33.0 |
 | Llama-3.2-1B | fp16 | 69.0 | 63.8 | 34.6 | 37.9 |
 | | RTN | 64.3 | 60.4 | 33.5 | 35.3 |
-| | GPTQ | 66.2 | 61.2 | 34.4 | 36.3 |
+| | GPTQ | 66.4 | 62.5 | 33.2 | 36.9 |
 | OLMo-2-1B | fp16 | 71.8 | 71.0 | 41.0 | 42.0 |
 | | RTN | 71.2 | 68.3 | 39.8 | 40.7 |
-| | GPTQ | 70.9 | 70.2 | 40.3 | 43.0 |
+| | GPTQ | 70.4 | 69.5 | 39.3 | 42.2 |
 | Qwen2.5-1.5B | fp16 | 76.8 | 76.0 | 43.5 | 46.7 |
 | | RTN | 65.6 | 62.3 | 37.0 | 39.7 |
-| | GPTQ | **75.0** | **74.3** | **42.1** | **45.1** |
+| | GPTQ | **73.1** | **72.0** | **40.5** | **44.0** |
 
-The surprise is **Qwen2.5-1.5B**: round-to-nearest loses 11 points on ARC-Easy (76.8 to 65.6) and 6.5 on ARC-Challenge, much more than its modest perplexity increase (12.66 to 14.30) suggests, and GPTQ brings it back to within 2 points of fp16. For the other three models the differences between fp16, RTN and GPTQ are mostly within the standard error: at INT4 these small models lose little on ARC either way. In other words, a perplexity table alone can hide a real quality problem, and it can also overstate one.
+The surprise is **Qwen2.5-1.5B**: round-to-nearest loses 11 points on ARC-Easy (76.8 to 65.6) and 6.5 on ARC-Challenge, much more than its modest perplexity increase (12.66 to 14.30) suggests, and GPTQ gets back 7.5 and 3.5 points of them. (With the earlier cap of 30 it got back 9.4 and 5.1: the differences are about two standard errors, so I would not call the cap of 10 worse on this model, but the data do not exclude it.) For the other three models the differences between fp16, RTN and GPTQ are mostly within the standard error: at INT4 these small models lose little on ARC either way. A perplexity table alone can hide a real quality problem, and it can also overstate one.
 
 ## Real AWQ and GPTQ checkpoints
 

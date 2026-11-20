@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--calib-len", type=int, default=512)
     ap.add_argument("--act-order", action="store_true")
     ap.add_argument("--rtn", nargs="*", default=[], help="Linears quantised with RTN instead of GPTQ, e.g. 1.mlp.down_proj")
-    ap.add_argument("--token-clip", type=float, default=30.0, help="cap token norms at this multiple of the median in the Hessian (0 = off)")
+    ap.add_argument("--token-clip", type=float, default=10.0, help="cap token norms at this multiple of the median in the Hessian (0 = off)")
     ap.add_argument("--clip", action="store_true", help="per-row range shrinking search at every group")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--nseq", type=int, default=8, help="number of test windows; 0 = the whole test split")

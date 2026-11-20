@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* GPTQ: calibration token norms are capped at 10x the median in the Hessian (`token_clip=10`), which removes a failure on models
+  with a massive-activation layer (Llama-3.2-1B: GPTQ was worse than RTN on the whole Wikitext-2 test split, 24.08 against 22.28;
+  now 20.21). A slow regression test (`test/E2E/test_gptq_real_model.py`, `QUANTFORGE_SLOW_TESTS=1`) guards the broken windows.
+* Decode: K tile 32 for 10240 <= N <= 12288 (1 x 4096 x 11008: 149.5 -> 135.7 us, 0.93x Marlin); autotune candidates version 3.
+* Benchmarks: `arc_eval.py`, `decode_repeat.py`, `kernel_repeat.py`, `ppl_per_window.py`; the comparison JSON is now
+  `compare_baselines_rtx4050_sm89.json`.
+
 ## 0.2.0 (2026-11-20)
 
 * `quantforge.nn`: `QuantLinear`, `quantize_model` (INT4 / INT8 / FP8, RTN), fused q/k/v and SiLU-gated MLP
