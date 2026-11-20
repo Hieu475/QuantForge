@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent go - QuantForge Notes</title>
+<meta name="description" content="A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/06-inside-vllm.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent go</h1><p class="lede">A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#the-plugin">The plugin</a></li>
+<li><a href="#same-checkpoint-same-engine-the-result">Same checkpoint, same engine: the result</a></li>
+<li><a href="#where-the-missing-20-to-30-percent-goes">Where the missing 20 to 30 percent goes</a></li>
+<li><a href="#limitations-of-the-plugin">Limitations of the plugin</a></li>
+</ul>
+</div>
+</details><p>The kernel benchmarks of the <a href="01-overview.html">overview</a> compare GEMMs in isolation, and the end-to-end numbers compare a Hugging Face model with a different one. Neither answers the practical question: <strong>if I swap Marlin for the generated kernels in the same engine, with the same checkpoint, how much throughput do I lose or gain?</strong> A vLLM plugin makes that experiment possible.</p>
+<h2 id="the-plugin">The plugin<a class="headerlink" href="#the-plugin" title="Permanent link">#</a></h2>
+<p>vLLM lets a package register a quantization method. The plugin (<code>quantforge.vllm_plugin</code>) is small because it reuses vLLM's GPTQ machinery:</p>
+<ul>
+<li><code>QuantForgeConfig</code> subclasses vLLM's GPTQ config and answers to <code>quantization="quantforge"</code>. It accepts the same checkpoints (symmetric or asymmetric, group 32/64/128, <code>desc_act</code>);</li>
+<li><code>QuantForgeLinearMethod</code> lets vLLM create and load the GPTQ tensors exactly as it does for Marlin (tensor parallelism, fused q/k/v and gate/up layers work unchanged), then <strong>converts them once after loading</strong> into the QuantForge layout and calls <code>torch.ops.quantforge.w4a16_gemm</code> in <code>apply</code>;</li>
+<li>the op already works under <code>torch.compile</code> and CUDA graphs, which vLLM uses for decode; the kernels for every row bucket are compiled in vLLM's warm-up passes, before graph capture;</li>
+<li>it registers itself through the <code>vllm.general_plugins</code> entry point (<code>pip install -e ./python</code>), because vLLM's engine runs in a separate process and pickles the config to it: the config classes must live at module level (my first version defined them inside a function and failed with a pickling error).</li>
+</ul>
+<pre><code class="language-python">from vllm import LLM
+llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;quantforge&quot;, dtype=&quot;float16&quot;)
+</code></pre>
+<h2 id="same-checkpoint-same-engine-the-result">Same checkpoint, same engine: the result<a class="headerlink" href="#same-checkpoint-same-engine-the-result" title="Permanent link">#</a></h2>
+<p>Throughput is the number of generated tokens per second summed over the concurrent requests (RTX 4050, best of 3, two independent runs agreed to 1 to 2 percent):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">concurrent requests</th>
+<th style="text-align: right;">Marlin (vLLM)</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B GPTQ-Int4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">298</td>
+<td style="text-align: right;">231</td>
+<td style="text-align: right;">0.78</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1153</td>
+<td style="text-align: right;">893</td>
+<td style="text-align: right;">0.77</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4188</td>
+<td style="text-align: right;">3403</td>
+<td style="text-align: right;">0.81</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">10418</td>
+<td style="text-align: right;">7747</td>
+<td style="text-align: right;">0.74</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B GPTQ-Int4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">138</td>
+<td style="text-align: right;">99</td>
+<td style="text-align: right;">0.72</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2012</td>
+<td style="text-align: right;">1542</td>
+<td style="text-align: right;">0.77</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4929</td>
+<td style="text-align: right;">3528</td>
+<td style="text-align: right;">0.72</td>
+</tr>
+</tbody>
+</table>
+<p>The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.014). So <strong>the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput</strong>, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.</p>
+<h2 id="where-the-missing-20-to-30-percent-goes">Where the missing 20 to 30 percent goes<a class="headerlink" href="#where-the-missing-20-to-30-percent-goes" title="Permanent link">#</a></h2>
+<p>My first guess was overhead: the op launches three kernels per GEMM (copy the activations into a 16-row padded buffer, the GEMM, convert the f32 result to f16), Marlin one. A profile of one M = 1 call confirms the extra kernels (about 2 microseconds of device time) but also that this cannot be the main cause, because the gap does not shrink for the larger model. The per-layer kernel comparison does (M = 1, microseconds, same method as the kernel tables):</p>
+<table>
+<thead>
+<tr>
+<th>layer of Qwen2.5-1.5B / 0.5B</th>
+<th>K x N</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qkv</td>
+<td>1536 x 2048</td>
+<td style="text-align: right;">11.7</td>
+<td style="text-align: right;">12.4</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr>
+<td>gate / up (merged)</td>
+<td>1536 x 17920</td>
+<td style="text-align: right;">78.5</td>
+<td style="text-align: right;">84.3</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+<tr>
+<td>gate / up (merged, 0.5B)</td>
+<td>896 x 9728</td>
+<td style="text-align: right;">27.6</td>
+<td style="text-align: right;">28.4</td>
+<td style="text-align: right;">0.97</td>
+</tr>
+<tr>
+<td>o_proj</td>
+<td>1536 x 1536</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">13.4</td>
+<td style="text-align: right;"><strong>0.73</strong></td>
+</tr>
+<tr>
+<td><strong>down_proj</strong></td>
+<td>8960 x 1536</td>
+<td style="text-align: right;">40.8</td>
+<td style="text-align: right;">66.2</td>
+<td style="text-align: right;"><strong>0.62</strong></td>
+</tr>
+<tr>
+<td><strong>down_proj (0.5B)</strong></td>
+<td>4864 x 896</td>
+<td style="text-align: right;">15.2</td>
+<td style="text-align: right;">27.7</td>
+<td style="text-align: right;"><strong>0.55</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Wide layers are fine. The layers with a <strong>long K and a narrow N</strong>, which in every transformer is the <code>down_proj</code> of the MLP, are 40 to 45 percent slower than Marlin. With 128 or 64 output columns per block, N = 1536 gives 12 to 24 blocks for 20 SMs: not enough warps in flight to stream the weights at full speed. Marlin splits the K dimension across blocks; the generated kernels do not.</p>
+<p>This overturns a conclusion I wrote earlier ("split-K is not the lever"): it was measured at 1 x 11008 x 4096, where N = 4096 already gives 64 blocks. The shapes that matter for decode in a serving engine are different, and the engine comparison found them where the isolated benchmark did not. The next kernel task is a split-K schedule for these layers (K-range per <code>blockIdx.z</code>, accumulation with atomics or a second reduction), plus fusing the pad and the f16 convert into the kernel.</p>
+<h2 id="limitations-of-the-plugin">Limitations of the plugin<a class="headerlink" href="#limitations-of-the-plugin" title="Permanent link">#</a></h2>
+<p>4-bit GPTQ only: no AWQ, no 8-bit, no MoE layers. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

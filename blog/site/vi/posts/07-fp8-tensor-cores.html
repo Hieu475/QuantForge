@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tensor core FP8 trên GPU laptop: nhanh gấp đôi trên giấy, không nhanh hơn trong một model - QuantForge Notes</title>
+<meta name="description" content="Tensor core FP8 của Ada cho một GEMM trần được bao nhiêu, một layer FP8 W8A8 dựng trên cuBLASLt, chất lượng của nó, và vì sao prefill cả model không nhanh hơn fp16.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/07-fp8-tensor-cores.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>Tensor core FP8 trên GPU laptop: nhanh gấp đôi trên giấy, không nhanh hơn trong một model</h1><p class="lede">Tensor core FP8 của Ada cho một GEMM trần được bao nhiêu, một layer FP8 W8A8 dựng trên cuBLASLt, chất lượng của nó, và vì sao prefill cả model không nhanh hơn fp16.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#phan-cung-lam-uoc-gi">Phần cứng làm được gì</a></li>
+<li><a href="#layer">Layer</a></li>
+<li><a href="#chat-luong-on">Chất lượng ổn</a></li>
+<li><a href="#toc-o-thi-khong">Tốc độ thì không</a></li>
+<li><a href="#can-gi-e-lam-uoc">Cần gì để làm được</a></li>
+</ul>
+</div>
+</details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
+<h2 id="phan-cung-lam-uoc-gi">Phần cứng làm được gì<a class="headerlink" href="#phan-cung-lam-uoc-gi" title="Permanent link">#</a></h2>
+<p><code>torch._scaled_mm</code> gọi GEMM FP8 của cuBLASLt. Thông lượng GEMM trần trên card này, ổn định, so với GEMM cuBLAS fp16:</p>
+<table>
+<thead>
+<tr>
+<th>M x N x K</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">FP8</th>
+<th style="text-align: right;">tăng tốc</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>512 x 4096 x 4096</td>
+<td style="text-align: right;">27.8 TFLOP/s</td>
+<td style="text-align: right;">73.3</td>
+<td style="text-align: right;">2.64x</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">29.0</td>
+<td style="text-align: right;">56.8</td>
+<td style="text-align: right;">1.96x</td>
+</tr>
+<tr>
+<td>4096 x 4096 x 4096</td>
+<td style="text-align: right;">28.7</td>
+<td style="text-align: right;">52.9</td>
+<td style="text-align: right;">1.84x</td>
+</tr>
+<tr>
+<td>2048 x 11008 x 4096</td>
+<td style="text-align: right;">28.7</td>
+<td style="text-align: right;">55.7</td>
+<td style="text-align: right;">1.94x</td>
+</tr>
+</tbody>
+</table>
+<p>Vậy các core FP8 nhanh gấp khoảng hai lần: có thật, và nhiều hơn những gì kernel W4A16 đạt được ở cỡ prefill (khoảng 0.85 của Marlin, tức khoảng tốc độ fp16).</p>
+<h2 id="layer">Layer<a class="headerlink" href="#layer" title="Permanent link">#</a></h2>
+<p><code>FP8W8A8Linear</code> (<code>quantize_model(model, "fp8_w8a8")</code>) lưu weight FP8 E4M3 với scale theo kênh đầu ra và lượng tử hóa activation tức thời với scale theo token. Hai chi tiết mỗi cái tốn của tôi một giờ:</p>
+<ul>
+<li>chế độ scale theo hàng của <code>_scaled_mm</code> không có trên sm_89 (nó âm thầm trả số sai trong test của tôi), nên phép nhân chạy với scale tensor đơn vị và hai vector scale được áp sau;</li>
+<li><strong>các tích FP8 thô tràn fp16</strong>: |x| và |w| tới 448 và K = 4096 cho tổng gần 10^8, nên GEMM phải cho ra f32 và scale được áp lên đó; phiên bản đầu của tôi yêu cầu kết quả f16 và test in ra <code>inf</code>.</li>
+</ul>
+<p>Không do compiler sinh: backend NVPTX của LLVM 18 không phát được lệnh <code>mma</code> FP8, nên layer này là tích hợp cuBLASLt, không phải kernel QuantForge.</p>
+<h2 id="chat-luong-on">Chất lượng ổn<a class="headerlink" href="#chat-luong-on" title="Permanent link">#</a></h2>
+<p>Perplexity Wikitext-2 trên toàn tập test: Qwen2.5-0.5B fp16 18.79, FP8 W8A8 19.10 (scale theo tensor: 19.04), INT4 round-to-nearest 22.91. Llama-3.2-1B fp16 17.91, FP8 W8A8 18.13. FP8 giữ độ chính xác tương đối qua các độ lớn khác nhau, nên một scale cho cả tensor cũng chạy được; cái giá là khoảng 0.2 đến 0.3 điểm perplexity.</p>
+<h2 id="toc-o-thi-khong">Tốc độ thì không<a class="headerlink" href="#toc-o-thi-khong" title="Permanent link">#</a></h2>
+<p>Prefill Qwen2.5-0.5B (một lượt forward, tốt nhất trong 10 lần):</p>
+<table>
+<thead>
+<tr>
+<th>biến thể</th>
+<th style="text-align: right;">1 x 2048 token</th>
+<th style="text-align: right;">8 x 512 token</th>
+<th style="text-align: right;">perplexity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fp16</td>
+<td style="text-align: right;">108 ms</td>
+<td style="text-align: right;">214 ms</td>
+<td style="text-align: right;">18.79</td>
+</tr>
+<tr>
+<td>INT4 (QuantForge)</td>
+<td style="text-align: right;">127 ms</td>
+<td style="text-align: right;">255 ms</td>
+<td style="text-align: right;">22.91</td>
+</tr>
+<tr>
+<td>FP8 W8A8, scale theo token / theo kênh</td>
+<td style="text-align: right;">117 ms</td>
+<td style="text-align: right;">236 ms</td>
+<td style="text-align: right;">19.10</td>
+</tr>
+<tr>
+<td>FP8 W8A8, một scale cho mỗi tensor</td>
+<td style="text-align: right;">103 ms</td>
+<td style="text-align: right;">326 ms</td>
+<td style="text-align: right;">19.04</td>
+</tr>
+</tbody>
+</table>
+<p>Không có mức tăng. Theo từng layer bức tranh thất thường: với đầu vào 2048 token, layer FP8 mất từ 0.35 đến 1.5 lần thời gian của layer fp16 tùy shape. Vì sao:</p>
+<ol>
+<li><strong>GEMM chỉ là một phần của layer.</strong> GEMM FP8 trần của layer 2048 x 896 x 4864 mất 0.24 ms so với 0.43 ms ở fp16, nhưng lượng tử hóa activation (một phép rút gọn và một lượt theo phần tử) và scale lại kết quả f32 (ghi 40 MB rồi đọc lại) tốn thêm 0.25 đến 0.45 ms. Ở các cỡ layer này chi phí phụ lớn bằng phần tiết kiệm được.</li>
+<li><strong>Attention, norm và phần còn lại vẫn ở fp16</strong>, và với model 0.5B chúng chiếm tỷ trọng lớn của lượt forward.</li>
+<li>Biến thể một scale để cuBLASLt áp scale ngay trong GEMM, bỏ được lượt rescale, nhưng tốc độ của nó phụ thuộc vào shape theo cách tôi không dự đoán được (4864 x 896 chậm gấp ba so với biến thể theo token).</li>
+</ol>
+<h2 id="can-gi-e-lam-uoc">Cần gì để làm được<a class="headerlink" href="#can-gi-e-lam-uoc" title="Permanent link">#</a></h2>
+<p>Một mức tăng tốc thật cần gộp việc lượng tử hóa activation vào nơi sinh ra activation (hoặc vào phần mở đầu của GEMM) và gộp epilogue scale vào lệnh store của GEMM, đúng loại gộp mà compiler này làm cho dequantisation và hàm kích hoạt. Nó cần lệnh <code>mma</code> FP8, mảnh còn thiếu trong toolchain này. Cho đến lúc đó layer này hữu ích vì <strong>bộ nhớ</strong> (một nửa số byte weight của fp16) và chất lượng, và làm baseline cho một đường compiler tương lai, không phải vì tốc độ. Với decode batch 1, kernel INT4 vẫn tốt hơn nhiều: weight FP8 gấp đôi số byte của INT4.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

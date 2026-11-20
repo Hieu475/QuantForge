@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* vLLM plugin (`quantization="quantforge"`, entry point `vllm.general_plugins`): GPTQ 4-bit checkpoints on the QuantForge kernels; 70-80 % of Marlin's
+  throughput on Qwen2.5-0.5B / 1.5B. `FP8W8A8Linear` / `quantize_model(fmt="fp8_w8a8")` (cuBLASLt FP8 tensor cores; quality good, no whole-model speed-up).
+
 * GPTQ: calibration token norms are capped at 10x the median in the Hessian (`token_clip=10`), which removes a failure on models
   with a massive-activation layer (Llama-3.2-1B: GPTQ was worse than RTN on the whole Wikitext-2 test split, 24.08 against 22.28;
   now 20.21). A slow regression test (`test/E2E/test_gptq_real_model.py`, `QUANTFORGE_SLOW_TESTS=1`) guards the broken windows.

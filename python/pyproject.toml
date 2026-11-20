@@ -27,6 +27,9 @@ dependencies = ["torch>=2.1"]
 hf = ["transformers>=4.40", "safetensors", "pandas", "pyarrow"]
 test = ["pytest", "lit", "psutil"]
 
+[project.entry-points."vllm.general_plugins"]
+quantforge = "quantforge.vllm_plugin:register"
+
 [project.scripts]
 quantforge-doctor = "quantforge.doctor:main"
 

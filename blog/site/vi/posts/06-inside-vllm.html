@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu - QuantForge Notes</title>
+<meta name="description" content="Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và một chẩn đoán theo từng layer chỉ ra một điểm yếu của kernel (K dài, N hẹp).">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/06-inside-vllm.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu</h1><p class="lede">Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và một chẩn đoán theo từng layer chỉ ra một điểm yếu của kernel (K dài, N hẹp).</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#plugin">Plugin</a></li>
+<li><a href="#cung-checkpoint-cung-engine-ket-qua">Cùng checkpoint, cùng engine: kết quả</a></li>
+<li><a href="#20-en-30-phan-tram-con-thieu-i-au">20 đến 30 phần trăm còn thiếu đi đâu</a></li>
+<li><a href="#han-che-cua-plugin">Hạn chế của plugin</a></li>
+</ul>
+</div>
+</details><p>Các benchmark kernel trong <a href="01-overview.html">bài tổng quan</a> so sánh GEMM tách rời, và các số đầu-cuối so sánh một model Hugging Face với một model khác. Không cái nào trả lời câu hỏi thực tế: <strong>nếu tôi thay Marlin bằng các kernel đã sinh trong cùng một engine, với cùng một checkpoint, tôi mất hay được bao nhiêu throughput?</strong> Một plugin vLLM cho phép làm thí nghiệm đó.</p>
+<h2 id="plugin">Plugin<a class="headerlink" href="#plugin" title="Permanent link">#</a></h2>
+<p>vLLM cho phép một package đăng ký một phương pháp lượng tử hóa. Plugin (<code>quantforge.vllm_plugin</code>) nhỏ vì nó tái dùng bộ máy GPTQ của vLLM:</p>
+<ul>
+<li><code>QuantForgeConfig</code> kế thừa config GPTQ của vLLM và đáp ứng <code>quantization="quantforge"</code>. Nó nhận cùng các checkpoint (đối xứng hoặc bất đối xứng, group 32/64/128, <code>desc_act</code>);</li>
+<li><code>QuantForgeLinearMethod</code> để vLLM tạo và nạp các tensor GPTQ đúng như với Marlin (tensor parallelism, các layer gộp q/k/v và gate/up chạy không đổi), rồi <strong>chuyển đổi một lần sau khi nạp</strong> sang layout QuantForge và gọi <code>torch.ops.quantforge.w4a16_gemm</code> trong <code>apply</code>;</li>
+<li>op đã chạy được dưới <code>torch.compile</code> và CUDA graph, thứ vLLM dùng cho decode; kernel của mọi row bucket được biên dịch trong các lượt warm-up của vLLM, trước khi capture graph;</li>
+<li>nó tự đăng ký qua entry point <code>vllm.general_plugins</code> (<code>pip install -e ./python</code>), vì engine của vLLM chạy ở một process riêng và pickle config sang đó: các lớp config phải nằm ở cấp module (phiên bản đầu của tôi định nghĩa chúng trong một hàm và lỗi pickle).</li>
+</ul>
+<pre><code class="language-python">from vllm import LLM
+llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;quantforge&quot;, dtype=&quot;float16&quot;)
+</code></pre>
+<h2 id="cung-checkpoint-cung-engine-ket-qua">Cùng checkpoint, cùng engine: kết quả<a class="headerlink" href="#cung-checkpoint-cung-engine-ket-qua" title="Permanent link">#</a></h2>
+<p>Throughput là số token sinh ra mỗi giây cộng trên các request đồng thời (RTX 4050, tốt nhất trong 3 lần, hai lần chạy độc lập khớp nhau trong 1 đến 2 phần trăm):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">request đồng thời</th>
+<th style="text-align: right;">Marlin (vLLM)</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B GPTQ-Int4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">298</td>
+<td style="text-align: right;">231</td>
+<td style="text-align: right;">0.78</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1153</td>
+<td style="text-align: right;">893</td>
+<td style="text-align: right;">0.77</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4188</td>
+<td style="text-align: right;">3403</td>
+<td style="text-align: right;">0.81</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">10418</td>
+<td style="text-align: right;">7747</td>
+<td style="text-align: right;">0.74</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B GPTQ-Int4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">138</td>
+<td style="text-align: right;">99</td>
+<td style="text-align: right;">0.72</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2012</td>
+<td style="text-align: right;">1542</td>
+<td style="text-align: right;">0.77</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4929</td>
+<td style="text-align: right;">3528</td>
+<td style="text-align: right;">0.72</td>
+</tr>
+</tbody>
+</table>
+<p>Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.014). Vậy <strong>plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin</strong>, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.</p>
+<h2 id="20-en-30-phan-tram-con-thieu-i-au">20 đến 30 phần trăm còn thiếu đi đâu<a class="headerlink" href="#20-en-30-phan-tram-con-thieu-i-au" title="Permanent link">#</a></h2>
+<p>Phỏng đoán đầu của tôi là chi phí phụ: op phát ba kernel mỗi GEMM (copy activation vào buffer đệm 16 hàng, GEMM, đổi kết quả f32 sang f16), Marlin một. Profile một lần gọi M = 1 xác nhận các kernel phụ (khoảng 2 micro giây thời gian thiết bị) nhưng cũng cho thấy chúng không thể là nguyên nhân chính, vì khoảng cách không thu hẹp ở model lớn hơn. So sánh kernel theo từng layer thì có (M = 1, micro giây, cùng phương pháp như các bảng kernel):</p>
+<table>
+<thead>
+<tr>
+<th>layer của Qwen2.5-1.5B / 0.5B</th>
+<th>K x N</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">tỷ lệ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qkv</td>
+<td>1536 x 2048</td>
+<td style="text-align: right;">11.7</td>
+<td style="text-align: right;">12.4</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr>
+<td>gate / up (gộp)</td>
+<td>1536 x 17920</td>
+<td style="text-align: right;">78.5</td>
+<td style="text-align: right;">84.3</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+<tr>
+<td>gate / up (gộp, 0.5B)</td>
+<td>896 x 9728</td>
+<td style="text-align: right;">27.6</td>
+<td style="text-align: right;">28.4</td>
+<td style="text-align: right;">0.97</td>
+</tr>
+<tr>
+<td>o_proj</td>
+<td>1536 x 1536</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">13.4</td>
+<td style="text-align: right;"><strong>0.73</strong></td>
+</tr>
+<tr>
+<td><strong>down_proj</strong></td>
+<td>8960 x 1536</td>
+<td style="text-align: right;">40.8</td>
+<td style="text-align: right;">66.2</td>
+<td style="text-align: right;"><strong>0.62</strong></td>
+</tr>
+<tr>
+<td><strong>down_proj (0.5B)</strong></td>
+<td>4864 x 896</td>
+<td style="text-align: right;">15.2</td>
+<td style="text-align: right;">27.7</td>
+<td style="text-align: right;"><strong>0.55</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Các layer rộng ổn. Các layer <strong>K dài và N hẹp</strong>, mà trong mọi transformer là <code>down_proj</code> của MLP, chậm hơn Marlin 40 đến 45 phần trăm. Với 128 hoặc 64 cột đầu ra mỗi block, N = 1536 cho 12 đến 24 block trên 20 SM: không đủ warp đang bay để stream weight ở tốc độ tối đa. Marlin chia chiều K giữa các block; kernel đã sinh thì không.</p>
+<p>Điều này lật ngược một kết luận tôi đã viết trước đó ("split-K không phải đòn bẩy"): nó được đo ở 1 x 11008 x 4096, nơi N = 4096 đã cho 64 block. Các shape quan trọng cho decode trong một engine phục vụ thì khác, và phép so sánh engine tìm ra chúng ở nơi benchmark tách rời không tìm ra. Việc kernel tiếp theo là một schedule split-K cho các layer này (một dải K cho mỗi <code>blockIdx.z</code>, cộng dồn bằng atomic hoặc một bước rút gọn thứ hai), cộng với gộp phép pad và phép đổi f16 vào kernel.</p>
+<h2 id="han-che-cua-plugin">Hạn chế của plugin<a class="headerlink" href="#han-che-cua-plugin" title="Permanent link">#</a></h2>
+<p>Chỉ GPTQ 4-bit: không AWQ, không 8-bit, không layer MoE. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -212,3 +212,26 @@ def test_load_fp8_per_channel_checkpoint():
     with torch.no_grad():
         r, f = ref.cuda()(ids).logits.float(), model(ids).logits.float()
     assert (f - r).abs().max().item() < 5e-3 * r.abs().max().item() + 5e-3
+
+
+def test_fp8_w8a8_linear_matches_the_quantised_reference_and_a_tiny_model_runs():
+    _require_gpu()
+    if torch.cuda.get_device_capability(0) < (8, 9):
+        pytest.skip("FP8 tensor cores need sm_89+")
+    import quantforge.nn as qnn
+
+    torch.manual_seed(0)
+    lin = nn.Linear(512, 384).half().cuda()
+    q = qnn.FP8W8A8Linear.from_linear(lin)
+    x = torch.randn(64, 512, device="cuda", dtype=torch.float16)
+    ref = x.float() @ q.dequantized_weight().float().t() + lin.bias.float()          # weights quantised, activations exact
+    out = q(x)
+    assert out.shape == (64, 384) and out.dtype == torch.float16
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, rel                                                        # + the per-token FP8 rounding of x (~3 %)
+    model = _tiny("llama")
+    st = qnn.quantize_model(model, "fp8_w8a8", fuse=False)
+    assert st["quantized"] == 2 * 7
+    ids = torch.randint(0, 512, (2, 24), device="cuda")
+    with torch.no_grad():
+        assert torch.isfinite(model(ids).logits).all()
