@@ -16,7 +16,8 @@ from quantforge.quant import w4a8_quantize
 from quantforge import w4a8_op
 
 M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]); G = 128
-extra = os.environ.get("DEC_OPTS") or ops._decode_opts(N)
+from quantforge.e2e import W4A8_DECODE_OPTS
+extra = os.environ.get("DEC_OPTS") or W4A8_DECODE_OPTS.replace(" accumulate=false", "")      # the schedule W4A8DecodeGemm uses
 ir = f"""#nk = affine_map<(n, k) -> (n, k)>
 func.func @dec(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K//2}xi8>, %zp: tensor<{N}x{K//G}xi8>, %sc: tensor<{N}x{K//G}xf16>,
                %c: tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32> {{
