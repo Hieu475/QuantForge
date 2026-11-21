@@ -329,3 +329,69 @@ def test_int8_w8a8_shared_input_fusion_gives_the_same_model_output():
             outs[fuse] = m(ids).logits.float()
     assert torch.isfinite(outs[True]).all()
     assert (outs[True] - outs[False]).abs().max() < 1e-2 * outs[False].abs().max()
+
+
+def _int4_group_rtn(w, group):
+    """Plain symmetric group-wise INT4 round-to-nearest with a float scale (the reference for how good INT4 can be)."""
+    g = w.reshape(w.shape[0], -1, group)
+    s = (g.abs().amax(2, keepdim=True) / 7).clamp(min=1e-8)
+    return ((g / s).round().clamp(-8, 7) * s).reshape(w.shape)
+
+
+def test_w4a8_quantisation_never_overflows_int8_and_the_linear_matches_its_reference():
+    """Progressive INT4 quantisation: the int8 weight the tensor cores see stays within int8 for any weight (so the in-kernel
+    (nibble - 8) * group_scale cannot wrap), and the compiled W4A8 layer equals the float reference of the SAME quantised weight."""
+    _require_gpu()
+    import quantforge.nn as qnn
+    from quantforge.quant import w4a8_dequantize, w4a8_quantize
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    w = torch.randn(256, 512, device="cuda", generator=g) * torch.rand(256, 1, device="cuda", generator=g) * 3
+    w[::7, ::5] *= 25                                                  # outliers: some groups much larger than the rest of their row
+    packed, gs, zp, sw = w4a8_quantize(w)
+    assert packed.shape == (256, 256) and gs.shape == (256, 4) and zp.shape == (256, 4) and 0 <= zp.min() and zp.max() <= 15 and 1 <= gs.min() and gs.max() <= 16
+    wd = w4a8_dequantize(packed, gs, zp, sw)
+    steps = wd / sw[:, None]                                           # the integer weight the kernel computes
+    assert steps.min() >= -128 - 1e-3 and steps.max() <= 127 + 1e-3
+    # INT4 resolution (a group of 128 Gaussians gives ~0.14 relative error); the integer group scale must not cost much more than the
+    # float one of plain group-wise INT4
+    err_plain = (w - _int4_group_rtn(w, 128)).norm() / w.norm()      # symmetric, float scale: no better than an asymmetric one
+    err = (wd - w).norm() / w.norm()
+    assert err < 1.25 * err_plain + 0.01, (err.item(), err_plain.item())
+
+    lin = torch.nn.Linear(512, 384, bias=True).half().cuda()
+    q = qnn.W4A8Linear.from_linear(lin)
+    for M in (4, 17, 200):
+        x = torch.randn(M, 512, device="cuda", dtype=torch.float16, generator=g)
+        y = q(x)
+        assert y.dtype == torch.float16 and y.shape == (M, 384)
+        dense = x.float() @ q.dequantized_weight().float().t() + lin.bias.float()
+        assert (y.float() - dense).norm() / dense.norm() < 0.03, M      # the activation rounding, nothing else
+        if M > 16:                                                      # compiled kernel: the same integers, exact up to the f16 store
+            xq, s_x = qnn._int8_quantize_tokens(x)
+            wi = (q.dequantized_weight().float() / q.w_scale[:, None]).round()      # the int8 weight (|.| <= 128, exact in fp32)
+            ref = (xq.float() @ wi.t()) * s_x * q.w_scale[None, :] + lin.bias.float()
+            assert (y.float() - ref).norm() / ref.norm() < 2e-3, M
+    with pytest.raises(ValueError):
+        qnn.W4A8Linear.from_linear(torch.nn.Linear(500, 384).half().cuda())
+
+
+def test_w4a8_shared_input_fusion_gives_the_same_model_output():
+    _require_gpu()
+    transformers = pytest.importorskip("transformers")
+    import quantforge.nn as qnn
+
+    cfg = transformers.LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, vocab_size=512, max_position_embeddings=64)
+    torch.manual_seed(0)
+    base = transformers.LlamaForCausalLM(cfg).half().eval()
+    ids = torch.randint(0, 512, (1, 64), device="cuda")
+    outs = {}
+    for fuse in (False, True):
+        m = copy.deepcopy(base)
+        st = qnn.quantize_model(m, "w4a8", fuse=fuse)
+        assert (st["fused_qkv"], st["fused_mlp"]) == ((2, 2) if fuse else (0, 0))
+        with torch.no_grad():
+            outs[fuse] = m(ids).logits.float()
+    assert torch.isfinite(outs[True]).all()
+    assert (outs[True] - outs[False]).abs().max() < 1e-2 * outs[False].abs().max()

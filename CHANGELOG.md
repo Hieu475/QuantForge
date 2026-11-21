@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* W4A8: `quantize_model(model, "w4a8")` / `W4A8Linear` / `quantforge.e2e.W4A8GemmDq` / `quantforge.quant.w4a8_quantize`: INT4 weights (progressive quantisation: INT8 per channel, INT4 per group of 128 with an integer scale and zero point) and INT8 activations in ONE kernel,
+  the int8 weight built by a `linalg.generic` producer fused into the tile loads (no compiler change). Kernel 1.11-1.26x cuBLAS fp16, 1.37-1.87x QF W4A16; whole-model prefill 1.01x / 1.07x / 1.04x of fp16 (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B) at INT4 quality, 2-2.6x less weight memory
+  than fp16. `benchmarks/w4a8_gemm.py`, `benchmarks/hf_fp8_w8a8.py` variant `w4a8`; `INT8W8A8Linear` gained `concat` / `_build_kernel` / `_launch` hooks (shared-input fusion works for both).
+
 * `epilogue=int8-dequant` (`quantforge-fuse-epilogue`) and `quantforge.e2e.Int8GemmDq`: INT8 GEMM + `* sx[m] * sw[n] + bias[n]` -> f16 in ONE kernel with no int32 intermediate (1.29-1.81x cuBLAS fp16 for GEMM + dequantisation).
   `INT8W8A8Linear` uses it by default (`backend="quantforge"`, `quantize_model(..., int8_backend=)`): whole-model prefill 1.10x / 1.18x / 1.20x of fp16 for Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B (cuBLASLt route: 0.91-1.08x). q/k/v and gate/up share one activation quantisation and one GEMM (`_Int8Shared`, 1-3 %); `int8_gemm_swizzle`: block rastering only for weights larger than the L2.
 

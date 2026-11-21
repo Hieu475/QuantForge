@@ -33,6 +33,7 @@ from . import torch_ops as _ops
 __all__ = ["QuantLinear", "FP8W8A8Linear", "INT8W8A8Linear", "quantize_model", "load_quantized_checkpoint", "enable_kfold", "FORMATS"]
 
 FORMATS = ("int4", "int8", "fp8")
+W4A8_FORMAT = "w4a8"          # INT4 weights, INT8 activations on the INT8 tensor cores, see W4A8Linear
 INT8_W8A8_FORMAT = "int8_w8a8"   # INT8 weights *and* activations on the INT8 tensor cores (cuBLASLt), see INT8W8A8Linear
 W8A8_FORMAT = "fp8_w8a8"      # FP8 weights *and* activations on the Ada / Hopper FP8 tensor cores (cuBLASLt), see FP8W8A8Linear
 
@@ -304,24 +305,42 @@ class INT8W8A8Linear(nn.Module):
                 return b
         return -(-m // 4096) * 4096
 
-    def _compiled_forward(self, x2: torch.Tensor, dt) -> torch.Tensor:
+    def _build_kernel(self, Mp: int, K: int):
         from .e2e import INT8_GEMM_OPTS, Int8GemmDq, int8_gemm_swizzle
 
+        return Int8GemmDq.build(Mp, K, self.out_features, bias=True,
+                                pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={int8_gemm_swizzle(K, self.out_features)}")
+
+    def _launch(self, k, xq, s_x, y) -> None:
+        k.launch(xq, self.weight, s_x, self._w_scale32, self._bias32, y)
+
+    @classmethod
+    def concat(cls, layers) -> "INT8W8A8Linear":
+        """One layer whose output channels are those of `layers` (they read the same input): q / k / v, gate / up."""
+        w = torch.cat([m.weight for m in layers], 0).contiguous()
+        sc = torch.cat([m.w_scale for m in layers])
+        sizes = [m.out_features for m in layers]
+        if any(m.bias is not None for m in layers):
+            bias = torch.cat([m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=w.device)
+                              for m, n in zip(layers, sizes)])
+        else:
+            bias = None
+        return cls(w, sc, bias, layers[0].backend)
+
+    def _compiled_forward(self, x2: torch.Tensor, dt) -> torch.Tensor:
         M, K = x2.shape
         Mp = self._bucket(M)
         key = Mp
         k = self._kernels.get(key)
         if k is None:
-            k = self._kernels[key] = Int8GemmDq.build(
-                Mp, K, self.out_features, bias=True,
-                pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={int8_gemm_swizzle(K, self.out_features)}")
+            k = self._kernels[key] = self._build_kernel(Mp, K)
         xq, s_x = _int8_quantize_tokens(x2)
         s_x = s_x.reshape(-1)
         if Mp != M:                                                       # zero rows (scale 0) up to the bucket
             xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
             s_x = torch.nn.functional.pad(s_x, (0, Mp - M))
         y = torch.empty(Mp, self.out_features, device=x2.device, dtype=torch.float16)
-        k.launch(xq, self.weight, s_x.contiguous(), self._w_scale32, self._bias32, y)
+        self._launch(k, xq, s_x.contiguous(), y)
         y = y[:M] if Mp != M else y
         return y if dt == torch.float16 else y.to(dt)
 
@@ -345,6 +364,81 @@ class INT8W8A8Linear(nn.Module):
 
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, fmt=int8_w8a8"
+
+
+class W4A8Linear(INT8W8A8Linear):
+    """INT4 weights (progressive quantisation: INT8 per channel, then INT4 per group of 128 with an integer scale and zero point) and INT8
+    activations (dynamic per token), on the INT8 tensor cores, in ONE compiled kernel (``W4A8GemmDq``): the weights are the only
+    4-bit traffic and are expanded to int8 while the tile is staged, the accumulation is int32 over all of K and the only float
+    scale left (per output channel) is applied in the store. Weight memory is half of INT8's (a quarter of fp16's). Prefill /
+    large-batch format like ``INT8W8A8Linear`` (fewer than 17 rows use a dequantised fp16 matmul); needs ``out_features % 128 == 0``
+    and ``in_features % 128 == 0``, other layers are left dense by ``quantize_model``."""
+
+    _TILE_N, _TILE_K = 128, 128
+
+    def __init__(self, packed, group_scale, group_zero, w_scale, bias):
+        nn.Module.__init__(self)
+        self.out_features, self.in_features = packed.shape[0], packed.shape[1] * 2
+        self.register_buffer("weight", packed)                     # int8 [out, in/2]: two nibbles per byte (zero point 8)
+        self.register_buffer("group_scale", group_scale)           # int8 [out, in/128]
+        self.register_buffer("group_zero", group_zero)             # int8 [out, in/128]
+        self.register_buffer("w_scale", w_scale)                   # f32 [out]
+        self.register_buffer("bias", bias)
+        self.backend = "quantforge"
+        self.use_compiled = self.out_features % self._TILE_N == 0 and self.in_features % self._TILE_K == 0
+        self.register_buffer("_w_scale32", w_scale.float().contiguous(), persistent=False)
+        self.register_buffer("_bias32", (bias if bias is not None else torch.zeros(self.out_features, device=packed.device)).float().contiguous(),
+                             persistent=False)
+        self._kernels: dict = {}
+
+    @classmethod
+    @torch.no_grad()
+    def from_linear(cls, lin: nn.Linear, device="cuda", backend: str = "quantforge") -> "W4A8Linear":
+        from .quant import w4a8_quantize
+
+        if lin.in_features % 128 or lin.out_features % 128:
+            raise ValueError("w4a8 needs in_features and out_features that are multiples of 128")
+        packed, gs, zp, sw = w4a8_quantize(lin.weight.data.to(device, torch.float32))
+        bias = None if lin.bias is None else lin.bias.data.to(device, torch.float16)
+        return cls(packed, gs, zp, sw, bias)
+
+    @classmethod
+    def concat(cls, layers) -> "W4A8Linear":
+        cat = lambda name: torch.cat([getattr(m, name) for m in layers], 0).contiguous()      # noqa: E731
+        sizes = [m.out_features for m in layers]
+        w = layers[0].weight
+        if any(m.bias is not None for m in layers):
+            bias = torch.cat([m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=w.device)
+                              for m, n in zip(layers, sizes)])
+        else:
+            bias = None
+        return cls(cat("weight"), cat("group_scale"), cat("group_zero"), cat("w_scale"), bias)
+
+    def _build_kernel(self, Mp: int, K: int):
+        from .e2e import W4A8GemmDq
+
+        return W4A8GemmDq.build(Mp, K, self.out_features, bias=True)
+
+    def _launch(self, k, xq, s_x, y) -> None:
+        k.launch(xq, self.weight, self.group_scale, self.group_zero, s_x, self._w_scale32, self._bias32, y)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        dt = torch.float16 if x.dtype == torch.float32 else x.dtype
+        if self.use_compiled and x2.shape[0] > 16 and x2.is_cuda:
+            return self._compiled_forward(x2, dt).reshape(*shape[:-1], self.out_features)
+        y = x2.to(torch.float16) @ self.dequantized_weight().t()
+        y = y if self.bias is None else y + self.bias
+        return y.to(dt).reshape(*shape[:-1], self.out_features)
+
+    def dequantized_weight(self) -> torch.Tensor:
+        from .quant import w4a8_dequantize
+
+        return w4a8_dequantize(self.weight, self.group_scale, self.group_zero, self.w_scale).half()
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, fmt=w4a8"
 
 
 # --------------------------------------------------------------------------- fusion
@@ -434,15 +528,8 @@ class _Int8Shared(nn.Module):
 
     def __init__(self, layers):
         super().__init__()
-        w = torch.cat([m.weight for m in layers], 0).contiguous()
-        sc = torch.cat([m.w_scale for m in layers])
         sizes = [m.out_features for m in layers]
-        if any(m.bias is not None for m in layers):
-            bias = torch.cat([m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=w.device)
-                              for m, n in zip(layers, sizes)])
-        else:
-            bias = None
-        self.inner = INT8W8A8Linear(w, sc, bias, layers[0].backend)
+        self.inner = type(layers[0]).concat(layers)
         self.sizes = sizes
         self._key, self._outs, self._taken = None, None, 0
 
@@ -476,7 +563,7 @@ def _fuse_int8(model: nn.Module) -> tuple[int, int]:
             layers = [getattr(module, n, None) for n in names]
             if not all(isinstance(m, INT8W8A8Linear) for m in layers):
                 continue
-            if len({(m.in_features, m.backend) for m in layers}) != 1:
+            if len({(m.in_features, m.backend, type(m)) for m in layers}) != 1:
                 continue
             shared = _Int8Shared(layers)
             for i, n in enumerate(names):
@@ -553,8 +640,8 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
 
     Returns ``{"quantized": n, "skipped": [names], "bytes_before": b, "bytes_after": b, "fused_qkv": n,
     "fused_mlp": n}``."""
-    if fmt not in FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT):
-        raise ValueError(f"fmt must be one of {FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT)}")
+    if fmt not in FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT, W4A8_FORMAT):
+        raise ValueError(f"fmt must be one of {FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT, W4A8_FORMAT)}")
     skip, only = tuple(skip), None if only is None else tuple(only)
     stats = {"quantized": 0, "skipped": [], "bytes_before": 0, "bytes_after": 0}
     targets = []
@@ -570,7 +657,9 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             targets.append((mod, cname, child, full))
     for mod, cname, lin, full in targets:
         try:
-            if fmt == INT8_W8A8_FORMAT:
+            if fmt == W4A8_FORMAT:
+                ql = W4A8Linear.from_linear(lin, device)
+            elif fmt == INT8_W8A8_FORMAT:
                 ql = INT8W8A8Linear.from_linear(lin, device, backend=int8_backend)
             elif fmt == W8A8_FORMAT:
                 ql = FP8W8A8Linear.from_linear(lin, device, per_token=w8a8_per_token)
@@ -582,7 +671,7 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             continue
         stats["bytes_before"] += lin.weight.numel() * lin.weight.element_size()
         stats["bytes_after"] += sum(b.numel() * b.element_size() for b in (
-            (ql.weight, ql.w_scale) if fmt in (W8A8_FORMAT, INT8_W8A8_FORMAT) else (ql.packed, ql.scale, ql.zero)))
+            (ql.weight, ql.w_scale) + ((ql.group_scale, ql.group_zero) if fmt == W4A8_FORMAT else ()) if fmt in (W8A8_FORMAT, INT8_W8A8_FORMAT, W4A8_FORMAT) else (ql.packed, ql.scale, ql.zero)))
         setattr(mod, cname, ql)
         stats["quantized"] += 1
         if verbose:
@@ -593,7 +682,7 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
-    stats["fused_qkv"], stats["fused_mlp"] = (_fuse_int8(model) if fmt == INT8_W8A8_FORMAT else _fuse(model)) if fuse else (0, 0)
+    stats["fused_qkv"], stats["fused_mlp"] = (_fuse_int8(model) if fmt in (INT8_W8A8_FORMAT, W4A8_FORMAT) else _fuse(model)) if fuse else (0, 0)
     model.to(device)       # embeddings / norms / any dense layer left; the quantised buffers are there
     if kfold:
         stats["kfold"] = enable_kfold(model)

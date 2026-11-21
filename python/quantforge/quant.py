@@ -253,3 +253,45 @@ def concat_columns(*parts):
     return (torch.cat([p[0] for p in parts], dim=1).contiguous(),
             torch.cat([p[1] for p in parts], dim=1).contiguous(),
             torch.cat([p[2] for p in parts], dim=1).contiguous())
+
+
+@torch.no_grad()
+def w4a8_quantize(w: torch.Tensor, group: int = 128):
+    """Progressive INT4 quantisation of a weight ``[N, K]`` for the W4A8 kernel (QServe's scheme): INT8 per output channel (the usual
+    +-127), then INT4 per group of `group` along K with an *integer* scale ``gs`` (1..16) and an integer zero point ``z`` (0..15)
+    per group, chosen to minimise the squared error of the group (a group may clip its largest values when that buys a finer step for
+    the rest). The weight the tensor cores see is ``(q - z) * gs`` with q in 0..15; the candidates are limited to the (gs, z) for which
+    that stays inside int8 ([-128, 127]), so the kernel's 8-bit arithmetic cannot wrap, and the only float scale is per channel.
+
+    Returns ``(packed int8 [N, K/2] (even k in the low nibble), gs int8 [N, K/group], z int8 [N, K/group], sw f32 [N])``."""
+    N, K = w.shape
+    if K % group or K % 2:
+        raise ValueError(f"in_features={K} must be a multiple of {group}")
+    w = w.float()
+    sw = (w.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
+    g8 = (w / sw[:, None]).round().clamp(-127, 127).reshape(N, K // group, group)
+    mn = g8.amin(2)
+    best_err = torch.full(g8.shape[:2], float("inf"), device=w.device)
+    gs = torch.ones(g8.shape[:2], device=w.device)
+    zp = torch.zeros(g8.shape[:2], device=w.device)
+    for cand in range(1, 17):
+        zlo, zhi = max(0, -(-(15 * cand - 127) // cand)), min(15, 128 // cand)      # (0 - z) * cand >= -128 and (15 - z) * cand <= 127
+        z = (-mn / cand).round().clamp(zlo, zhi)
+        q = (g8 / cand + z[:, :, None]).round().clamp(0, 15)
+        err = (g8 - (q - z[:, :, None]) * cand).square().sum(2)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        gs = torch.where(better, torch.full_like(gs, cand), gs)
+        zp = torch.where(better, z, zp)
+    q = (g8 / gs[:, :, None] + zp[:, :, None]).round().clamp(0, 15)
+    nib = q.to(torch.uint8).reshape(N, K)
+    packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.int8).contiguous()
+    return packed, gs.to(torch.int8).contiguous(), zp.to(torch.int8).contiguous(), sw
+
+
+def w4a8_dequantize(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, group: int = 128) -> torch.Tensor:
+    """Float weight ``[N, K]`` that `w4a8_quantize` represents (reference / fallback)."""
+    p = packed.view(torch.uint8)
+    nib = torch.stack((p & 15, p >> 4), dim=2).reshape(p.shape[0], -1).int()
+    rep = lambda t: t.int().repeat_interleave(group, 1)      # noqa: E731
+    return (nib - rep(zp)) * rep(gs) * sw[:, None]

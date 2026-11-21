@@ -319,3 +319,12 @@ The program is `matmul_transpose_b (i8 -> i32)` followed by a `linalg.generic` (
 (`sitofp`, two multiplies, bias, `truncf`) and stored to the f16 output at absolute coordinates with ONE 4-byte `st.global.b32` (inline asm; the generic lowering of a `vector<2xf16>` store gave two 2-byte stores). The elementwise
 kernel (every other `gpu.launch` that touches the int32 buffer), the dead subviews and the buffer's `gpu.alloc` / `gpu.dealloc` are erased: **the device allocation matters**, a first version left it and every call did a `cudaMalloc` of
 `M x N x 4` bytes (device time 1.1 ms, wall time 2.1 ms; ncu said the kernel was fine, the profiler's device time versus the wall time per launch said where the second millisecond was).
+
+### W4A8 (`W4A8GemmDq`): a plain `linalg.generic` as the weight producer
+
+INT4 weights with INT8 activations need no new pass: the program is a `linalg.generic` (`quantforge.no_tile`, `quantforge.no_vectorize`) that builds the int8 weight `Bt[n, k] = (nibble(Bp[n, k floordiv 2], k mod 2) - zp[n, k floordiv 128]) * gs[n, k floordiv 128]`
+(all `i8` arithmetic) followed by the `matmul_transpose_b` and the `int8-dequant` generic above. After bufferisation the producer is a standalone elementwise kernel writing an `[N x K]` int8 buffer, and the existing
+`quantforge-fuse-producer-into-loads` pass (it is not specific to `qf.dequant`: any store whose backward slice is pure and reads only inputs) recomputes it at the loads that stage the B tile and deletes the kernel and the buffer,
+so the 4-bit weights are the only weight traffic and the whole GEMM + dequantisation is one kernel (`w4a8_gemm_dq`, 1 launch in the profiler). The accumulation is int32 over all of K: the group scale is an *integer* and is folded
+into the int8 weight before the `mma`, the only float scale is per output channel and lives in the epilogue (QServe's progressive quantisation). `quantforge.quant.w4a8_quantize` picks (gs, zp) per group by minimum squared error among the
+pairs for which `(q - zp) * gs` stays inside int8, because the kernel's 8-bit arithmetic wraps. Cost: the dequantisation (and, per row block, its repetition) is ALU work in the main loop, 47-53 TOPS against 59-71 for the int8 kernel.

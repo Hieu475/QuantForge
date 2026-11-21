@@ -141,6 +141,13 @@ of fp16 (the cuBLASLt route was 0.91-1.08x), wikitext-2 perplexity +0.33..0.41. 
 needed an integer extension-folding pattern in the vectorization pass, the `thread-tile-k` option, an i32-aware overwrite pass, a fix to the shared-memory promotion pass (a transposed B tile was only recognised when block N equalled
 block M: half the output or more was wrong for the other block shapes; the sweep that compared every result with cuBLASLt found it) and the new epilogue kind.
 
+**W4A8 (INT4 weights, INT8 activations, experimental).** `quantize_model(model, "w4a8")` (`W4A8Linear`, kernel `quantforge.e2e.W4A8GemmDq`): QServe-style progressive quantisation (INT8 per channel, then INT4 per group of 128 with an
+*integer* scale and zero point), so the tensor cores get `(nibble - zero) * scale` as int8 built while the tile is staged, the accumulation is one int32 over K and the only float scale is the per-channel one of the `int8-dequant` store: one kernel,
+no compiler change (the weight is a `linalg.generic` the producer-fusion pass recomputes at the loads; `python/quantforge/PIPELINE.md`). Kernel: 1.11-1.26x cuBLAS fp16 and 1.37-1.87x the QuantForge W4A16 kernel at 2048 rows, 20-30 % behind the INT8 kernel
+(`benchmarks/w4a8_gemm.py`). Whole-model prefill (2048 tokens, one session): Qwen2.5-0.5B 1.01x / Llama-3.2-1B 1.07x / Qwen2.5-1.5B 1.04x of fp16 against 0.83x / 0.88x for INT4 W4A16, at INT4 quality (perplexity 23.7 / 22.1 against 22.9 / 22.3 for W4A16 RTN; 14.7 against 12.7 for fp16 on the 1.5B)
+and the smallest memory (0.47 / 1.05 / 1.19 GB against 1.01 / 2.48 / 3.10 for fp16). INT8 W8A8 is faster (1.10-1.22x) and closer to fp16 when the memory is affordable. Prefill / large-batch format (fewer than 17 rows use a dequantised fp16 matmul); needs in/out features that are multiples of 128;
+round-to-nearest only (no GPTQ). The first version used a symmetric range and was 5 perplexity points worse than INT4: the group zero point matters (blog, update 5).
+
 ## Build
 
 Supported toolchain: **LLVM/MLIR 18.1.x** (the MLIR C++ API changes every release;

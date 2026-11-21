@@ -150,3 +150,38 @@ GEMM thật sự nhanh hơn 1.46x; điều ngăn cả model theo kịp là 24 ms
 **Hai cái bẫy đo lường.** (1) Một sweep `block-swizzle` đo từng biến thể ở một thời điểm khác nhau nói rằng swizzle giúp mọi shape layer từ 3 đến 28 phần trăm. Các vòng xen kẽ của mọi biến thể trong một phiên nói điều khác: nó nhanh hơn 2.3x với weight lớn hơn L2 (2048 x 2048 x 16384: 5.8 xuống 2.5 ms) và chậm hơn 12 đến 14 phần trăm với weight vừa trong L2 (2048 x 4096 x 4096), nên quy tắc giờ dựa trên kích thước. Xung nhịp của GPU laptop trôi 10 phần trăm giữa các lần đo, nhiều hơn phần lớn các khác biệt tôi đang cố đo. Phép gộp đầu vào dùng chung trước đó đã làm lộ ra điều này theo chiều ngược lại: với ngưỡng cũ, weight gate / up được nới rộng của Llama-3.2-1B (33.6 MB, ngay dưới ngưỡng) chạy không swizzle với thời gian gấp 2.9 lần và làm model chậm đi 32 phần trăm, cho đến khi tôi đo riêng shape đó. (2) Các bảng trong bài này đến từ các phiên khác nhau; hãy so sánh các cột trong cùng một hàng, đừng bao giờ so giữa các bảng.
 
 Chưa làm, và vì sao: lượng tử hóa head (prefill thật chỉ cần vị trí cuối), W4A8 (giảm một nửa số byte weight nhưng cần phép đổi tỷ lệ int32 sang float theo từng nhóm ngay trong vòng K, một cách tích lũy mới trong compiler), và lượng tử hóa `silu * up` gộp, vốn là một kernel cho một họ model.
+
+## Cập nhật 5: W4A8, và lý do tôi đưa ra để không làm nó là sai (2026-11-21)
+
+Cập nhật 4 nói W4A8 "cần phép đổi tỷ lệ int32 sang float theo từng nhóm ngay trong vòng K, một cách tích lũy mới trong compiler". Không cần, nếu cách lượng tử hóa được thiết kế cho nó. *Lượng tử hóa lũy tiến* của QServe làm được: weight trước hết được lượng tử hóa sang INT8 với một scale float cho mỗi kênh đầu ra, rồi weight INT8 đó được lượng tử hóa sang INT4 theo nhóm 128 với scale **nguyên** (1 đến 16) và zero point nguyên. Weight mà tensor core cần là `(nibble - zero) * group_scale`, lại là một int8, nên nó dựng được trong thanh ghi lúc nạp tile, phép tích lũy vẫn là một int32 trên toàn bộ K, và scale float duy nhất còn lại là scale theo kênh trong epilogue đã có. Không phải đổi gì ở compiler.
+
+**Kernel là một producer, không phải một pass.** Chương trình là một `linalg.generic` tính weight int8 từ các nibble đã đóng gói (`n, k` đọc byte `k / 2`, chọn nibble theo `k mod 2`, trừ zero point của nhóm, nhân với scale của nhóm; toàn bộ trong `i8`), rồi đến `matmul_transpose_b` và phép lưu `int8-dequant` của Cập nhật 3. Pass hợp nhất producer viết cho việc dequantise INT4 hóa ra không riêng cho nó: mọi phép store có backward slice thuần đều được tính lại tại các lần load của GEMM. Nó biên dịch được ngay lần đầu, khớp từng bit với tham chiếu số nguyên, trong **một kernel** (`W4A8GemmDq`). Weight là lưu lượng weight duy nhất: 4 bit mỗi weight.
+
+**Lượng tử hóa, và một cái bẫy chất lượng.** Phiên bản đầu của tôi dùng dải 4-bit đối xứng theo nhóm, và model tệ hơn INT4 thường rất nhiều (perplexity Qwen2.5-0.5B 28.9 so với 22.9). Tôi đã đổ cho scale nhóm nguyên; chọn nó theo từng nhóm bằng bình phương sai số nhỏ nhất thay vì làm tròn lên chỉ đưa Qwen xuống 28.0 và Llama-3.2-1B không đổi. Thí nghiệm tách riêng tìm ra nguyên nhân: thay weight bằng giá trị dequantise và giữ activation ở fp16, INT4 đối xứng với scale *float* đã cho 26.3, bất đối xứng cho 22.9. INT4 của thư viện luôn có zero point theo nhóm; tôi đã bỏ nó để tiết kiệm một tensor. Với zero point nguyên theo nhóm (phép tìm chỉ giữ các cặp (scale, zero) mà `(q - z) * s` vẫn nằm trong int8, vì số học 8-bit của kernel bị quấn vòng chứ không bão hòa) riêng weight cho 23.1 và cả lớp W4A8 cho 23.7 (Qwen2.5-0.5B), 22.06 (Llama-3.2-1B, so với 22.28 của INT4 W4A16 với head INT8). Vậy chất lượng là của INT4, không tốt hơn.
+
+**Tốc độ** (kernel, các vòng xen kẽ trong một phiên, L2 được xả, `benchmarks/w4a8_gemm.py`):
+
+| shape (M x K x N) | cuBLAS fp16 | QF W4A16 | QF INT8 W8A8 | **QF W4A8** | W4A8 so với fp16 / W4A16 / INT8 |
+|---|--:|--:|--:|--:|--:|
+| 2048 x 4096 x 4096 | 1424 us | 1767 | 966 | **1286** (53 TOPS) | 1.11x / 1.37x / 0.75x |
+| 2048 x 4096 x 11008 | 4359 | 5455 | 2630 | **3709** | 1.18x / 1.47x / 0.71x |
+| 2048 x 11008 x 4096 | 4649 | 5031 | 2618 | **3682** | 1.26x / 1.37x / 0.71x |
+| 2048 x 896 x 4864 | 449 | 711 | 304 | **381** | 1.18x / 1.87x / 0.80x |
+| 2048 x 2048 x 8192 | 1639 | 2062 | 1022 | **1304** | 1.26x / 1.58x / 0.78x |
+
+Nó vượt cuBLAS fp16 và kernel W4A16 ở prefill, và chậm hơn kernel INT8 từ 20 đến 30 phần trăm: việc giải nén là công việc ALU trong vòng nạp tile, lặp lại cho mỗi khối hàng, và producer tổng quát là mã vô hướng (một phép giải nén vector hóa như của đường W4A16 là việc nên thử tiếp theo).
+
+Cả model, prefill 2048 token, head ở fp16, bốn biến thể của mỗi model trong một phiên (`benchmarks/hf_fp8_w8a8.py`):
+
+| model | fp16 | INT4 W4A16 (+ head INT8) | INT8 W8A8 | **W4A8** |
+|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B, ms (so với fp16) | 87.7 | 105.4 (0.83x) | 79.5 (1.10x) | **87.0 (1.01x)** |
+| perplexity / bộ nhớ GPU | 18.79 / 1.01 GB | 22.91 / 0.67 | 19.20 / 0.64 | **23.72 / 0.47** |
+| Llama-3.2-1B, ms | 184.2 | 210.1 (0.88x) | 152.2 (1.21x) | **172.7 (1.07x)** |
+| perplexity / bộ nhớ GPU | 17.91 / 2.48 GB | 22.28 / 1.40 | 18.23 / 1.51 | **22.06 / 1.05** |
+| Qwen2.5-1.5B, ms | 243.1 | hết bộ nhớ trong benchmark này | 199.6 (1.22x) | **233.5 (1.04x)** |
+| perplexity / bộ nhớ GPU | 12.66 / 3.10 GB | | 13.06 / 1.79 | **14.70 / 1.19** |
+
+(Biến thể INT4 W4A16 của 1.5B hết bộ nhớ trong benchmark Hugging Face nên không có số cho nó; các hàng 1.5B của những biến thể khác được chạy mỗi biến thể một tiến trình.) Tóm tắt trung thực: **W4A8 là bản thay thế cho lớp INT4 W4A16 ở prefill, giữ nguyên chất lượng** (nhanh hơn 1.2x với cùng số bit và gần cùng perplexity), và là định dạng nhỏ nhất ở đây, nhưng ở mức cả model nó chỉ chạm tốc độ fp16 vì 28 phần trăm prefill đó không phải GEMM; khi có thể chi thêm 1.5 lần bộ nhớ, INT8 W8A8 vừa nhanh hơn vừa tốt hơn W4A8 1.6 điểm perplexity ở model 1.5B (13.06 so với 14.70). Decode không đổi (bị giới hạn bởi băng thông: kernel W4A16 đã đọc cùng số byte). Weight đến từ việc lượng tử hóa model fp16 bằng làm tròn gần nhất; bù sai số kiểu GPTQ trên định dạng này chưa làm.
+
+Test: `test_w4a8_quantisation_never_overflows_int8_and_the_linear_matches_its_reference` (weight nguyên nằm trong int8 với đầu vào nhiều outlier, lớp đã biên dịch bằng tham chiếu số nguyên tới mức làm tròn f16) và `test_w4a8_shared_input_fusion_gives_the_same_model_output`.
