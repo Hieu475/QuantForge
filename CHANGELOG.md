@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* `quantforge.kfold`: K-folding for long-K, narrow-N decode layers (`QuantLinear.enable_kfold()`, `nn.enable_kfold(model)`, `kfold=` in `quantize_model` / `load_quantized_checkpoint`,
+  on by default in the vLLM plugin): +9 % (Qwen2.5-0.5B) / +15 % (1.5B) vLLM throughput at 1-4 requests, ~0.85x of Marlin there.
+
 * vLLM plugin (`quantization="quantforge"`, entry point `vllm.general_plugins`): GPTQ 4-bit checkpoints on the QuantForge kernels; 70-80 % of Marlin's
   throughput on Qwen2.5-0.5B / 1.5B. `FP8W8A8Linear` / `quantize_model(fmt="fp8_w8a8")` (cuBLASLt FP8 tensor cores; quality good, no whole-model speed-up).
 

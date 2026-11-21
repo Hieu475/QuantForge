@@ -235,3 +235,29 @@ def test_fp8_w8a8_linear_matches_the_quantised_reference_and_a_tiny_model_runs()
     ids = torch.randint(0, 512, (2, 24), device="cuda")
     with torch.no_grad():
         assert torch.isfinite(model(ids).logits).all()
+
+
+def test_kfold_matches_the_plain_layer_for_every_row_count_and_under_torch_compile():
+    """Folding K (kfold.py) is a pure re-layout: same result as the plain kernel for 1 row (folded), more rows than
+    16 // S (plain fallback) and inside torch.compile."""
+    _require_gpu()
+    import quantforge.kfold as kf
+    import quantforge.nn as qnn
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    lin = torch.nn.Linear(1536, 896).half().cuda()                          # narrow N, K a multiple of 3 groups
+    ql = qnn.QuantLinear.from_linear(lin, "int4", 128)
+    ql_f = qnn.QuantLinear.from_linear(lin, "int4", 128)
+    assert ql_f.enable_kfold(3) == 3 and ql_f.packed_f.shape == (512, 3 * 896 // 2) and ql_f.scale_f.shape[1] == 3 * 896
+    for M in (1, 3, 5, 6, 40):
+        x = torch.randn(M, 1536, device="cuda", dtype=torch.float16, generator=g)
+        assert (ql_f(x).float() - ql(x).float()).abs().max().item() < 0.08
+    assert ql_f(torch.randn(2, 3, 1536, device="cuda", dtype=torch.float16)).shape == (2, 3, 896)
+    f = torch.compile(ql_f)
+    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16, generator=g)
+    assert (f(x).float() - ql(x).float()).abs().max().item() < 0.08
+    # a shape that does not need folding is left alone
+    wide = qnn.QuantLinear.from_linear(torch.nn.Linear(1024, 4096).half().cuda(), "int4", 128)
+    assert wide.enable_kfold() == 1 and not hasattr(wide, "packed_f")
+    with pytest.raises(ValueError):
+        kf.fold_k(ql.packed, ql.scale, ql.zero, 5)

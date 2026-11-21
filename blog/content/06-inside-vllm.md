@@ -1,5 +1,5 @@
 ---
-title: QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent go
+title: QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went
 date: 2026-11-20
 order: 6
 summary: A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).
@@ -35,7 +35,7 @@ Throughput is the number of generated tokens per second summed over the concurre
 | | 16 | 2012 | 1542 | 0.77 |
 | | 64 | 4929 | 3528 | 0.72 |
 
-The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.014). So **the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput**, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.
+The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.017). So **the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput**, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.
 
 ## Where the missing 20 to 30 percent goes
 
@@ -52,7 +52,39 @@ My first guess was overhead: the op launches three kernels per GEMM (copy the ac
 
 Wide layers are fine. The layers with a **long K and a narrow N**, which in every transformer is the `down_proj` of the MLP, are 40 to 45 percent slower than Marlin. With 128 or 64 output columns per block, N = 1536 gives 12 to 24 blocks for 20 SMs: not enough warps in flight to stream the weights at full speed. Marlin splits the K dimension across blocks; the generated kernels do not.
 
-This overturns a conclusion I wrote earlier ("split-K is not the lever"): it was measured at 1 x 11008 x 4096, where N = 4096 already gives 64 blocks. The shapes that matter for decode in a serving engine are different, and the engine comparison found them where the isolated benchmark did not. The next kernel task is a split-K schedule for these layers (K-range per `blockIdx.z`, accumulation with atomics or a second reduction), plus fusing the pad and the f16 convert into the kernel.
+This overturns a conclusion I wrote earlier ("split-K is not the lever"): it was measured at 1 x 11008 x 4096, where N = 4096 already gives 64 blocks. The shapes that matter for decode in a serving engine are different, and the engine comparison found them where the isolated benchmark did not. The textbook fix is split-K in the kernel, which in this compiler means touching six passes (tiling, mapping, shared-memory promotion, prefetch, accumulator hoisting, store). Before that I tried what could be done without the compiler.
+
+## Fixing it without touching the compiler: K-folding
+
+Three things that did not work: sweeping the tile and prefetch options (nothing below 67 microseconds for the 8960 x 1536 layer, 22 percent above Marlin's 41), a multi-stream split-K (several concurrent launches into separate accumulators, summed afterwards: 72 to 56 microseconds for that layer, no gain for 4864 x 896), and a deeper pipeline.
+
+What worked is a re-layout. Cut K into S slices and lay them side by side as the *columns* of one wider GEMM, with the S slices of the activation as S *rows*:
+
+```
+W' = [W_0 | W_1 | ... | W_{S-1}]   shape [K/S, S*N]        A' = x reshaped to [M*S, K/S]  (free)
+C' = A' @ W'   ->   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal blocks)
+```
+
+The kernel computes every (slice, slice) pair, S times more arithmetic than needed, but a tensor-core tile has 16 rows anyway, so as long as `M * S <= 16` the extra arithmetic is free: the weights are still read exactly once, by S times as many blocks and with a K loop S times shorter. The factor is chosen per layer shape by measuring the real op once (cached): S = 2 for the 4864 x 896 layer, 7 for 8960 x 1536. Layers with N >= 4096 already have enough blocks and are left alone. The cost is a second copy of the weights of the folded layers (the plain layout serves the calls with more rows), which only matters for small models because only N <= 2048 is folded.
+
+Kernel level, one row, whole op inside a CUDA graph (microseconds): 4864 x 896 37.7 to 23.3, 8960 x 1536 68.5 to 43.0, 1536 x 1536 14.4 to 12.6. In vLLM, same checkpoint, interleaved runs that agreed to 1 percent:
+
+| model | requests | Marlin | QuantForge, no fold | QuantForge, fold | fold / Marlin |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 283 | 222 | 242 | 0.85 |
+| | 4 | 1089 | 856 | 940 | 0.86 |
+| | 16 | 3968 | 3300 | 3330 | 0.84 |
+| | 64 | 11141 | 7770 | 7850 | 0.70 |
+| Qwen2.5-1.5B | 1 | 132 | 97 | 112 | 0.85 |
+| | 4 | 518 | 382 | 385 | 0.74 |
+| | 16 | 1945 | 1572 | 1560 | 0.80 |
+| | 64 | 5464 | 3742 | 3725 | 0.68 |
+
+Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where `M * S` exceeds 16 and the plain kernel runs. At 64 requests the gap to Marlin (0.68 to 0.70) is a different problem, with larger row tiles, that I have not analysed yet.
+
+### A measurement trap
+
+My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear `~/.cache/vllm/torch_compile_cache` once.
 
 ## Limitations of the plugin
 

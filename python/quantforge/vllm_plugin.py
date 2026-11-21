@@ -15,6 +15,8 @@ Limitations: 4-bit only (no 8-bit GPTQ, no AWQ yet), no MoE layers, f16 / bf16 a
 """
 from __future__ import annotations
 
+import os
+
 NAME = "quantforge"
 
 
@@ -69,13 +71,25 @@ if HAVE_VLLM:
             layer.qf_packed, layer.qf_scale, layer.qf_zero = param(packed), param(scale.half()), param(zero)
             layer.qf_perm = param(perm) if perm is not None else None
             layer.qf_group = group
+            # narrow-N decode layers get a second, folded copy of the weights (kfold.py); the others a placeholder, so that
+            # every layer calls the same op and the graph vLLM compiles (and caches) does not depend on this choice
+            from . import kfold
+
+            S = 1
+            if os.environ.get("QUANTFORGE_KFOLD", "1") != "0":
+                S = kfold.plan_ksplit(packed.shape[0], scale.shape[1], group)
+            folded = kfold.fold_k(packed, scale.half(), zero, S) if S > 1 else kfold.no_fold(packed.device)
+            layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = (param(t) for t in folded)
 
         def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
             import quantforge.torch_ops as ops
 
             xh = x if x.dtype == torch.float16 else x.half()
-            y = ops.w4a16_linear(xh, layer.qf_packed, layer.qf_scale, layer.qf_zero, layer.qf_group,
-                                 None if bias is None else bias.half(), perm=layer.qf_perm)
+            from . import kfold
+
+            y = kfold.linear(xh, layer.qf_packed, layer.qf_scale, layer.qf_zero,
+                             (layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f), layer.qf_group,
+                             None if bias is None else bias.half(), layer.qf_perm)
             return y if x.dtype == torch.float16 else y.to(x.dtype)
 
     @register_quantization_config(NAME)

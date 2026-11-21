@@ -18,6 +18,10 @@
 <li><a href="#plugin">Plugin</a></li>
 <li><a href="#cung-checkpoint-cung-engine-ket-qua">Cùng checkpoint, cùng engine: kết quả</a></li>
 <li><a href="#20-en-30-phan-tram-con-thieu-i-au">20 đến 30 phần trăm còn thiếu đi đâu</a></li>
+<li><a href="#chua-ma-khong-ung-compiler-k-folding">Chữa mà không đụng compiler: K-folding</a><ul>
+<li><a href="#mot-cai-bay-khi-o">Một cái bẫy khi đo</a></li>
+</ul>
+</li>
 <li><a href="#han-che-cua-plugin">Hạn chế của plugin</a></li>
 </ul>
 </div>
@@ -97,7 +101,7 @@ llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;q
 </tr>
 </tbody>
 </table>
-<p>Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.014). Vậy <strong>plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin</strong>, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.</p>
+<p>Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy <strong>plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin</strong>, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.</p>
 <h2 id="20-en-30-phan-tram-con-thieu-i-au">20 đến 30 phần trăm còn thiếu đi đâu<a class="headerlink" href="#20-en-30-phan-tram-con-thieu-i-au" title="Permanent link">#</a></h2>
 <p>Phỏng đoán đầu của tôi là chi phí phụ: op phát ba kernel mỗi GEMM (copy activation vào buffer đệm 16 hàng, GEMM, đổi kết quả f32 sang f16), Marlin một. Profile một lần gọi M = 1 xác nhận các kernel phụ (khoảng 2 micro giây thời gian thiết bị) nhưng cũng cho thấy chúng không thể là nguyên nhân chính, vì khoảng cách không thu hẹp ở model lớn hơn. So sánh kernel theo từng layer thì có (M = 1, micro giây, cùng phương pháp như các bảng kernel):</p>
 <table>
@@ -156,7 +160,96 @@ llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;q
 </tbody>
 </table>
 <p>Các layer rộng ổn. Các layer <strong>K dài và N hẹp</strong>, mà trong mọi transformer là <code>down_proj</code> của MLP, chậm hơn Marlin 40 đến 45 phần trăm. Với 128 hoặc 64 cột đầu ra mỗi block, N = 1536 cho 12 đến 24 block trên 20 SM: không đủ warp đang bay để stream weight ở tốc độ tối đa. Marlin chia chiều K giữa các block; kernel đã sinh thì không.</p>
-<p>Điều này lật ngược một kết luận tôi đã viết trước đó ("split-K không phải đòn bẩy"): nó được đo ở 1 x 11008 x 4096, nơi N = 4096 đã cho 64 block. Các shape quan trọng cho decode trong một engine phục vụ thì khác, và phép so sánh engine tìm ra chúng ở nơi benchmark tách rời không tìm ra. Việc kernel tiếp theo là một schedule split-K cho các layer này (một dải K cho mỗi <code>blockIdx.z</code>, cộng dồn bằng atomic hoặc một bước rút gọn thứ hai), cộng với gộp phép pad và phép đổi f16 vào kernel.</p>
+<p>Điều này lật ngược một kết luận tôi đã viết trước đó ("split-K không phải đòn bẩy"): nó được đo ở 1 x 11008 x 4096, nơi N = 4096 đã cho 64 block. Các shape quan trọng cho decode trong một engine phục vụ thì khác, và phép so sánh engine tìm ra chúng ở nơi benchmark tách rời không tìm ra. Cách chữa chuẩn là split-K trong kernel, mà trong compiler này nghĩa là đụng vào sáu pass (tiling, mapping, shared-memory promotion, prefetch, hoist accumulator, store). Trước đó tôi thử những gì làm được mà không đụng compiler.</p>
+<h2 id="chua-ma-khong-ung-compiler-k-folding">Chữa mà không đụng compiler: K-folding<a class="headerlink" href="#chua-ma-khong-ung-compiler-k-folding" title="Permanent link">#</a></h2>
+<p>Ba thứ không có tác dụng: quét các tùy chọn tile và prefetch (không cấu hình nào dưới 67 micro giây cho layer 8960 x 1536, cao hơn 22 phần trăm so với 41 của Marlin), split-K nhiều stream (nhiều lần phát đồng thời vào các accumulator riêng, cộng sau: 72 xuống 56 micro giây cho layer đó, không có lợi cho 4864 x 896), và pipeline sâu hơn.</p>
+<p>Cái hiệu quả là một cách sắp lại layout. Cắt K thành S lát và xếp cạnh nhau thành <em>cột</em> của một GEMM rộng hơn, với S lát của activation thành S <em>hàng</em>:</p>
+<pre><code>W' = [W_0 | W_1 | ... | W_{S-1}]   shape [K/S, S*N]        A' = x reshape thành [M*S, K/S]  (miễn phí)
+C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
+</code></pre>
+<p>Kernel tính mọi cặp (lát, lát), nhiều hơn cần thiết S lần phép tính, nhưng một tile tensor-core vốn đã có 16 hàng, nên chừng nào <code>M * S &lt;= 16</code> thì phần tính thừa là miễn phí: weight vẫn được đọc đúng một lần, bởi số block nhiều gấp S lần và với vòng K ngắn đi S lần. Hệ số được chọn theo từng shape layer bằng cách đo op thật một lần (có cache): S = 2 cho layer 4864 x 896, 7 cho 8960 x 1536. Layer có N &gt;= 4096 đã đủ block và được để nguyên. Cái giá là một bản weight thứ hai cho các layer được fold (layout thường phục vụ các lần gọi nhiều hàng hơn), chỉ đáng kể với model nhỏ vì chỉ N &lt;= 2048 mới được fold.</p>
+<p>Mức kernel, một hàng, cả op trong một CUDA graph (micro giây): 4864 x 896 từ 37.7 xuống 23.3, 8960 x 1536 từ 68.5 xuống 43.0, 1536 x 1536 từ 14.4 xuống 12.6. Trong vLLM, cùng checkpoint, các lần chạy xen kẽ khớp nhau trong 1 phần trăm:</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">request</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge, không fold</th>
+<th style="text-align: right;">QuantForge, fold</th>
+<th style="text-align: right;">fold / Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">283</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">242</td>
+<td style="text-align: right;">0.85</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1089</td>
+<td style="text-align: right;">856</td>
+<td style="text-align: right;">940</td>
+<td style="text-align: right;">0.86</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3968</td>
+<td style="text-align: right;">3300</td>
+<td style="text-align: right;">3330</td>
+<td style="text-align: right;">0.84</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11141</td>
+<td style="text-align: right;">7770</td>
+<td style="text-align: right;">7850</td>
+<td style="text-align: right;">0.70</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">132</td>
+<td style="text-align: right;">97</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">0.85</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">518</td>
+<td style="text-align: right;">382</td>
+<td style="text-align: right;">385</td>
+<td style="text-align: right;">0.74</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1945</td>
+<td style="text-align: right;">1572</td>
+<td style="text-align: right;">1560</td>
+<td style="text-align: right;">0.80</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5464</td>
+<td style="text-align: right;">3742</td>
+<td style="text-align: right;">3725</td>
+<td style="text-align: right;">0.68</td>
+</tr>
+</tbody>
+</table>
+<p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Ở 64 request, khoảng cách tới Marlin (0.68 đến 0.70) là một vấn đề khác, với tile hàng lớn hơn, mà tôi chưa phân tích.</p>
+<h3 id="mot-cai-bay-khi-o">Một cái bẫy khi đo<a class="headerlink" href="#mot-cai-bay-khi-o" title="Permanent link">#</a></h3>
+<p>A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa <code>~/.cache/vllm/torch_compile_cache</code> một lần.</p>
 <h2 id="han-che-cua-plugin">Hạn chế của plugin<a class="headerlink" href="#han-che-cua-plugin" title="Permanent link">#</a></h2>
 <p>Chỉ GPTQ 4-bit: không AWQ, không 8-bit, không layer MoE. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.</p></article>
 </main>

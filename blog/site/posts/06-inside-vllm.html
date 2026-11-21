@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent go - QuantForge Notes</title>
+<title>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went - QuantForge Notes</title>
 <meta name="description" content="A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).">
 <link rel="stylesheet" href="../assets/style.css">
 </head>
@@ -13,11 +13,15 @@
   <nav><a href="../index.html">Posts</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/06-inside-vllm.html" hreflang="vi">Tiếng Việt</a></nav>
 </div></header>
 <main class="wrap">
-<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent go</h1><p class="lede">A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).</p><details class="toc"><summary>Contents</summary><div class="toc">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went</h1><p class="lede">A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).</p><details class="toc"><summary>Contents</summary><div class="toc">
 <ul>
 <li><a href="#the-plugin">The plugin</a></li>
 <li><a href="#same-checkpoint-same-engine-the-result">Same checkpoint, same engine: the result</a></li>
 <li><a href="#where-the-missing-20-to-30-percent-goes">Where the missing 20 to 30 percent goes</a></li>
+<li><a href="#fixing-it-without-touching-the-compiler-k-folding">Fixing it without touching the compiler: K-folding</a><ul>
+<li><a href="#a-measurement-trap">A measurement trap</a></li>
+</ul>
+</li>
 <li><a href="#limitations-of-the-plugin">Limitations of the plugin</a></li>
 </ul>
 </div>
@@ -97,7 +101,7 @@ llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;q
 </tr>
 </tbody>
 </table>
-<p>The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.014). So <strong>the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput</strong>, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.</p>
+<p>The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.017). So <strong>the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput</strong>, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.</p>
 <h2 id="where-the-missing-20-to-30-percent-goes">Where the missing 20 to 30 percent goes<a class="headerlink" href="#where-the-missing-20-to-30-percent-goes" title="Permanent link">#</a></h2>
 <p>My first guess was overhead: the op launches three kernels per GEMM (copy the activations into a 16-row padded buffer, the GEMM, convert the f32 result to f16), Marlin one. A profile of one M = 1 call confirms the extra kernels (about 2 microseconds of device time) but also that this cannot be the main cause, because the gap does not shrink for the larger model. The per-layer kernel comparison does (M = 1, microseconds, same method as the kernel tables):</p>
 <table>
@@ -156,7 +160,96 @@ llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;q
 </tbody>
 </table>
 <p>Wide layers are fine. The layers with a <strong>long K and a narrow N</strong>, which in every transformer is the <code>down_proj</code> of the MLP, are 40 to 45 percent slower than Marlin. With 128 or 64 output columns per block, N = 1536 gives 12 to 24 blocks for 20 SMs: not enough warps in flight to stream the weights at full speed. Marlin splits the K dimension across blocks; the generated kernels do not.</p>
-<p>This overturns a conclusion I wrote earlier ("split-K is not the lever"): it was measured at 1 x 11008 x 4096, where N = 4096 already gives 64 blocks. The shapes that matter for decode in a serving engine are different, and the engine comparison found them where the isolated benchmark did not. The next kernel task is a split-K schedule for these layers (K-range per <code>blockIdx.z</code>, accumulation with atomics or a second reduction), plus fusing the pad and the f16 convert into the kernel.</p>
+<p>This overturns a conclusion I wrote earlier ("split-K is not the lever"): it was measured at 1 x 11008 x 4096, where N = 4096 already gives 64 blocks. The shapes that matter for decode in a serving engine are different, and the engine comparison found them where the isolated benchmark did not. The textbook fix is split-K in the kernel, which in this compiler means touching six passes (tiling, mapping, shared-memory promotion, prefetch, accumulator hoisting, store). Before that I tried what could be done without the compiler.</p>
+<h2 id="fixing-it-without-touching-the-compiler-k-folding">Fixing it without touching the compiler: K-folding<a class="headerlink" href="#fixing-it-without-touching-the-compiler-k-folding" title="Permanent link">#</a></h2>
+<p>Three things that did not work: sweeping the tile and prefetch options (nothing below 67 microseconds for the 8960 x 1536 layer, 22 percent above Marlin's 41), a multi-stream split-K (several concurrent launches into separate accumulators, summed afterwards: 72 to 56 microseconds for that layer, no gain for 4864 x 896), and a deeper pipeline.</p>
+<p>What worked is a re-layout. Cut K into S slices and lay them side by side as the <em>columns</em> of one wider GEMM, with the S slices of the activation as S <em>rows</em>:</p>
+<pre><code>W' = [W_0 | W_1 | ... | W_{S-1}]   shape [K/S, S*N]        A' = x reshaped to [M*S, K/S]  (free)
+C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal blocks)
+</code></pre>
+<p>The kernel computes every (slice, slice) pair, S times more arithmetic than needed, but a tensor-core tile has 16 rows anyway, so as long as <code>M * S &lt;= 16</code> the extra arithmetic is free: the weights are still read exactly once, by S times as many blocks and with a K loop S times shorter. The factor is chosen per layer shape by measuring the real op once (cached): S = 2 for the 4864 x 896 layer, 7 for 8960 x 1536. Layers with N &gt;= 4096 already have enough blocks and are left alone. The cost is a second copy of the weights of the folded layers (the plain layout serves the calls with more rows), which only matters for small models because only N &lt;= 2048 is folded.</p>
+<p>Kernel level, one row, whole op inside a CUDA graph (microseconds): 4864 x 896 37.7 to 23.3, 8960 x 1536 68.5 to 43.0, 1536 x 1536 14.4 to 12.6. In vLLM, same checkpoint, interleaved runs that agreed to 1 percent:</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">requests</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge, no fold</th>
+<th style="text-align: right;">QuantForge, fold</th>
+<th style="text-align: right;">fold / Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">283</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">242</td>
+<td style="text-align: right;">0.85</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1089</td>
+<td style="text-align: right;">856</td>
+<td style="text-align: right;">940</td>
+<td style="text-align: right;">0.86</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3968</td>
+<td style="text-align: right;">3300</td>
+<td style="text-align: right;">3330</td>
+<td style="text-align: right;">0.84</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11141</td>
+<td style="text-align: right;">7770</td>
+<td style="text-align: right;">7850</td>
+<td style="text-align: right;">0.70</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">132</td>
+<td style="text-align: right;">97</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">0.85</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">518</td>
+<td style="text-align: right;">382</td>
+<td style="text-align: right;">385</td>
+<td style="text-align: right;">0.74</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1945</td>
+<td style="text-align: right;">1572</td>
+<td style="text-align: right;">1560</td>
+<td style="text-align: right;">0.80</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5464</td>
+<td style="text-align: right;">3742</td>
+<td style="text-align: right;">3725</td>
+<td style="text-align: right;">0.68</td>
+</tr>
+</tbody>
+</table>
+<p>Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where <code>M * S</code> exceeds 16 and the plain kernel runs. At 64 requests the gap to Marlin (0.68 to 0.70) is a different problem, with larger row tiles, that I have not analysed yet.</p>
+<h3 id="a-measurement-trap">A measurement trap<a class="headerlink" href="#a-measurement-trap" title="Permanent link">#</a></h3>
+<p>My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear <code>~/.cache/vllm/torch_compile_cache</code> once.</p>
 <h2 id="limitations-of-the-plugin">Limitations of the plugin<a class="headerlink" href="#limitations-of-the-plugin" title="Permanent link">#</a></h2>
 <p>4-bit GPTQ only: no AWQ, no 8-bit, no MoE layers. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.</p></article>
 </main>

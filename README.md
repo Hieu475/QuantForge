@@ -422,10 +422,29 @@ same engine, throughput in tokens/s summed over the concurrent requests (RTX 405
 | | 64 | 4929 | 3528 | 0.72 |
 
 Output agrees with Marlin (`benchmarks/vllm_compare_outputs.py`: 4 of 5 prompts identical over 64 greedy tokens, the fifth for 34 tokens; mean |log-probability
-difference| 0.002, max 0.014). **So inside a real engine QuantForge reaches 70-80 % of Marlin.** The kernel-level table (M = 1, K x N) shows where the rest goes: qkv
-1536 x 2048 0.94x, gate/up 1536 x 17920 0.93x, but `o_proj` 1536 x 1536 **0.73x** and `down_proj` 8960 x 1536 **0.62x** (66 against 41 us), 4864 x 896 **0.55x**
-(0.5B): the layers with a long K and a narrow N have only 12-24 blocks for 20 SMs and cannot stream the weights fast enough (a split-K for them is the next
-kernel task; earlier measurements at N = 4096 had hidden this), plus two extra small kernels around every GEMM (pad the rows to 16, convert the f32 result to f16).
+difference| 0.002, max 0.017). The kernel-level table (M = 1, K x N) showed where the rest went: qkv 1536 x 2048 0.94x, gate/up 1536 x 17920 0.93x, but `o_proj`
+1536 x 1536 **0.73x**, `down_proj` 8960 x 1536 **0.62x** and 4864 x 896 **0.55x**: a long K with a narrow N gives only 12-24 blocks for 20 SMs. No tile / prefetch
+option fixes it (swept), so the plugin **folds K** (`python/quantforge/kfold.py`, `QUANTFORGE_KFOLD=0` to disable): K is cut into S slices that are laid side by side as
+columns of one wider GEMM (and as S rows of the activation). The tensor-core tile already has 16 rows, so while `M * S <= 16` the S-fold redundant arithmetic is free, the weights
+are still read once, by S times as many blocks with a K loop S times shorter. No compiler change; costs a second copy of the weights of the folded layers (only layers with
+N <= 2048). Kernel level, M = 1 (us, whole op in a CUDA graph): 4864 x 896 37.7 -> 23.3, 8960 x 1536 68.5 -> 43.0, 1536 x 1536 14.4 -> 12.6. Inside vLLM, same checkpoint
+(tokens/s summed over the requests, interleaved A/B, two runs each, identical across runs):
+
+| model | requests | Marlin | QuantForge without fold | with fold | with fold / Marlin |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 283 | 222 | 242 | 0.85 |
+| | 4 | 1089 | 856 | 940 | 0.86 |
+| | 16 | 3968 | 3300 | 3330 | 0.84 |
+| | 64 | 11141 | 7770 | 7850 | 0.70 |
+| Qwen2.5-1.5B | 1 | 132 | 97 | 112 | 0.85 |
+| | 4 | 518 | 382 | 385 | 0.74 |
+| | 16 | 1945 | 1572 | 1560 | 0.80 |
+| | 64 | 5464 | 3742 | 3725 | 0.68 |
+
+Fold helps for 1-4 requests (+9 % / +15 %) and does nothing from 16 requests up (more than `16 // S` rows: the plain kernel runs). At 64 requests the gap to Marlin is another
+story (larger-M tiles, not yet analysed). **Pitfall found on the way:** vLLM caches its compiled graphs (`~/.cache/vllm/torch_compile_cache`) by a hash that does not see the plugin, so
+a graph compiled before a plugin change is silently reused (my first A/B measured nothing for that reason). The plugin therefore makes every layer call the same op and derives the
+fold factor from tensor shapes at run time; after upgrading the plugin, clear that cache once.
 Limitations: 4-bit GPTQ only (no AWQ, no 8-bit, no MoE).
 
 ### FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)

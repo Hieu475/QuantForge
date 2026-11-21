@@ -35,7 +35,7 @@ Throughput là số token sinh ra mỗi giây cộng trên các request đồng 
 | | 16 | 2012 | 1542 | 0.77 |
 | | 64 | 4929 | 3528 | 0.72 |
 
-Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.014). Vậy **plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin**, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.
+Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy **plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin**, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.
 
 ## 20 đến 30 phần trăm còn thiếu đi đâu
 
@@ -52,7 +52,39 @@ Phỏng đoán đầu của tôi là chi phí phụ: op phát ba kernel mỗi GE
 
 Các layer rộng ổn. Các layer **K dài và N hẹp**, mà trong mọi transformer là `down_proj` của MLP, chậm hơn Marlin 40 đến 45 phần trăm. Với 128 hoặc 64 cột đầu ra mỗi block, N = 1536 cho 12 đến 24 block trên 20 SM: không đủ warp đang bay để stream weight ở tốc độ tối đa. Marlin chia chiều K giữa các block; kernel đã sinh thì không.
 
-Điều này lật ngược một kết luận tôi đã viết trước đó ("split-K không phải đòn bẩy"): nó được đo ở 1 x 11008 x 4096, nơi N = 4096 đã cho 64 block. Các shape quan trọng cho decode trong một engine phục vụ thì khác, và phép so sánh engine tìm ra chúng ở nơi benchmark tách rời không tìm ra. Việc kernel tiếp theo là một schedule split-K cho các layer này (một dải K cho mỗi `blockIdx.z`, cộng dồn bằng atomic hoặc một bước rút gọn thứ hai), cộng với gộp phép pad và phép đổi f16 vào kernel.
+Điều này lật ngược một kết luận tôi đã viết trước đó ("split-K không phải đòn bẩy"): nó được đo ở 1 x 11008 x 4096, nơi N = 4096 đã cho 64 block. Các shape quan trọng cho decode trong một engine phục vụ thì khác, và phép so sánh engine tìm ra chúng ở nơi benchmark tách rời không tìm ra. Cách chữa chuẩn là split-K trong kernel, mà trong compiler này nghĩa là đụng vào sáu pass (tiling, mapping, shared-memory promotion, prefetch, hoist accumulator, store). Trước đó tôi thử những gì làm được mà không đụng compiler.
+
+## Chữa mà không đụng compiler: K-folding
+
+Ba thứ không có tác dụng: quét các tùy chọn tile và prefetch (không cấu hình nào dưới 67 micro giây cho layer 8960 x 1536, cao hơn 22 phần trăm so với 41 của Marlin), split-K nhiều stream (nhiều lần phát đồng thời vào các accumulator riêng, cộng sau: 72 xuống 56 micro giây cho layer đó, không có lợi cho 4864 x 896), và pipeline sâu hơn.
+
+Cái hiệu quả là một cách sắp lại layout. Cắt K thành S lát và xếp cạnh nhau thành *cột* của một GEMM rộng hơn, với S lát của activation thành S *hàng*:
+
+```
+W' = [W_0 | W_1 | ... | W_{S-1}]   shape [K/S, S*N]        A' = x reshape thành [M*S, K/S]  (miễn phí)
+C' = A' @ W'   ->   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
+```
+
+Kernel tính mọi cặp (lát, lát), nhiều hơn cần thiết S lần phép tính, nhưng một tile tensor-core vốn đã có 16 hàng, nên chừng nào `M * S <= 16` thì phần tính thừa là miễn phí: weight vẫn được đọc đúng một lần, bởi số block nhiều gấp S lần và với vòng K ngắn đi S lần. Hệ số được chọn theo từng shape layer bằng cách đo op thật một lần (có cache): S = 2 cho layer 4864 x 896, 7 cho 8960 x 1536. Layer có N >= 4096 đã đủ block và được để nguyên. Cái giá là một bản weight thứ hai cho các layer được fold (layout thường phục vụ các lần gọi nhiều hàng hơn), chỉ đáng kể với model nhỏ vì chỉ N <= 2048 mới được fold.
+
+Mức kernel, một hàng, cả op trong một CUDA graph (micro giây): 4864 x 896 từ 37.7 xuống 23.3, 8960 x 1536 từ 68.5 xuống 43.0, 1536 x 1536 từ 14.4 xuống 12.6. Trong vLLM, cùng checkpoint, các lần chạy xen kẽ khớp nhau trong 1 phần trăm:
+
+| model | request | Marlin | QuantForge, không fold | QuantForge, fold | fold / Marlin |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 283 | 222 | 242 | 0.85 |
+| | 4 | 1089 | 856 | 940 | 0.86 |
+| | 16 | 3968 | 3300 | 3330 | 0.84 |
+| | 64 | 11141 | 7770 | 7850 | 0.70 |
+| Qwen2.5-1.5B | 1 | 132 | 97 | 112 | 0.85 |
+| | 4 | 518 | 382 | 385 | 0.74 |
+| | 16 | 1945 | 1572 | 1560 | 0.80 |
+| | 64 | 5464 | 3742 | 3725 | 0.68 |
+
+Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi `M * S` vượt 16 và kernel thường chạy. Ở 64 request, khoảng cách tới Marlin (0.68 đến 0.70) là một vấn đề khác, với tile hàng lớn hơn, mà tôi chưa phân tích.
+
+### Một cái bẫy khi đo
+
+A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa `~/.cache/vllm/torch_compile_cache` một lần.
 
 ## Hạn chế của plugin
 

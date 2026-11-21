@@ -30,7 +30,7 @@ import torch.nn as nn
 from . import quant
 from . import torch_ops as _ops
 
-__all__ = ["QuantLinear", "FP8W8A8Linear", "quantize_model", "load_quantized_checkpoint", "FORMATS"]
+__all__ = ["QuantLinear", "FP8W8A8Linear", "quantize_model", "load_quantized_checkpoint", "enable_kfold", "FORMATS"]
 
 FORMATS = ("int4", "int8", "fp8")
 W8A8_FORMAT = "fp8_w8a8"      # FP8 weights *and* activations on the Ada / Hopper FP8 tensor cores (cuBLASLt), see FP8W8A8Linear
@@ -61,6 +61,7 @@ class QuantLinear(nn.Module):
         self.register_buffer("zero", zero)
         self.register_buffer("bias", bias)
         self.register_buffer("perm", perm)      # GPTQ act-order: input columns are gathered with it
+        self.ksplit = 1                          # > 1: second copy of the weights folded for narrow-N decode (see kfold.py)
 
     @classmethod
     @torch.no_grad()
@@ -103,10 +104,32 @@ class QuantLinear(nn.Module):
         g = group_size or packed.shape[0] // scale.shape[0]
         return cls(packed, scale, zero, bias, g, fmt, perm)
 
+    def enable_kfold(self, ksplit: Optional[int] = None) -> int:
+        """Fold K for the calls with few rows (``kfold.py``): a long-K, narrow-N layer (``down_proj``, ``o_proj`` of a
+        small model) decodes up to 1.6x faster. Keeps a second copy of the weights. ``ksplit=None``: measure the best
+        factor (cached); returns the factor in use (1 = not worth it)."""
+        from . import kfold
+
+        kind = 8 if self.fmt == "int8" else 4 if self.fmt == "int4" else 0
+        S = kfold.plan_ksplit(self.in_features, self.out_features, self.group_size, kind) if ksplit is None else ksplit
+        if S > 1 and kind in (4, 8):
+            pf, sf, zf = kfold.fold_k(self.packed, self.scale, self.zero, S)
+            self.register_buffer("packed_f", pf, persistent=False)
+            self.register_buffer("scale_f", sf, persistent=False)
+            self.register_buffer("zero_f", zf, persistent=False)
+            self.ksplit = S
+        return self.ksplit
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = x.dtype
-        y = _ops.w4a16_linear(x if dt == torch.float16 else x.half(), self.packed, self.scale,
-                              self.zero, self.group_size, self.bias, perm=self.perm)
+        xh = x if dt == torch.float16 else x.half()
+        if self.ksplit > 1:
+            from . import kfold
+
+            y = kfold.linear(xh, self.packed, self.scale, self.zero, (self.packed_f, self.scale_f, self.zero_f),
+                             self.group_size, self.bias, self.perm)
+        else:
+            y = _ops.w4a16_linear(xh, self.packed, self.scale, self.zero, self.group_size, self.bias, perm=self.perm)
         return y if dt == torch.float16 else y.to(dt)
 
     def dequantized_weight(self) -> torch.Tensor:
@@ -127,6 +150,21 @@ class QuantLinear(nn.Module):
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, out_features={self.out_features}, fmt={self.fmt}, "
                 f"group_size={self.group_size}, bias={self.bias is not None}, act_order={self.perm is not None}")
+
+
+@torch.no_grad()
+def enable_kfold(model: nn.Module) -> dict:
+    """``QuantLinear.enable_kfold()`` on every layer (also inside the fused attention / MLP blocks). Returns
+    ``{"folded": n, "layers": total, "factors": {S: count}}``."""
+    factors: dict[int, int] = {}
+    total = 0
+    for m in model.modules():
+        if isinstance(m, QuantLinear):
+            total += 1
+            S = m.enable_kfold()
+            if S > 1:
+                factors[S] = factors.get(S, 0) + 1
+    return {"folded": sum(factors.values()), "layers": total, "factors": factors}
 
 
 def _maybe_compile(fn):
@@ -340,7 +378,7 @@ def _fuse(model: nn.Module) -> tuple[int, int]:
 @torch.no_grad()
 def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
                    skip: Iterable[str] = ("lm_head",), only: Optional[Iterable[str]] = None,
-                   fuse: bool = True, device="cuda", verbose: bool = False, w8a8_per_token: bool = True) -> dict:
+                   fuse: bool = True, device="cuda", verbose: bool = False, w8a8_per_token: bool = True, kfold: bool = False) -> dict:
     """Replace the ``nn.Linear`` layers of `model` (in place) with :class:`QuantLinear`.
 
     ``skip``: name substrings that stay dense (default: the ``lm_head``); ``only``: if given, quantise
@@ -394,6 +432,8 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
     torch.cuda.empty_cache()
     stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
     model.to(device)       # embeddings / norms / any dense layer left; the quantised buffers are there
+    if kfold:
+        stats["kfold"] = enable_kfold(model)
     gc.collect()
     torch.cuda.empty_cache()
     return stats
@@ -401,7 +441,7 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
 
 @torch.no_grad()
 def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", fuse: bool = True,
-                              device="cuda", zeros_offset: int = 1, verbose: bool = False) -> dict:
+                              device="cuda", zeros_offset: int = 1, verbose: bool = False, kfold: bool = False) -> dict:
     """Turn the Linear layers of `model` into :class:`QuantLinear` from an AWQ / GPTQ checkpoint.
 
     `model` is any (dense) instance of the architecture, e.g. ``AutoModelForCausalLM.from_pretrained(base)``;
@@ -480,6 +520,8 @@ def load_quantized_checkpoint(model: nn.Module, tensors, method: str = "gptq", f
             own[k].copy_(get(k))
     stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
     model.to(device)
+    if kfold:
+        stats["kfold"] = enable_kfold(model)
     gc.collect()
     torch.cuda.empty_cache()
     return stats
