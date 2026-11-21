@@ -78,25 +78,26 @@ Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư việ
 
 ## Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)
 
-Phép tính của lần cập nhật trước nói rằng mức 2x bị mất quanh GEMM, nên điều đầu tiên cần biết là đường Tensor Core của compiler có tiến gần đỉnh của lệnh không. Tôi đẩy một GEMM `i8 x i8 -> i32` thuần (`linalg.matmul_transpose_b`, B dạng `[N, K]` vì `ldmatrix` không chuyển vị được dữ liệu 8-bit) qua pipeline hiện có. Nó cần ba thay đổi nhỏ và một phát hiện về cấu hình:
+Phép tính của lần cập nhật trước nói rằng mức 2x bị mất quanh GEMM, nên điều đầu tiên cần biết là đường Tensor Core của compiler có tiến gần đỉnh của lệnh không. Tôi đẩy một GEMM `i8 x i8 -> i32` thuần (`linalg.matmul_transpose_b`, B dạng `[N, K]` vì `ldmatrix` không chuyển vị được dữ liệu 8-bit) qua pipeline hiện có. Nó cần ba thay đổi nhỏ, một phát hiện về cấu hình và một sửa lỗi:
 
 * matmul đã vector hóa là `contract(extsi a, extsi b, acc)`, và phần hạ xuống nvgpu từ chối `extsi`: `populateFoldArithExtensionPatterns` của LLVM 18 chỉ gộp `extf`, nên pass vector hóa có thêm một mẫu gộp các phép mở rộng số nguyên vào contraction (khoảng 20 dòng);
 * lệnh là `m16n8k16` s8 (không nhanh hơn fp16); một tùy chọn pipeline mới `thread-tile-k=32` chọn `m16n8k32`;
 * lần chạy đầu chết vì `misaligned address`: padding shared memory 8 phần tử là 16 byte với f16 nhưng 8 byte với int8, nên một hàng của tile không còn căn 16 byte cho `ldmatrix`; `smem-pad=16` sửa nó;
 * pass ghi đè (`accumulate=false`) chỉ biết accumulator f32 và âm thầm vẫn cộng dồn vào C với i32; giờ nó xử lý cả hai. Tôi phát hiện ra vì chính test của tôi điền sẵn giá trị vào đầu ra.
+* **sweep tìm ra một lỗi thật**: 48 trên 180 tổ hợp block / warp / tile K cho kết quả sai (75, 50 hoặc 100 phần trăm đầu ra), kể cả những cái trông nhanh nhất ở 60 TOPS. Bản đồ đầu ra theo từng fragment cho thấy các tile n8 xen kẽ bị sai; IR nvgpu của một cấu hình tốt và một cấu hình xấu giống hệt nhau về cấu trúc, nhưng ở cấu hình xấu tile B trong shared memory là `memref<64x64xi8>` với block N bằng 128. Pass đưa lên shared memory nhận diện tile toán hạng theo hình dạng, `[M-tile x K]` cho A và `[K x N-tile]` cho B, còn B chuyển vị là `[N-tile x K]`: nó chỉ được nhận ra khi block N tình cờ bằng block M hoặc warp M, nếu không thì pass đưa tile *warp* vào một buffer dùng chung cho mọi warp. Mở rộng phép kiểm tra hình dạng một dòng là sửa được; cùng sweep đó giờ cho 174 đúng tuyệt đối và 6 lỗi biên dịch rõ ràng (vượt ngân sách shared memory), không còn kết quả sai, và một test hồi quy phủ các tổ hợp từng sai.
 
 Kết quả, mọi đầu ra **khớp từng bit** với cuBLASLt (RTX 4050, GPU được làm nóng, chế độ ghi đè, `benchmarks/int8_gemm_probe.py`):
 
 | shape (M x K x N) | INT8 do compiler sinh | cuBLASLt INT8 | cuBLAS fp16 | so với fp16 | so với cuBLASLt |
 |---|--:|--:|--:|--:|--:|
-| 2048 x 4096 x 4096 | 57.2 TOPS | 73.0 | 38.5 | **1.49x** | 0.78x |
-| 4096 x 4096 x 4096 | 59.1 | 79.4 | 38.2 | **1.55x** | 0.74x |
-| 512 x 4096 x 4096 | 48.0 | 58.9 | 37.0 | 1.30x | 0.81x |
-| 2048 x 4096 x 11008 (swizzle 16) | 59.4 | 75.6 | 38.1 | **1.56x** | 0.79x |
-| 2048 x 4864 x 896 | 50.1 | 53.3 | 35.7 | 1.40x | 0.94x |
-| 2048 x 896 x 4864 | 39.3 | 54.8 | 35.4 | 1.11x | 0.72x |
-| 2048 x 1536 x 8960 | 46.5 | 64.0 | 36.8 | 1.26x | 0.73x |
+| 2048 x 4096 x 4096 | 61.7 TOPS | 69.9 | 38.5 | **1.60x** | 0.88x |
+| 4096 x 4096 x 4096 | 64.8 | 77.0 | 38.0 | **1.70x** | 0.84x |
+| 512 x 4096 x 4096 | 50.0 | 58.5 | 36.4 | 1.37x | 0.85x |
+| 2048 x 4096 x 11008 (swizzle 16) | 59.6 | 77.5 | 38.3 | **1.56x** | 0.77x |
+| 2048 x 4864 x 896 | 54.5 | 52.5 | 35.3 | 1.54x | **1.04x** |
+| 2048 x 896 x 4864 | 38.6 | 56.1 | 35.1 | 1.10x | 0.69x |
+| 2048 x 1536 x 8960 | 51.2 | 64.1 | 36.6 | 1.40x | 0.80x |
 
-Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chưa tinh chỉnh, nó đạt 57 đến 59 TOPS ở các shape lớn (hai phần ba đỉnh 88 TOPS của lệnh, ba phần tư cuBLASLt) và **nhanh hơn cuBLAS fp16 từ 1.1 đến 1.6 lần ở mọi shape đã thử**. Weight lớn hơn L2 cần `block-swizzle=16` (2048 x 4096 x 11008: từ 21.7 lên 56 TOPS trước khi sửa pass ghi đè, 59.4 sau đó), một lời nhắc rằng thứ tự block quan trọng ngang tile.
+Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chọn từ sweep 129 tổ hợp đều đúng tuyệt đối, nó đạt 59 đến 65 TOPS ở các shape lớn (ba phần tư đỉnh 88 TOPS của lệnh, 77 đến 88 phần trăm cuBLASLt, và vượt nó ở một shape) và **nhanh hơn cuBLAS fp16 từ 1.1 đến 1.7 lần ở mọi shape đã thử**. Weight lớn hơn L2 cần `block-swizzle=16` (2048 x 4096 x 11008: từ 21.7 lên 59.6 TOPS), một lời nhắc rằng thứ tự block quan trọng ngang tile.
 
-Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Ba lưu ý: (1) **một số tổ hợp tile biên dịch và chạy nhưng cho kết quả sai** với int8 (ví dụ block 64 x 128 với tile warp 32 x 64 ở K tile 64, tìm ra bởi sweep vì mọi kết quả đều được so với cuBLASLt); schedule trong `quantforge.e2e.INT8_GEMM_OPTS` đã được kiểm chứng, các cái khác phải được kiểm tra; (2) các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; (3) một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.
+Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Hai lưu ý: các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; và chỉ có một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.

@@ -591,12 +591,12 @@ def reference_gemm(act, q, scale, zero_point):
 # --------------------------------------------------------------------------- #
 # Plain INT8 GEMM (experimental): C[M, N] (int32) = A[M, K] (int8) @ Bt[N, K]^T (int8)
 # --------------------------------------------------------------------------- #
-INT8_GEMM_OPTS = ("block-tile-m=128 block-tile-n=128 block-tile-k=64 warp-tile-m=64 warp-tile-n=64 smem-stages=2 "
+INT8_GEMM_OPTS = ("block-tile-m=128 block-tile-n=128 block-tile-k=64 warp-tile-m=64 warp-tile-n=64 smem-stages=1 "
                   "thread-tile-k=32 smem-pad=16 accumulate=false")
-"""The schedule verified bit-exact against cuBLASLt on random data (``thread-tile-k=32``: ``mma.m16n8k32`` s8; ``smem-pad=16``: a row
-of an int8 tile must stay 16-byte aligned for ``ldmatrix``). Other tile combinations of the sweep compile and run but some give WRONG
-results (e.g. block 64x128 with warp 32x64 at K tile 64): check every new schedule against ``torch._int_mm``. For weights larger than
-the L2 add ``block-swizzle=16`` (2048 x 4096 x 11008: 21.7 -> 56 TOPS)."""
+"""The best schedule of a sweep of 129 block / warp / K-tile / stage combinations, every one bit-exact against cuBLASLt (``thread-tile-k=32``:
+``mma.m16n8k32`` s8; ``smem-pad=16``: a row of an int8 tile must stay 16-byte aligned for ``ldmatrix``). For weights larger than the L2 add
+``block-swizzle=16``. (Before the shared-memory promotion pass learned about a transposed B, the combinations with block N different
+from block M gave wrong results; they are covered by ``test/E2E/test_int8_gemm.py`` now.)"""
 
 
 class Int8Gemm:

@@ -78,25 +78,26 @@ So the 2x exists in the instruction and in the library GEMM, and is lost in the 
 
 ## Update 2: the compiler's own INT8 kernel (2026-11-21)
 
-The arithmetic of the previous update says the 2x is lost around the GEMM, so the first thing to know is whether the compiler's Tensor Core path reaches anything close to the instruction's peak. I pushed a plain `i8 x i8 -> i32` GEMM (`linalg.matmul_transpose_b`, B as `[N, K]` because `ldmatrix` cannot transpose 8-bit data) through the existing pipeline. It needed three small changes and one configuration discovery:
+The arithmetic of the previous update says the 2x is lost around the GEMM, so the first thing to know is whether the compiler's Tensor Core path reaches anything close to the instruction's peak. I pushed a plain `i8 x i8 -> i32` GEMM (`linalg.matmul_transpose_b`, B as `[N, K]` because `ldmatrix` cannot transpose 8-bit data) through the existing pipeline. It needed three small changes, one configuration discovery and a bug fix:
 
 * the vectorised matmul is `contract(extsi a, extsi b, acc)`, and the nvgpu lowering refuses the `extsi`: LLVM 18's `populateFoldArithExtensionPatterns` folds only `extf`, so the vectorization pass gets a pattern that folds the integer extensions into the contraction (about 20 lines);
 * the instruction was `m16n8k16` s8 (no faster than fp16); a new pipeline option `thread-tile-k=32` selects `m16n8k32`;
 * the first launch died with `misaligned address`: the shared-memory padding of 8 elements is 16 bytes for f16 but 8 for int8, so a tile row stopped being 16-byte aligned for `ldmatrix`; `smem-pad=16` fixes it;
 * the overwrite pass (`accumulate=false`) only knew f32 accumulators and silently kept accumulating into C for i32; it now handles both. I found this because my own test pre-filled the output.
+* **the sweep found a real bug**: 48 of 180 block / warp / K-tile combinations gave wrong results (75, 50 or 100 percent of the output), including the ones that looked fastest at 60 TOPS. A per-fragment map of the output showed alternate n8 tiles wrong; the nvgpu IR of a good and a bad configuration was structurally identical, but in the bad one the B tile in shared memory was `memref<64x64xi8>` for a block N of 128. The shared-memory promotion pass recognises operand tiles by shape, `[M-tile x K]` for A and `[K x N-tile]` for B, and a transposed B is `[N-tile x K]`: it was found only when block N happened to equal block M or warp M, and otherwise the pass promoted the *warp* tile into a buffer shared by all warps. A one-line extension of the shape test fixes it; the same sweep now gives 174 exact and 6 clean compile errors (shared-memory budget exceeded), no wrong result, and a regression test covers the combinations that failed.
 
 Result, every output **bit-exact** against cuBLASLt (RTX 4050, GPU pre-heated, overwrite mode, `benchmarks/int8_gemm_probe.py`):
 
 | shape (M x K x N) | compiler-generated INT8 | cuBLASLt INT8 | cuBLAS fp16 | vs fp16 | vs cuBLASLt |
 |---|--:|--:|--:|--:|--:|
-| 2048 x 4096 x 4096 | 57.2 TOPS | 73.0 | 38.5 | **1.49x** | 0.78x |
-| 4096 x 4096 x 4096 | 59.1 | 79.4 | 38.2 | **1.55x** | 0.74x |
-| 512 x 4096 x 4096 | 48.0 | 58.9 | 37.0 | 1.30x | 0.81x |
-| 2048 x 4096 x 11008 (swizzle 16) | 59.4 | 75.6 | 38.1 | **1.56x** | 0.79x |
-| 2048 x 4864 x 896 | 50.1 | 53.3 | 35.7 | 1.40x | 0.94x |
-| 2048 x 896 x 4864 | 39.3 | 54.8 | 35.4 | 1.11x | 0.72x |
-| 2048 x 1536 x 8960 | 46.5 | 64.0 | 36.8 | 1.26x | 0.73x |
+| 2048 x 4096 x 4096 | 61.7 TOPS | 69.9 | 38.5 | **1.60x** | 0.88x |
+| 4096 x 4096 x 4096 | 64.8 | 77.0 | 38.0 | **1.70x** | 0.84x |
+| 512 x 4096 x 4096 | 50.0 | 58.5 | 36.4 | 1.37x | 0.85x |
+| 2048 x 4096 x 11008 (swizzle 16) | 59.6 | 77.5 | 38.3 | **1.56x** | 0.77x |
+| 2048 x 4864 x 896 | 54.5 | 52.5 | 35.3 | 1.54x | **1.04x** |
+| 2048 x 896 x 4864 | 38.6 | 56.1 | 35.1 | 1.10x | 0.69x |
+| 2048 x 1536 x 8960 | 51.2 | 64.1 | 36.6 | 1.40x | 0.80x |
 
-Compiled from the same machinery as the W4A16 kernels, with an untuned schedule, it reaches 57 to 59 TOPS on the large shapes (two thirds of the 88 TOPS instruction peak, three quarters of cuBLASLt) and is **1.1 to 1.6 times faster than cuBLAS fp16 on every shape tried**. Weights larger than the L2 want `block-swizzle=16` (2048 x 4096 x 11008: 21.7 to 56 TOPS before the overwrite fix, 59.4 after), a reminder that block order matters as much as the tile.
+Compiled from the same machinery as the W4A16 kernels, with a schedule chosen from a sweep of 129 exact combinations, it reaches 59 to 65 TOPS on the large shapes (three quarters of the 88 TOPS instruction peak, 77 to 88 percent of cuBLASLt, and above it on one shape) and is **1.1 to 1.7 times faster than cuBLAS fp16 on every shape tried**. Weights larger than the L2 want `block-swizzle=16` (2048 x 4096 x 11008: 21.7 to 59.6 TOPS), a reminder that block order matters as much as the tile.
 
-What this is not: a raw int32 GEMM, with no scales, no epilogue and no activation quantisation, so it is not yet a layer and not yet a speed-up of anything the user sees. Three caveats: (1) **some tile combinations compile and run but give wrong results** on int8 (for example a 64 x 128 block with a 32 x 64 warp tile at K tile 64, found by the sweep because every result was compared with cuBLASLt); the schedule in `quantforge.e2e.INT8_GEMM_OPTS` is verified, others must be checked; (2) the small-K shapes are held back by the int32 output (4 bytes per element), which a fused f16-store epilogue would halve; (3) one GPU, sm_89. The next steps are the ones the arithmetic named: fuse the row / column scales and the bias into the store, and quantise the activations in the kernel that produces them; then W4A8.
+What this is not: a raw int32 GEMM, with no scales, no epilogue and no activation quantisation, so it is not yet a layer and not yet a speed-up of anything the user sees. Two caveats: the small-K shapes are held back by the int32 output (4 bytes per element), which a fused f16-store epilogue would halve; and it is one GPU, sm_89. The next steps are the ones the arithmetic named: fuse the row / column scales and the bias into the store, and quantise the activations in the kernel that produces them; then W4A8.

@@ -103,6 +103,12 @@ static bool isTileSizedSubview(memref::SubViewOp subview,
   for (int64_t n : tileSizesN) {
     if (dimM == tileK && dimN == n)
       return true; // Tile B: [blockK × blockN] or [blockK × warpN]
+    // Tile B of a transposed-B GEMM (linalg.matmul_transpose_b, K contiguous):
+    // [blockN × blockK] or [warpN × blockK]. Without this the block tile was
+    // only recognised when blockN happened to equal blockM / warpM, and
+    // otherwise the *warp* tile was promoted into a buffer shared by all warps.
+    if (dimM == n && dimN == tileK)
+      return true;
   }
 
   return false;

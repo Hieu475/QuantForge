@@ -25,3 +25,23 @@ def test_int8_gemm_is_bit_exact(M, K, N, extra):
     assert torch.equal(c, torch._int_mm(a, bt.t()))
     ext = a.double() @ bt.double().t()                                         # and against exact arithmetic (sums < 2**53)
     assert torch.equal(c.double(), ext)
+
+
+@pytest.mark.parametrize("bm,bn,bk,wm,wn", [(64, 128, 64, 32, 64), (64, 128, 32, 64, 64), (128, 256, 32, 64, 64), (256, 128, 64, 64, 64),
+                                             (128, 64, 128, 32, 32), (64, 64, 64, 32, 32), (128, 128, 128, 64, 64)])
+def test_int8_gemm_is_exact_for_block_n_different_from_block_m(bm, bn, bk, wm, wn):
+    """Regression: the promotion pass recognised the transposed-B tile [bn x bk] only when bn happened to equal bm / wm; otherwise it
+    promoted the warp tile into a buffer shared by all warps and half of the output (or more) was wrong."""
+    _require_gpu()
+    from quantforge.e2e import Int8Gemm
+
+    M, K, N = 512, 512, 512
+    g = torch.Generator(device="cuda").manual_seed(1)
+    a = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8, generator=g)
+    bt = torch.randint(-127, 127, (N, K), device="cuda", dtype=torch.int8, generator=g)
+    opts = (f"block-tile-m={bm} block-tile-n={bn} block-tile-k={bk} warp-tile-m={wm} warp-tile-n={wn} smem-stages=2 "
+            "thread-tile-k=32 smem-pad=16 accumulate=false")
+    c = torch.full((M, N), -1, device="cuda", dtype=torch.int32)
+    Int8Gemm.build(M, K, N, pipeline_opts=opts).launch(a, bt, c)
+    torch.cuda.synchronize()
+    assert torch.equal(c, torch._int_mm(a, bt.t()))

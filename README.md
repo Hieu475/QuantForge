@@ -133,10 +133,10 @@ torch). Checked on the RTX 4050: `quantforge-doctor` passes inside the container
 compiler with those two fused is the open path to beat cuBLAS fp16 at prefill (about 1.8x for large layers by the arithmetic of the blog post); it is not built.
 
 **A compiler-generated INT8 GEMM (experimental).** `quantforge.e2e.Int8Gemm` compiles `C[int32] = A[int8] @ Bt[int8]^T` through the existing pipeline onto the INT8 Tensor Cores
-(`mma.m16n8k32.s8`; options `thread-tile-k=32 smem-pad=16 accumulate=false`, `block-swizzle=16` for weights larger than the L2). Bit-exact against cuBLASLt, 57-59 TOPS on large shapes
-(instruction peak 88, cuBLASLt 73-79) and **1.1-1.6x cuBLAS fp16 on every shape tried** (`benchmarks/int8_gemm_probe.py`, table in the blog). Raw int32 result only: no scales, epilogue or activation quantisation yet,
-so it is not a layer; some tile combinations give wrong results (verify new schedules against `torch._int_mm`). It needed an integer extension-folding pattern in the vectorization pass, the `thread-tile-k`
-option and an i32-aware overwrite pass.
+(`mma.m16n8k32.s8`; options `thread-tile-k=32 smem-pad=16 accumulate=false`, `block-swizzle=16` for weights larger than the L2). Bit-exact against cuBLASLt for all 129 schedules of a sweep, 59-65 TOPS on large shapes
+(instruction peak 88, cuBLASLt 70-78) and **1.1-1.7x cuBLAS fp16 on every shape tried** (`benchmarks/int8_gemm_probe.py`, table in the blog). Raw int32 result only: no scales, epilogue or activation quantisation yet,
+so it is not a layer. It needed an integer extension-folding pattern in the vectorization pass, the `thread-tile-k` option, an i32-aware overwrite pass and a fix to the shared-memory promotion pass (a transposed B
+tile was only recognised when block N equalled block M: half the output or more was wrong for the other block shapes; the sweep that compared every result with cuBLASLt found it).
 
 ## Build
 

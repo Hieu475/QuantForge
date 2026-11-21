@@ -308,4 +308,6 @@ would break CUDA-graph capture). A useful version would reduce inside the kernel
 `i8 x i8 -> i32` goes through the same pipeline as the W4A16 kernels (`linalg.matmul_transpose_b`, B as `[N, K]`: `ldmatrix` cannot transpose 8-bit data). What it needed:
 `FoldExtSIIntoContract` in `quantforge-vectorization` (the vectorised matmul is `contract(extsi a, extsi b, acc)`; LLVM 18 folds only `extf`), the pipeline option `thread-tile-k` (32 selects
 `mma.m16n8k32`; 16 would give `m16n8k16`, which is no faster than f16), `smem-pad=16` (a row of an int8 tile must stay 16-byte aligned for `ldmatrix`) and i32 support in `quantforge-overwrite-output`.
-Verified schedule: `quantforge.e2e.INT8_GEMM_OPTS`. Other tile combinations of the sweep compile and run but some are WRONG (check against `torch._int_mm`): the cause is not found yet.
+Schedule: `quantforge.e2e.INT8_GEMM_OPTS` (best of 129 exact combinations). `SharedMemoryPromotionPass::isTileSizedSubview` recognises operand tiles by shape (`[M-tile x K]`, `[K x N-tile]`); a transposed B is
+`[N-tile x K]` and used to be found only when block N happened to equal block M / warp M, otherwise the *warp* tile was promoted into a buffer shared by all warps (wrong results for 48 of 180 combinations);
+`[N-tile x K]` is accepted now, and `test/E2E/test_int8_gemm.py` covers the combinations that failed.
