@@ -261,3 +261,27 @@ def test_kfold_matches_the_plain_layer_for_every_row_count_and_under_torch_compi
     assert wide.enable_kfold() == 1 and not hasattr(wide, "packed_f")
     with pytest.raises(ValueError):
         kf.fold_k(ql.packed, ql.scale, ql.zero, 5)
+
+
+def test_kfold_op_with_bias_matches_the_plain_op_and_uses_the_fused_epilogue():
+    """quantforge::w4a16_gemm_kfold = plain op for every row count, with and without a bias (C++ runtime: one epilogue kernel)."""
+    _require_gpu()
+    import quantforge.kfold as kf
+    import quantforge.nn as qnn
+    import quantforge.torch_ops as ops
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    lin = torch.nn.Linear(1536, 1152, bias=True).half().cuda()
+    ql = qnn.QuantLinear.from_linear(lin, "int4", 128)
+    S = 3
+    folded = kf.fold_k(ql.packed, ql.scale, ql.zero, S)
+    for M in (1, 4, 5, 6, 17):
+        x = torch.randn(M, 1536, device="cuda", dtype=torch.float16, generator=g)
+        for bias in (ql.bias, None):
+            y = kf.linear(x, ql.packed, ql.scale, ql.zero, folded, 128, bias)
+            ref = ops.w4a16_linear(x, ql.packed, ql.scale, ql.zero, 128, bias)
+            assert y.shape == ref.shape and (y.float() - ref.float()).abs().max().item() < 0.05, (M, bias is None)
+    if getattr(ops._cpp, "HAS_KFOLD", False):                  # the placeholder (no fold) goes through the plain kernel
+        x = torch.randn(2, 1536, device="cuda", dtype=torch.float16, generator=g)
+        y = kf.linear(x, ql.packed, ql.scale, ql.zero, kf.no_fold(x.device), 128, ql.bias)
+        assert (y.float() - ops.w4a16_linear(x, ql.packed, ql.scale, ql.zero, 128, ql.bias).float()).abs().max().item() < 1e-3

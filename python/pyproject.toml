@@ -45,4 +45,4 @@ version = { attr = "quantforge.__version__" }
 
 [tool.setuptools.package-data]
 "quantforge" = ["PIPELINE.md"]
-"quantforge.runtime" = ["*.c", "*.cpp"]
+"quantforge.runtime" = ["*.c", "*.cpp", "*.cu"]

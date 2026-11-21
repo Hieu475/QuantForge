@@ -23,6 +23,9 @@
 
 namespace py = pybind11;
 
+at::Tensor kfold_reduce_cuda(const at::Tensor &acc, int64_t M, int64_t S, int64_t N,
+                             const c10::optional<at::Tensor> &bias); // kfold_reduce.cu
+
 namespace {
 
 struct Kernel {
@@ -191,6 +194,43 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
   return out.reshape(shape);
 }
 
+// K-folded GEMM (kfold.py): S slices of K laid side by side as columns, used while M * S <= 16 rows. The generated kernel
+// writes an f32 accumulator [rows, S*N]; one small kernel adds the S diagonal blocks (+ bias) and writes f16. For more
+// rows, or without the folded weights, it is the plain op.
+at::Tensor w4a16_gemm_kfold(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
+                            const at::Tensor &zero, const at::Tensor &packed_f, const at::Tensor &scale_f,
+                            const at::Tensor &zero_f, int64_t group_size, const c10::optional<at::Tensor> &bias) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() >= 1, "x must be a float16 CUDA tensor");
+  const int64_t K = x.size(-1);
+  const int64_t M = x.numel() / K;
+  const int64_t S = scale_f.numel() ? scale_f.size(1) / scale.size(1) : 1;
+  if (S <= 1 || M * S > 16)
+    return w4a16_gemm(x, packed, scale, zero, group_size, bias, "none");
+  const int64_t N = scale.size(1), Nf = S * N, Kf = K / S;
+  const int bits = (packed_f.size(1) == Nf) ? 8 : 4;
+  c10::cuda::CUDAGuard guard(x.device());
+  Kernel k = lookup(M * S, Kf, Nf, group_size, x.device().index(), "none", /*overwrite=*/true, bits);
+  at::Tensor x2 = x.reshape({M * S, Kf}).contiguous();
+  std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
+  shape.back() = N;
+  if (!k.hot || !aligned16(x2) || !aligned16(packed_f) || !aligned16(scale_f) || !aligned16(zero_f) ||
+      !packed_f.is_contiguous() || !scale_f.is_contiguous() || !zero_f.is_contiguous()) {
+    // not on the hot path: the plain ops (same result, a few more kernels)
+    at::Tensor yf = w4a16_gemm(x2, packed_f, scale_f, zero_f, group_size, c10::nullopt, "none");
+    at::Tensor y = yf.view({M, S, S, N}).diagonal(0, 1, 2).sum(at::IntArrayRef({-1}), false, at::kFloat).to(at::kHalf);
+    if (bias.has_value())
+      y = y + *bias;
+    return y.reshape(shape);
+  }
+  at::Tensor act = (k.Mp == M * S) ? x2 : padded_activations(x2, k.Mp);
+  at::Tensor acc = at::empty({k.Mp, Nf}, x.options().dtype(at::kFloat));
+  Desc2 d0 = describe(act), d1 = describe(packed_f), d2 = describe(scale_f), d3 = describe(zero_f),
+        d4 = describe(acc), result{};
+  k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
+  k.fn(&result, &d0, &d1, &d2, &d3, &d4);
+  return kfold_reduce_cuda(acc, M, S, N, bias).reshape(shape);
+}
+
 void set_python_hooks(py::object builder, py::object fallback) {
   delete g_builder;
   delete g_fallback;
@@ -211,9 +251,18 @@ TORCH_LIBRARY(quantforge, m) {
         "Tensor? bias=None, str activation=\"none\") -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(quantforge, CUDA, m) { m.impl("w4a16_gemm", &w4a16_gemm); }
+TORCH_LIBRARY_FRAGMENT(quantforge, m) {
+  m.def("w4a16_gemm_kfold(Tensor x, Tensor packed, Tensor scale, Tensor zero_point, Tensor packed_f, Tensor scale_f, "
+        "Tensor zero_f, int group_size, Tensor? bias=None) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(quantforge, CUDA, m) {
+  m.impl("w4a16_gemm", &w4a16_gemm);
+  m.impl("w4a16_gemm_kfold", &w4a16_gemm_kfold);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_python_hooks", &set_python_hooks);
   m.def("clear_kernels", &clear_kernels);
+  m.attr("HAS_KFOLD") = true;
 }

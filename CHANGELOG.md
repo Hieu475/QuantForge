@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* 32 / 64-row schedules: 32 / 64-column blocks for N <= 2048 (11-52 % faster at kernel level); `benchmarks/sweep_skinny_blocks.py`. K-fold: the epilogue (sum of the diagonal blocks + bias + f16) is one CUDA kernel
+  in the C++ runtime (`kfold_reduce.cu`, op `w4a16_gemm_kfold`), 3 kernels per folded call instead of 5-7. vLLM, QuantForge / Marlin: Qwen2.5-0.5B 0.87-0.96, 1.5B 0.74-0.87 at 1-64 requests.
+* A failed build of the C++ runtime now says why in its warning (it used to be cut to the compiler command).
+
 * `docker/Dockerfile`: image with the compiler, torch and the package (optionally vLLM); `quantforge-doctor` and the torch op verified inside it with `--gpus all`.
 * vLLM plugin works on vLLM 0.24.0, 0.25.1 and 0.34.0 (fixes for 0.34: `use_batch_invariant`, the new `is_layer_skipped` keyword); the slow generation test now fails, instead of skipping, when only the plugin fails.
 * vLLM plugin: needs vLLM >= 0.24 (the `auto_gptq` / `auto_awq` classes it extends are in 0.24-0.34.0 and absent before); with an older or missing vLLM it now warns once

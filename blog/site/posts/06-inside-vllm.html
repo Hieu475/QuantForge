@@ -179,85 +179,114 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal bloc
 <th style="text-align: right;">QuantForge (tok/s)</th>
 <th style="text-align: right;">ratio: first version</th>
 <th style="text-align: right;">+ K-fold</th>
-<th style="text-align: right;">+ schedules (now)</th>
+<th style="text-align: right;">+ shape-aware schedules</th>
+<th style="text-align: right;">+ narrow blocks (now)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B</td>
 <td style="text-align: right;">1</td>
-<td style="text-align: right;">295</td>
-<td style="text-align: right;">258</td>
+<td style="text-align: right;">289</td>
+<td style="text-align: right;">277</td>
 <td style="text-align: right;">0.78</td>
 <td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.87</td>
+<td style="text-align: right;">0.96</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1112</td>
+<td style="text-align: right;">1050</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.88</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4066</td>
+<td style="text-align: right;">3796</td>
+<td style="text-align: right;">0.81</td>
+<td style="text-align: right;">0.84</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">7289</td>
+<td style="text-align: right;">6533</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">0.90</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11076</td>
+<td style="text-align: right;">9590</td>
+<td style="text-align: right;">0.74</td>
+<td style="text-align: right;">0.70</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.87</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">141</td>
+<td style="text-align: right;">122</td>
+<td style="text-align: right;">0.72</td>
+<td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.84</td>
 <td style="text-align: right;">0.87</td>
 </tr>
 <tr>
 <td></td>
 <td style="text-align: right;">4</td>
-<td style="text-align: right;">1129</td>
-<td style="text-align: right;">995</td>
-<td style="text-align: right;">0.77</td>
-<td style="text-align: right;">0.86</td>
-<td style="text-align: right;">0.88</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">4221</td>
-<td style="text-align: right;">3650</td>
-<td style="text-align: right;">0.81</td>
-<td style="text-align: right;">0.84</td>
-<td style="text-align: right;">0.86</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">64</td>
-<td style="text-align: right;">11306</td>
-<td style="text-align: right;">9100</td>
-<td style="text-align: right;">0.74</td>
-<td style="text-align: right;">0.70</td>
-<td style="text-align: right;">0.80</td>
-</tr>
-<tr>
-<td>Qwen2.5-1.5B</td>
-<td style="text-align: right;">1</td>
-<td style="text-align: right;">137</td>
-<td style="text-align: right;">115</td>
-<td style="text-align: right;">0.72</td>
-<td style="text-align: right;">0.85</td>
-<td style="text-align: right;">0.84</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">4</td>
-<td style="text-align: right;">531</td>
-<td style="text-align: right;">427</td>
+<td style="text-align: right;">546</td>
+<td style="text-align: right;">446</td>
 <td style="text-align: right;">n/a</td>
 <td style="text-align: right;">0.74</td>
-<td style="text-align: right;">0.80</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">2008</td>
-<td style="text-align: right;">1646</td>
-<td style="text-align: right;">0.77</td>
 <td style="text-align: right;">0.80</td>
 <td style="text-align: right;">0.82</td>
 </tr>
 <tr>
 <td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2095</td>
+<td style="text-align: right;">1702</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.82</td>
+<td style="text-align: right;">0.81</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">3681</td>
+<td style="text-align: right;">2896</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">0.79</td>
+</tr>
+<tr>
+<td></td>
 <td style="text-align: right;">64</td>
-<td style="text-align: right;">5614</td>
-<td style="text-align: right;">4090</td>
+<td style="text-align: right;">5796</td>
+<td style="text-align: right;">4300</td>
 <td style="text-align: right;">0.72</td>
 <td style="text-align: right;">0.68</td>
 <td style="text-align: right;">0.73</td>
+<td style="text-align: right;">0.74</td>
 </tr>
 </tbody>
 </table>
-<p>Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where <code>M * S</code> exceeds 16 and the plain kernel runs. The last column adds the width-aware default schedules: the fixed tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models (autotune picks 32 / 64-column blocks and a look-ahead there; I turned its winners into rules, <code>benchmarks/sweep_skinny.py</code>). Together with the fold, 1 to 16 requests reach 0.80 to 0.88 of Marlin and 64 requests 0.73 to 0.80 (+16 % and +10 % over the fold alone). Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.</p>
+<p>Folding gained 9 percent (0.5B) and 15 percent (1.5B) for one to four requests when it was introduced (about 4 percent now that the plain schedules are better) and nothing from 16 requests up, where <code>M * S</code> exceeds 16 and the plain kernel runs. The last two columns add, first, the width-aware default schedules (the tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models; autotune picks 32 / 64-column blocks and a look-ahead there, and I turned its winners into rules, <code>benchmarks/sweep_skinny.py</code>), then a second sweep that found 32 and 64-column blocks 11 to 52 % faster than 128-column ones for N &lt;= 2048 at 32 and 64 rows (for wide outputs no candidate of 74 beat the defaults by more than 4 %, <code>benchmarks/sweep_skinny_blocks.py</code>) and a fused epilogue kernel for the folded layers (3 kernels per call instead of 5 to 7: 20 to 35 % faster per layer, but invisible in whole-model time, about 1 to 2 %, because the GPU is busy 97 % of the time anyway). Together: the 0.5B model reaches 0.87 to 0.96 of Marlin at 1 to 64 requests, the 1.5B model 0.74 to 0.87; the absolute speed rose by 4 to 7 % over the previous column. Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.</p>
 <h3 id="a-measurement-trap">A measurement trap<a class="headerlink" href="#a-measurement-trap" title="Permanent link">#</a></h3>
 <p>My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear <code>~/.cache/vllm/torch_compile_cache</code> once.</p>
 <h2 id="other-checkpoint-formats">Other checkpoint formats<a class="headerlink" href="#other-checkpoint-formats" title="Permanent link">#</a></h2>

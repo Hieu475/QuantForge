@@ -97,13 +97,18 @@ _SKINNY_OPTS = {
 
 
 def _skinny_opts(M: int, K: int, N: int) -> str:
-    """Default schedule of a 32- or 64-row call (see the comment above `_SKINNY_OPTS`)."""
+    """Default schedule of a 32- or 64-row call (see the comment above `_SKINNY_OPTS`). Narrow outputs (N <= 2048) take 32 / 64
+    column blocks: the sweep over 74 candidates (`benchmarks/sweep_skinny.py`, 8 shapes) found them 11-52 % faster than the
+    128-column blocks, while for wide outputs no candidate beat the defaults by more than 4 %."""
+    base = "smem-stages=1 prefetch-distance=1"
+    if N <= 2048 and N % 64 == 0 and M in (32, 64):
+        if K * N <= 1_200_000:                 # 896 x 896 / 896 x 1152: 32 rows 1.5x, 64 rows 1.24x
+            bn = 32 if (M == 32 and N <= 1152 and N % 32 == 0) else 64
+            return f"block-tile-m=32 warp-tile-m=16 warp-tile-n=16 block-tile-n={bn} block-tile-k=128 {base}"
+        bk = 128 if M == 32 else 64
+        return f"block-tile-m=32 warp-tile-m=32 warp-tile-n=16 block-tile-n=64 block-tile-k={bk} {base}"
     if M == 32 and N >= 8192 and K <= 2048:
         return ("block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=64 "
-                "smem-stages=1 prefetch-distance=1")
-    if M == 64 and N <= 2048:
-        wn = 16 if K * N <= 1_200_000 else 32
-        return (f"block-tile-m=32 warp-tile-m=16 warp-tile-n={wn} block-tile-n=128 block-tile-k=128 "
                 "smem-stages=1 prefetch-distance=1")
     return _SKINNY_OPTS[M]
 
@@ -217,9 +222,10 @@ def _load_cpp_runtime():
         import ctypes
         from torch.utils import cpp_extension
 
-        src = Path(__file__).resolve().parent / "runtime" / "torch_runtime.cpp"
+        rt = Path(__file__).resolve().parent / "runtime"
+        src = rt / "torch_runtime.cpp"
         cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-        ext = cpp_extension.load(name="quantforge_rt", sources=[str(src)], with_cuda=True,
+        ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu")], with_cuda=True,
                                  extra_include_paths=[f"{cuda}/include"], verbose=False)
 
         def builder(M, K, N, group_size, device_index, activation, overwrite, kind):
@@ -231,8 +237,12 @@ def _load_cpp_runtime():
         return ext
     except Exception as e:  # noqa: BLE001 - any build problem: fall back to the Python op
         import warnings
-        warnings.warn(f"quantforge: C++ torch runtime unavailable ({type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:120] if str(e) else ''}); using the Python op")
+        msg = str(e)
+        # a failed build prints the compiler command first: show the lines that say what went wrong
+        errs = [ln.strip() for ln in msg.splitlines() if "error" in ln.lower() and "ninja" not in ln.lower()]
+        detail = " | ".join(errs[:2])[:400] if errs else (msg.splitlines()[0][:200] if msg else "")
+        warnings.warn(f"quantforge: C++ torch runtime unavailable ({type(e).__name__}: {detail}); using the slower Python op "
+                      f"(set QUANTFORGE_NO_CPP=1 to silence this)")
         return None
 
 

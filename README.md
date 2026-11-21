@@ -444,18 +444,20 @@ are still read once, by S times as many blocks with a K loop S times shorter. No
 N <= 2048). Kernel level, M = 1 (us, whole op in a CUDA graph): 4864 x 896 37.7 -> 23.3, 8960 x 1536 68.5 -> 43.0, 1536 x 1536 14.4 -> 12.6. Inside vLLM, same checkpoint
 (tokens/s summed over the requests, interleaved A/B, two runs each, identical across runs):
 
-| model | requests | Marlin (tok/s) | QuantForge (tok/s) | ratio: first version | + K-fold | + schedules (now) |
-|---|--:|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 1 | 295 | 258 | 0.78 | 0.85 | 0.87 |
-|  | 4 | 1129 | 995 | 0.77 | 0.86 | 0.88 |
-|  | 16 | 4221 | 3650 | 0.81 | 0.84 | 0.86 |
-|  | 64 | 11306 | 9100 | 0.74 | 0.70 | 0.80 |
-| Qwen2.5-1.5B | 1 | 137 | 115 | 0.72 | 0.85 | 0.84 |
-|  | 4 | 531 | 427 | n/a | 0.74 | 0.80 |
-|  | 16 | 2008 | 1646 | 0.77 | 0.80 | 0.82 |
-|  | 64 | 5614 | 4090 | 0.72 | 0.68 | 0.73 |
+| model | requests | Marlin (tok/s) | QuantForge (tok/s) | ratio: first version | + K-fold | + shape-aware schedules | + narrow blocks (now) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 289 | 277 | 0.78 | 0.85 | 0.87 | 0.96 |
+|  | 4 | 1112 | 1050 | 0.77 | 0.86 | 0.88 | 0.94 |
+|  | 16 | 4066 | 3796 | 0.81 | 0.84 | 0.86 | 0.93 |
+|  | 32 | 7289 | 6533 | n/a | n/a | n/a | 0.90 |
+|  | 64 | 11076 | 9590 | 0.74 | 0.70 | 0.80 | 0.87 |
+| Qwen2.5-1.5B | 1 | 141 | 122 | 0.72 | 0.85 | 0.84 | 0.87 |
+|  | 4 | 546 | 446 | n/a | 0.74 | 0.80 | 0.82 |
+|  | 16 | 2095 | 1702 | 0.77 | 0.80 | 0.82 | 0.81 |
+|  | 32 | 3681 | 2896 | n/a | n/a | n/a | 0.79 |
+|  | 64 | 5796 | 4300 | 0.72 | 0.68 | 0.73 | 0.74 |
 
-Fold helps for 1-4 requests (+9 % / +15 %) and does nothing from 16 requests up (more than `16 // S` rows: the plain kernel runs). The last column adds the width-aware default schedules: the fixed tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models (autotune picks 32 / 64-column blocks and a look-ahead there; I turned its winners into rules, `benchmarks/sweep_skinny.py`). Together with the fold, 1 to 16 requests reach 0.80 to 0.88 of Marlin and 64 requests 0.73 to 0.80 (+16 % and +10 % over the fold alone). Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.
+Fold helps for 1-4 requests (+9 % / +15 % at the time, about +4 % now that the plain schedules are better) and does nothing from 16 requests up (more than `16 // S` rows: the plain kernel runs). The last two columns add, first, the width-aware default schedules (the tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models; autotune picks 32 / 64-column blocks and a look-ahead there, and I turned its winners into rules, `benchmarks/sweep_skinny.py`), then a second sweep that found 32 and 64-column blocks 11 to 52 % faster than 128-column ones for N <= 2048 at 32 and 64 rows (for wide outputs no candidate of 74 beat the defaults by more than 4 %, `benchmarks/sweep_skinny_blocks.py`) and a fused epilogue kernel for the folded layers (3 kernels per call instead of 5 to 7: 20 to 35 % faster per layer, but invisible in whole-model time, about 1 to 2 %, because the GPU is busy 97 % of the time anyway). Together: the 0.5B model reaches 0.87 to 0.96 of Marlin at 1 to 64 requests, the 1.5B model 0.74 to 0.87; the absolute speed rose by 4 to 7 % over the previous column. Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.
 
 **Pitfall found on the way:** vLLM caches its compiled graphs (`~/.cache/vllm/torch_compile_cache`) by a hash that does not see the plugin, so a graph compiled before a plugin change is
 silently reused (my first A/B measured nothing for that reason). The plugin therefore makes every layer call the same op and derives the fold factor from tensor shapes at run time; after

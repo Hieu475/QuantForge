@@ -179,85 +179,114 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
 <th style="text-align: right;">QuantForge (tok/s)</th>
 <th style="text-align: right;">tỷ lệ: bản đầu</th>
 <th style="text-align: right;">+ K-fold</th>
-<th style="text-align: right;">+ schedule (hiện tại)</th>
+<th style="text-align: right;">+ schedule theo shape</th>
+<th style="text-align: right;">+ khối hẹp (hiện tại)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B</td>
 <td style="text-align: right;">1</td>
-<td style="text-align: right;">295</td>
-<td style="text-align: right;">258</td>
+<td style="text-align: right;">289</td>
+<td style="text-align: right;">277</td>
 <td style="text-align: right;">0.78</td>
 <td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.87</td>
+<td style="text-align: right;">0.96</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1112</td>
+<td style="text-align: right;">1050</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.88</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4066</td>
+<td style="text-align: right;">3796</td>
+<td style="text-align: right;">0.81</td>
+<td style="text-align: right;">0.84</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">7289</td>
+<td style="text-align: right;">6533</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">0.90</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11076</td>
+<td style="text-align: right;">9590</td>
+<td style="text-align: right;">0.74</td>
+<td style="text-align: right;">0.70</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.87</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">141</td>
+<td style="text-align: right;">122</td>
+<td style="text-align: right;">0.72</td>
+<td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.84</td>
 <td style="text-align: right;">0.87</td>
 </tr>
 <tr>
 <td></td>
 <td style="text-align: right;">4</td>
-<td style="text-align: right;">1129</td>
-<td style="text-align: right;">995</td>
-<td style="text-align: right;">0.77</td>
-<td style="text-align: right;">0.86</td>
-<td style="text-align: right;">0.88</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">4221</td>
-<td style="text-align: right;">3650</td>
-<td style="text-align: right;">0.81</td>
-<td style="text-align: right;">0.84</td>
-<td style="text-align: right;">0.86</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">64</td>
-<td style="text-align: right;">11306</td>
-<td style="text-align: right;">9100</td>
-<td style="text-align: right;">0.74</td>
-<td style="text-align: right;">0.70</td>
-<td style="text-align: right;">0.80</td>
-</tr>
-<tr>
-<td>Qwen2.5-1.5B</td>
-<td style="text-align: right;">1</td>
-<td style="text-align: right;">137</td>
-<td style="text-align: right;">115</td>
-<td style="text-align: right;">0.72</td>
-<td style="text-align: right;">0.85</td>
-<td style="text-align: right;">0.84</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">4</td>
-<td style="text-align: right;">531</td>
-<td style="text-align: right;">427</td>
+<td style="text-align: right;">546</td>
+<td style="text-align: right;">446</td>
 <td style="text-align: right;">n/a</td>
 <td style="text-align: right;">0.74</td>
-<td style="text-align: right;">0.80</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">2008</td>
-<td style="text-align: right;">1646</td>
-<td style="text-align: right;">0.77</td>
 <td style="text-align: right;">0.80</td>
 <td style="text-align: right;">0.82</td>
 </tr>
 <tr>
 <td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2095</td>
+<td style="text-align: right;">1702</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.82</td>
+<td style="text-align: right;">0.81</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">3681</td>
+<td style="text-align: right;">2896</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">0.79</td>
+</tr>
+<tr>
+<td></td>
 <td style="text-align: right;">64</td>
-<td style="text-align: right;">5614</td>
-<td style="text-align: right;">4090</td>
+<td style="text-align: right;">5796</td>
+<td style="text-align: right;">4300</td>
 <td style="text-align: right;">0.72</td>
 <td style="text-align: right;">0.68</td>
 <td style="text-align: right;">0.73</td>
+<td style="text-align: right;">0.74</td>
 </tr>
 </tbody>
 </table>
-<p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Cột cuối thêm các schedule mặc định theo độ rộng: các tùy chọn tile cố định của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này (autotune chọn khối 32 / 64 cột và look-ahead ở đó; tôi biến các kết quả thắng thành quy tắc, <code>benchmarks/sweep_skinny.py</code>). Cùng với fold, 1 đến 16 request đạt 0.80 đến 0.88 của Marlin và 64 request đạt 0.73 đến 0.80 (+16 % và +10 % so với chỉ fold). Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.</p>
+<p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request lúc mới đưa vào (khoảng 4 phần trăm bây giờ khi các schedule thường đã tốt hơn) và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Hai cột cuối thêm, trước hết, các schedule mặc định theo độ rộng (các tùy chọn tile của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này; autotune chọn khối 32 / 64 cột và look-ahead ở đó, và tôi biến các kết quả thắng thành quy tắc, <code>benchmarks/sweep_skinny.py</code>), rồi một lượt sweep thứ hai thấy khối 32 và 64 cột nhanh hơn 11 đến 52 % so với khối 128 cột khi N &lt;= 2048 ở 32 và 64 hàng (với đầu ra rộng không ứng viên nào trong 74 cái hơn mặc định quá 4 %, <code>benchmarks/sweep_skinny_blocks.py</code>) và một kernel epilogue gộp cho các layer được fold (3 kernel mỗi lần gọi thay vì 5 đến 7: nhanh hơn 20 đến 35 % mỗi layer, nhưng không thấy trong thời gian cả model, khoảng 1 đến 2 %, vì GPU vốn bận 97 % thời gian). Tổng cộng: model 0.5B đạt 0.87 đến 0.96 Marlin ở 1 đến 64 request, model 1.5B đạt 0.74 đến 0.87; tốc độ tuyệt đối tăng 4 đến 7 % so với cột trước. Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.</p>
 <h3 id="mot-cai-bay-khi-o">Một cái bẫy khi đo<a class="headerlink" href="#mot-cai-bay-khi-o" title="Permanent link">#</a></h3>
 <p>A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa <code>~/.cache/vllm/torch_compile_cache</code> một lần.</p>
 <h2 id="cac-inh-dang-checkpoint-khac">Các định dạng checkpoint khác<a class="headerlink" href="#cac-inh-dang-checkpoint-khac" title="Permanent link">#</a></h2>

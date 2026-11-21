@@ -69,18 +69,20 @@ Kernel tính mọi cặp (lát, lát), nhiều hơn cần thiết S lần phép 
 
 Mức kernel, một hàng, cả op trong một CUDA graph (micro giây): 4864 x 896 từ 37.7 xuống 23.3, 8960 x 1536 từ 68.5 xuống 43.0, 1536 x 1536 từ 14.4 xuống 12.6. Trong vLLM, cùng checkpoint, các lần chạy xen kẽ khớp nhau trong 1 phần trăm:
 
-| model | request | Marlin (tok/s) | QuantForge (tok/s) | tỷ lệ: bản đầu | + K-fold | + schedule (hiện tại) |
-|---|--:|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 1 | 295 | 258 | 0.78 | 0.85 | 0.87 |
-|  | 4 | 1129 | 995 | 0.77 | 0.86 | 0.88 |
-|  | 16 | 4221 | 3650 | 0.81 | 0.84 | 0.86 |
-|  | 64 | 11306 | 9100 | 0.74 | 0.70 | 0.80 |
-| Qwen2.5-1.5B | 1 | 137 | 115 | 0.72 | 0.85 | 0.84 |
-|  | 4 | 531 | 427 | n/a | 0.74 | 0.80 |
-|  | 16 | 2008 | 1646 | 0.77 | 0.80 | 0.82 |
-|  | 64 | 5614 | 4090 | 0.72 | 0.68 | 0.73 |
+| model | request | Marlin (tok/s) | QuantForge (tok/s) | tỷ lệ: bản đầu | + K-fold | + schedule theo shape | + khối hẹp (hiện tại) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 289 | 277 | 0.78 | 0.85 | 0.87 | 0.96 |
+|  | 4 | 1112 | 1050 | 0.77 | 0.86 | 0.88 | 0.94 |
+|  | 16 | 4066 | 3796 | 0.81 | 0.84 | 0.86 | 0.93 |
+|  | 32 | 7289 | 6533 | n/a | n/a | n/a | 0.90 |
+|  | 64 | 11076 | 9590 | 0.74 | 0.70 | 0.80 | 0.87 |
+| Qwen2.5-1.5B | 1 | 141 | 122 | 0.72 | 0.85 | 0.84 | 0.87 |
+|  | 4 | 546 | 446 | n/a | 0.74 | 0.80 | 0.82 |
+|  | 16 | 2095 | 1702 | 0.77 | 0.80 | 0.82 | 0.81 |
+|  | 32 | 3681 | 2896 | n/a | n/a | n/a | 0.79 |
+|  | 64 | 5796 | 4300 | 0.72 | 0.68 | 0.73 | 0.74 |
 
-Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi `M * S` vượt 16 và kernel thường chạy. Cột cuối thêm các schedule mặc định theo độ rộng: các tùy chọn tile cố định của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này (autotune chọn khối 32 / 64 cột và look-ahead ở đó; tôi biến các kết quả thắng thành quy tắc, `benchmarks/sweep_skinny.py`). Cùng với fold, 1 đến 16 request đạt 0.80 đến 0.88 của Marlin và 64 request đạt 0.73 đến 0.80 (+16 % và +10 % so với chỉ fold). Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.
+Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request lúc mới đưa vào (khoảng 4 phần trăm bây giờ khi các schedule thường đã tốt hơn) và không đổi từ 16 request trở lên, nơi `M * S` vượt 16 và kernel thường chạy. Hai cột cuối thêm, trước hết, các schedule mặc định theo độ rộng (các tùy chọn tile của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này; autotune chọn khối 32 / 64 cột và look-ahead ở đó, và tôi biến các kết quả thắng thành quy tắc, `benchmarks/sweep_skinny.py`), rồi một lượt sweep thứ hai thấy khối 32 và 64 cột nhanh hơn 11 đến 52 % so với khối 128 cột khi N <= 2048 ở 32 và 64 hàng (với đầu ra rộng không ứng viên nào trong 74 cái hơn mặc định quá 4 %, `benchmarks/sweep_skinny_blocks.py`) và một kernel epilogue gộp cho các layer được fold (3 kernel mỗi lần gọi thay vì 5 đến 7: nhanh hơn 20 đến 35 % mỗi layer, nhưng không thấy trong thời gian cả model, khoảng 1 đến 2 %, vì GPU vốn bận 97 % thời gian). Tổng cộng: model 0.5B đạt 0.87 đến 0.96 Marlin ở 1 đến 64 request, model 1.5B đạt 0.74 đến 0.87; tốc độ tuyệt đối tăng 4 đến 7 % so với cột trước. Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.
 
 ### Một cái bẫy khi đo
 

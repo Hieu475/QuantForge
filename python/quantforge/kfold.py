@@ -72,8 +72,11 @@ def _kfold_fake(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, zero
     return x.new_empty((*x.shape[:-1], scale.shape[1]), dtype=torch.float16)
 
 
-_kfold_op = torch.library.custom_op("quantforge::w4a16_gemm_kfold", mutates_args=())(_kfold_impl)
-_kfold_op.register_fake(_kfold_fake)
+if getattr(torch_ops._cpp, "HAS_KFOLD", False):      # the C++ runtime registers the op (one fused epilogue kernel)
+    torch.library.register_fake("quantforge::w4a16_gemm_kfold")(_kfold_fake)
+else:                                                # Python version: a few more small kernels
+    _kfold_op = torch.library.custom_op("quantforge::w4a16_gemm_kfold", mutates_args=())(_kfold_impl)
+    _kfold_op.register_fake(_kfold_fake)
 
 
 def no_fold(device) -> tuple:
