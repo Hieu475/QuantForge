@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Experimental compiler-generated INT8 GEMM (`quantforge.e2e.Int8Gemm`, `benchmarks/int8_gemm_probe.py`): `mma.m16n8k32.s8` through the existing pipeline, bit-exact, 57-59 TOPS on large shapes, 1.1-1.6x cuBLAS fp16.
+  Compiler: `arith.extsi` operands are folded into `vector.contract` (vectorization pass), new `thread-tile-k` pipeline option, `quantforge-overwrite-output` handles i32 accumulators.
+
 * `INT8W8A8Linear` / `quantize_model(fmt="int8_w8a8")` (cuBLASLt `_int_mm`) and `benchmarks/mma_peak.cu`: INT8 `mma` is 2.00x fp16 in hardware (88.2 vs 44.1 TOPS), 80-83 TOPS through cuBLASLt with a column-major B, but 0.90-1.07x of fp16
   for whole-model prefill; perplexity +0.33..0.41. Corrected the FP8 vs fp16 GEMM ratio to 1.9-2.1x (the fp16 baseline had been measured before the GPU reached its sustained clocks).
 

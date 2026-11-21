@@ -27,6 +27,27 @@ using namespace mlir;
 using namespace mlir::quantforge;
 
 namespace {
+/// Integer counterpart of vector::populateFoldArithExtensionPatterns (which in LLVM 18 only folds arith.extf): an i8 x i8 -> i32
+/// matmul is vectorised as `contract(extsi(a), extsi(b), acc_i32)`; fold both extensions into the contraction so that the i8
+/// operands stay visible to the Tensor Core lowering (m16n8k32 s8 x s8 -> s32).
+struct FoldExtSIIntoContract : public OpRewritePattern<vector::ContractionOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ContractionOp op, PatternRewriter &rewriter) const override {
+    auto lhs = op.getLhs().getDefiningOp<arith::ExtSIOp>();
+    auto rhs = op.getRhs().getDefiningOp<arith::ExtSIOp>();
+    if (!lhs || !rhs)
+      return failure();
+    auto lt = dyn_cast<VectorType>(lhs.getIn().getType()), rt = dyn_cast<VectorType>(rhs.getIn().getType());
+    if (!lt || !rt || lt.getElementType() != rt.getElementType())
+      return failure();
+    if (op.getKind() != vector::CombiningKind::ADD)
+      return failure();
+    rewriter.replaceOpWithNewOp<vector::ContractionOp>(op, lhs.getIn(), rhs.getIn(), op.getAcc(),
+                                                       op.getIndexingMapsAttr(), op.getIteratorTypesAttr());
+    return success();
+  }
+};
+
 struct VectorizationPass
     : public PassWrapper<VectorizationPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorizationPass)
@@ -107,8 +128,10 @@ struct VectorizationPass
     // arith.extf on the operands before the contract. Fold the extension into
     // vector.contract so the f16 operands stay visible to the Tensor Core
     // lowering (m16n8k16 f16 x f16 -> f32).
-    if (foldExtension)
+    if (foldExtension) {
       vector::populateFoldArithExtensionPatterns(patterns);
+      patterns.add<FoldExtSIIntoContract>(ctx);
+    }
 
     if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
       signalPassFailure();

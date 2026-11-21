@@ -21,6 +21,7 @@
 <li><a href="#toc-o-thi-khong">Tốc độ thì không</a></li>
 <li><a href="#can-gi-e-lam-uoc">Cần gì để làm được</a></li>
 <li><a href="#cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21">Cập nhật: tensor core INT8 cho được gì (2026-11-21)</a></li>
+<li><a href="#cap-nhat-2-kernel-int8-cua-chinh-compiler-2026-11-21">Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -150,7 +151,88 @@
 <p>cuBLAS fp16 đạt 37 đến 38 trên 44 (85 phần trăm). INT8 là đúng gấp đôi, và là một lệnh mà compiler này đã có thể nhắm tới.</p>
 <p><strong>2. Thư viện.</strong> <code>torch._int_mm</code> ban đầu cho 22 đến 24 TOPS, <em>chậm hơn</em> fp16, trông như ngõ cụt. Đó là hiệu ứng bố cục: với B theo cột (<code>weight.t()</code> của weight <code>[out, in]</code> theo hàng đúng là như vậy) cuBLASLt đạt <strong>80 đến 83 TOPS, gấp 2.1 đến 2.2 lần fp16</strong>; với B theo hàng nó âm thầm đi vào đường chậm. Một lời nhắc rằng con số của thư viện là nói về một đường đi, không phải về phần cứng.</p>
 <p><strong>3. Layer và cả model.</strong> <code>INT8W8A8Linear</code> (scale theo kênh cho weight, scale động theo token cho activation, cuBLASLt cho phép nhân) cư xử y như layer FP8: 1.44x fp16 với layer 2048 x 4096 x 4096, 0.74 đến 0.96x với các layer nhỏ của model 0.5B, vì lượng tử hóa activation và epilogue scale tốn khoảng 0.4 ms quanh một GEMM 0.86 ms. Prefill cả model 2048 token: Qwen2.5-0.5B 95.8 ms so với 86.3 ms ở fp16 (0.90x), Llama-3.2-1B 166.6 so với 178.5 ms (1.07x). Chất lượng chấp nhận được và ngang FP8: perplexity wikitext-2 19.20 so với 18.79 (+0.41) và 18.23 so với 17.91 (+0.33).</p>
-<p>Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư viện, và bị mất ở các bước quanh nó. Đó là lý lẽ cho một kernel INT8 <strong>do compiler sinh</strong> với epilogue (scale hàng, scale cột, bias, lưu f16) gộp vào lệnh store, và lượng tử hóa activation gộp vào nơi sinh ra activation; khi gộp cả hai, phép tính ở trên gợi ý khoảng 1.0 ms thay vì 1.29 ms cho layer rộng 4096, tức 1.8x fp16, và một biến thể W4A8 (weight int4 nới sang int8, scale nhóm áp lên tổng riêng int32) cũng sẽ giảm một nửa công việc dequantisation của kernel W4A16 hiện tại. Chưa cái nào được xây; đó là cách hứa hẹn nhất để thắng cuBLAS ở chế độ bị giới hạn bởi tính toán, với độ chính xác (smoothing / xoay cho W4A8) là rủi ro chính.</p></article>
+<p>Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư viện, và bị mất ở các bước quanh nó. Đó là lý lẽ cho một kernel INT8 <strong>do compiler sinh</strong> với epilogue (scale hàng, scale cột, bias, lưu f16) gộp vào lệnh store, và lượng tử hóa activation gộp vào nơi sinh ra activation; khi gộp cả hai, phép tính ở trên gợi ý khoảng 1.0 ms thay vì 1.29 ms cho layer rộng 4096, tức 1.8x fp16, và một biến thể W4A8 (weight int4 nới sang int8, scale nhóm áp lên tổng riêng int32) cũng sẽ giảm một nửa công việc dequantisation của kernel W4A16 hiện tại. Chưa cái nào được xây; đó là cách hứa hẹn nhất để thắng cuBLAS ở chế độ bị giới hạn bởi tính toán, với độ chính xác (smoothing / xoay cho W4A8) là rủi ro chính.</p>
+<h2 id="cap-nhat-2-kernel-int8-cua-chinh-compiler-2026-11-21">Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)<a class="headerlink" href="#cap-nhat-2-kernel-int8-cua-chinh-compiler-2026-11-21" title="Permanent link">#</a></h2>
+<p>Phép tính của lần cập nhật trước nói rằng mức 2x bị mất quanh GEMM, nên điều đầu tiên cần biết là đường Tensor Core của compiler có tiến gần đỉnh của lệnh không. Tôi đẩy một GEMM <code>i8 x i8 -&gt; i32</code> thuần (<code>linalg.matmul_transpose_b</code>, B dạng <code>[N, K]</code> vì <code>ldmatrix</code> không chuyển vị được dữ liệu 8-bit) qua pipeline hiện có. Nó cần ba thay đổi nhỏ và một phát hiện về cấu hình:</p>
+<ul>
+<li>matmul đã vector hóa là <code>contract(extsi a, extsi b, acc)</code>, và phần hạ xuống nvgpu từ chối <code>extsi</code>: <code>populateFoldArithExtensionPatterns</code> của LLVM 18 chỉ gộp <code>extf</code>, nên pass vector hóa có thêm một mẫu gộp các phép mở rộng số nguyên vào contraction (khoảng 20 dòng);</li>
+<li>lệnh là <code>m16n8k16</code> s8 (không nhanh hơn fp16); một tùy chọn pipeline mới <code>thread-tile-k=32</code> chọn <code>m16n8k32</code>;</li>
+<li>lần chạy đầu chết vì <code>misaligned address</code>: padding shared memory 8 phần tử là 16 byte với f16 nhưng 8 byte với int8, nên một hàng của tile không còn căn 16 byte cho <code>ldmatrix</code>; <code>smem-pad=16</code> sửa nó;</li>
+<li>pass ghi đè (<code>accumulate=false</code>) chỉ biết accumulator f32 và âm thầm vẫn cộng dồn vào C với i32; giờ nó xử lý cả hai. Tôi phát hiện ra vì chính test của tôi điền sẵn giá trị vào đầu ra.</li>
+</ul>
+<p>Kết quả, mọi đầu ra <strong>khớp từng bit</strong> với cuBLASLt (RTX 4050, GPU được làm nóng, chế độ ghi đè, <code>benchmarks/int8_gemm_probe.py</code>):</p>
+<table>
+<thead>
+<tr>
+<th>shape (M x K x N)</th>
+<th style="text-align: right;">INT8 do compiler sinh</th>
+<th style="text-align: right;">cuBLASLt INT8</th>
+<th style="text-align: right;">cuBLAS fp16</th>
+<th style="text-align: right;">so với fp16</th>
+<th style="text-align: right;">so với cuBLASLt</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">57.2 TOPS</td>
+<td style="text-align: right;">73.0</td>
+<td style="text-align: right;">38.5</td>
+<td style="text-align: right;"><strong>1.49x</strong></td>
+<td style="text-align: right;">0.78x</td>
+</tr>
+<tr>
+<td>4096 x 4096 x 4096</td>
+<td style="text-align: right;">59.1</td>
+<td style="text-align: right;">79.4</td>
+<td style="text-align: right;">38.2</td>
+<td style="text-align: right;"><strong>1.55x</strong></td>
+<td style="text-align: right;">0.74x</td>
+</tr>
+<tr>
+<td>512 x 4096 x 4096</td>
+<td style="text-align: right;">48.0</td>
+<td style="text-align: right;">58.9</td>
+<td style="text-align: right;">37.0</td>
+<td style="text-align: right;">1.30x</td>
+<td style="text-align: right;">0.81x</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 11008 (swizzle 16)</td>
+<td style="text-align: right;">59.4</td>
+<td style="text-align: right;">75.6</td>
+<td style="text-align: right;">38.1</td>
+<td style="text-align: right;"><strong>1.56x</strong></td>
+<td style="text-align: right;">0.79x</td>
+</tr>
+<tr>
+<td>2048 x 4864 x 896</td>
+<td style="text-align: right;">50.1</td>
+<td style="text-align: right;">53.3</td>
+<td style="text-align: right;">35.7</td>
+<td style="text-align: right;">1.40x</td>
+<td style="text-align: right;">0.94x</td>
+</tr>
+<tr>
+<td>2048 x 896 x 4864</td>
+<td style="text-align: right;">39.3</td>
+<td style="text-align: right;">54.8</td>
+<td style="text-align: right;">35.4</td>
+<td style="text-align: right;">1.11x</td>
+<td style="text-align: right;">0.72x</td>
+</tr>
+<tr>
+<td>2048 x 1536 x 8960</td>
+<td style="text-align: right;">46.5</td>
+<td style="text-align: right;">64.0</td>
+<td style="text-align: right;">36.8</td>
+<td style="text-align: right;">1.26x</td>
+<td style="text-align: right;">0.73x</td>
+</tr>
+</tbody>
+</table>
+<p>Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chưa tinh chỉnh, nó đạt 57 đến 59 TOPS ở các shape lớn (hai phần ba đỉnh 88 TOPS của lệnh, ba phần tư cuBLASLt) và <strong>nhanh hơn cuBLAS fp16 từ 1.1 đến 1.6 lần ở mọi shape đã thử</strong>. Weight lớn hơn L2 cần <code>block-swizzle=16</code> (2048 x 4096 x 11008: từ 21.7 lên 56 TOPS trước khi sửa pass ghi đè, 59.4 sau đó), một lời nhắc rằng thứ tự block quan trọng ngang tile.</p>
+<p>Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Ba lưu ý: (1) <strong>một số tổ hợp tile biên dịch và chạy nhưng cho kết quả sai</strong> với int8 (ví dụ block 64 x 128 với tile warp 32 x 64 ở K tile 64, tìm ra bởi sweep vì mọi kết quả đều được so với cuBLASLt); schedule trong <code>quantforge.e2e.INT8_GEMM_OPTS</code> đã được kiểm chứng, các cái khác phải được kiểm tra; (2) các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; (3) một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

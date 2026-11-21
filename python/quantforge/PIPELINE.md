@@ -302,3 +302,10 @@ the S partial results. The block tiling then runs inside it. `mergeSplitKForall`
 Constraints: `K / S` must be a multiple of `block-tile-k` and of the group size. Result: correct (`test/Transforms/gpu_pipeline_split_k.mlir`, `test/E2E/test_split_k.py`)
 but 14-23 % faster only for long-K, narrow-N layers at 32 rows, and slower for most shapes at 64 rows (second kernel, `S x M x N` extra floats, a device allocation per call that
 would break CUDA-graph capture). A useful version would reduce inside the kernel (atomics / semaphore) and take the scratch as an argument; see the blog post for the numbers.
+
+## INT8 GEMM (experimental)
+
+`i8 x i8 -> i32` goes through the same pipeline as the W4A16 kernels (`linalg.matmul_transpose_b`, B as `[N, K]`: `ldmatrix` cannot transpose 8-bit data). What it needed:
+`FoldExtSIIntoContract` in `quantforge-vectorization` (the vectorised matmul is `contract(extsi a, extsi b, acc)`; LLVM 18 folds only `extf`), the pipeline option `thread-tile-k` (32 selects
+`mma.m16n8k32`; 16 would give `m16n8k16`, which is no faster than f16), `smem-pad=16` (a row of an int8 tile must stay 16-byte aligned for `ldmatrix`) and i32 support in `quantforge-overwrite-output`.
+Verified schedule: `quantforge.e2e.INT8_GEMM_OPTS`. Other tile combinations of the sweep compile and run but some are WRONG (check against `torch._int_mm`): the cause is not found yet.

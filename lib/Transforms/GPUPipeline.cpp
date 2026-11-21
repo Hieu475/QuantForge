@@ -211,6 +211,12 @@ struct GPUPipelineOptions
       llvm::cl::desc("Keep the C accumulator tile in registers across the "
                      "innermost K loop"),
       llvm::cl::init(true)};
+  Option<int> threadTileK{
+      *this, "thread-tile-k",
+      llvm::cl::desc("K extent of one mma.sync: 16 for f16 (m16n8k16), 32 for "
+                     "int8 (m16n8k32)"),
+      llvm::cl::init(16)};
+
   Option<int> splitK{
       *this, "split-k",
       llvm::cl::desc("Cut the K reduction into this many chunks run by "
@@ -257,6 +263,7 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
           std::to_string(bk) + " warp-tile-m=" +
           std::to_string(wm) + " warp-tile-n=" +
           std::to_string(wn) +
+          " thread-tile-k=" + std::to_string(opts.threadTileK.getValue()) +
           " split-k=" + std::to_string(opts.splitK.getValue()) +
           // overwrite mode: every block writes its whole partial tile, no zero fill needed
           " split-k-init=" +

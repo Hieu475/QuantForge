@@ -65,7 +65,8 @@ struct OverwriteOutputPass
         work.push_back(ins.getDest());
         if (auto ld = ins.getSource().getDefiningOp<vector::LoadOp>())
           if (!ld.getMemRefType().getMemorySpace() &&
-              isa<FloatType>(ld.getVectorType().getElementType()))
+              (isa<FloatType>(ld.getVectorType().getElementType()) ||
+               ld.getVectorType().getElementType().isInteger(32))) // f32 / i32 accumulators
             loads.push_back(ld);
       }
     });

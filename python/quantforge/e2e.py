@@ -586,3 +586,50 @@ def dequant_reference(q, scale, zero_point):
 def reference_gemm(act, q, scale, zero_point):
     """fp32 reference of act @ ((q - zp) * scale), q holds the *unpacked* 0..15 values."""
     return act.float() @ dequant_reference(q, scale, zero_point).float()
+
+
+# --------------------------------------------------------------------------- #
+# Plain INT8 GEMM (experimental): C[M, N] (int32) = A[M, K] (int8) @ Bt[N, K]^T (int8)
+# --------------------------------------------------------------------------- #
+INT8_GEMM_OPTS = ("block-tile-m=128 block-tile-n=128 block-tile-k=64 warp-tile-m=64 warp-tile-n=64 smem-stages=2 "
+                  "thread-tile-k=32 smem-pad=16 accumulate=false")
+"""The schedule verified bit-exact against cuBLASLt on random data (``thread-tile-k=32``: ``mma.m16n8k32`` s8; ``smem-pad=16``: a row
+of an int8 tile must stay 16-byte aligned for ``ldmatrix``). Other tile combinations of the sweep compile and run but some give WRONG
+results (e.g. block 64x128 with warp 32x64 at K tile 64): check every new schedule against ``torch._int_mm``. For weights larger than
+the L2 add ``block-swizzle=16`` (2048 x 4096 x 11008: 21.7 -> 56 TOPS)."""
+
+
+class Int8Gemm:
+    """Compiled ``C = A @ Bt^T`` on the INT8 Tensor Cores (``mma.sync.m16n8k32.s8``). ``Bt`` is the weight as ``[N, K]`` (K contiguous: ldmatrix
+    cannot transpose 8-bit data). Raw int32 result: no scales, no epilogue, no activation quantisation (an experiment, see the blog)."""
+
+    NAME = "i8_gemm"
+
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled):
+        self.M, self.K, self.N = M, K, N
+        self.compiled = compiled
+        self._lib = ctypes.CDLL(str(compiled.lib_path))
+        self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
+        self._fn.argtypes = [ctypes.c_void_p] * 4
+        self._fn.restype = None
+        self._set_stream = self._lib.mgpuSetStream
+        self._set_stream.argtypes = [ctypes.c_void_p]
+        self._result = _descriptor_type(2)()
+
+    @classmethod
+    def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = INT8_GEMM_OPTS) -> "Int8Gemm":
+        ir = (f"func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bt: tensor<{N}x{K}xi8>, %c: tensor<{M}x{N}xi32>) -> tensor<{M}x{N}xi32> {{\n"
+              f"  %r = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xi8>, tensor<{N}x{K}xi8>) outs(%c : tensor<{M}x{N}xi32>) "
+              f"-> tensor<{M}x{N}xi32>\n  return %r : tensor<{M}x{N}xi32>\n}}\n")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=pipeline_opts))
+
+    def launch(self, a, bt, c) -> None:
+        """``c`` is written (overwrite schedule); all three are contiguous CUDA tensors of the right shapes."""
+        import torch
+
+        d = [_descriptor(t) for t in (a, bt, c)]
+        self._set_stream(_current_raw_stream(torch, a.device.index or 0))
+        self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))

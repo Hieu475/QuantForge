@@ -75,3 +75,28 @@ cuBLAS fp16 đạt 37 đến 38 trên 44 (85 phần trăm). INT8 là đúng gấ
 **3. Layer và cả model.** `INT8W8A8Linear` (scale theo kênh cho weight, scale động theo token cho activation, cuBLASLt cho phép nhân) cư xử y như layer FP8: 1.44x fp16 với layer 2048 x 4096 x 4096, 0.74 đến 0.96x với các layer nhỏ của model 0.5B, vì lượng tử hóa activation và epilogue scale tốn khoảng 0.4 ms quanh một GEMM 0.86 ms. Prefill cả model 2048 token: Qwen2.5-0.5B 95.8 ms so với 86.3 ms ở fp16 (0.90x), Llama-3.2-1B 166.6 so với 178.5 ms (1.07x). Chất lượng chấp nhận được và ngang FP8: perplexity wikitext-2 19.20 so với 18.79 (+0.41) và 18.23 so với 17.91 (+0.33).
 
 Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư viện, và bị mất ở các bước quanh nó. Đó là lý lẽ cho một kernel INT8 **do compiler sinh** với epilogue (scale hàng, scale cột, bias, lưu f16) gộp vào lệnh store, và lượng tử hóa activation gộp vào nơi sinh ra activation; khi gộp cả hai, phép tính ở trên gợi ý khoảng 1.0 ms thay vì 1.29 ms cho layer rộng 4096, tức 1.8x fp16, và một biến thể W4A8 (weight int4 nới sang int8, scale nhóm áp lên tổng riêng int32) cũng sẽ giảm một nửa công việc dequantisation của kernel W4A16 hiện tại. Chưa cái nào được xây; đó là cách hứa hẹn nhất để thắng cuBLAS ở chế độ bị giới hạn bởi tính toán, với độ chính xác (smoothing / xoay cho W4A8) là rủi ro chính.
+
+## Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)
+
+Phép tính của lần cập nhật trước nói rằng mức 2x bị mất quanh GEMM, nên điều đầu tiên cần biết là đường Tensor Core của compiler có tiến gần đỉnh của lệnh không. Tôi đẩy một GEMM `i8 x i8 -> i32` thuần (`linalg.matmul_transpose_b`, B dạng `[N, K]` vì `ldmatrix` không chuyển vị được dữ liệu 8-bit) qua pipeline hiện có. Nó cần ba thay đổi nhỏ và một phát hiện về cấu hình:
+
+* matmul đã vector hóa là `contract(extsi a, extsi b, acc)`, và phần hạ xuống nvgpu từ chối `extsi`: `populateFoldArithExtensionPatterns` của LLVM 18 chỉ gộp `extf`, nên pass vector hóa có thêm một mẫu gộp các phép mở rộng số nguyên vào contraction (khoảng 20 dòng);
+* lệnh là `m16n8k16` s8 (không nhanh hơn fp16); một tùy chọn pipeline mới `thread-tile-k=32` chọn `m16n8k32`;
+* lần chạy đầu chết vì `misaligned address`: padding shared memory 8 phần tử là 16 byte với f16 nhưng 8 byte với int8, nên một hàng của tile không còn căn 16 byte cho `ldmatrix`; `smem-pad=16` sửa nó;
+* pass ghi đè (`accumulate=false`) chỉ biết accumulator f32 và âm thầm vẫn cộng dồn vào C với i32; giờ nó xử lý cả hai. Tôi phát hiện ra vì chính test của tôi điền sẵn giá trị vào đầu ra.
+
+Kết quả, mọi đầu ra **khớp từng bit** với cuBLASLt (RTX 4050, GPU được làm nóng, chế độ ghi đè, `benchmarks/int8_gemm_probe.py`):
+
+| shape (M x K x N) | INT8 do compiler sinh | cuBLASLt INT8 | cuBLAS fp16 | so với fp16 | so với cuBLASLt |
+|---|--:|--:|--:|--:|--:|
+| 2048 x 4096 x 4096 | 57.2 TOPS | 73.0 | 38.5 | **1.49x** | 0.78x |
+| 4096 x 4096 x 4096 | 59.1 | 79.4 | 38.2 | **1.55x** | 0.74x |
+| 512 x 4096 x 4096 | 48.0 | 58.9 | 37.0 | 1.30x | 0.81x |
+| 2048 x 4096 x 11008 (swizzle 16) | 59.4 | 75.6 | 38.1 | **1.56x** | 0.79x |
+| 2048 x 4864 x 896 | 50.1 | 53.3 | 35.7 | 1.40x | 0.94x |
+| 2048 x 896 x 4864 | 39.3 | 54.8 | 35.4 | 1.11x | 0.72x |
+| 2048 x 1536 x 8960 | 46.5 | 64.0 | 36.8 | 1.26x | 0.73x |
+
+Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chưa tinh chỉnh, nó đạt 57 đến 59 TOPS ở các shape lớn (hai phần ba đỉnh 88 TOPS của lệnh, ba phần tư cuBLASLt) và **nhanh hơn cuBLAS fp16 từ 1.1 đến 1.6 lần ở mọi shape đã thử**. Weight lớn hơn L2 cần `block-swizzle=16` (2048 x 4096 x 11008: từ 21.7 lên 56 TOPS trước khi sửa pass ghi đè, 59.4 sau đó), một lời nhắc rằng thứ tự block quan trọng ngang tile.
+
+Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Ba lưu ý: (1) **một số tổ hợp tile biên dịch và chạy nhưng cho kết quả sai** với int8 (ví dụ block 64 x 128 với tile warp 32 x 64 ở K tile 64, tìm ra bởi sweep vì mọi kết quả đều được so với cuBLASLt); schedule trong `quantforge.e2e.INT8_GEMM_OPTS` đã được kiểm chứng, các cái khác phải được kiểm tra; (2) các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; (3) một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.

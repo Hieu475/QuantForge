@@ -75,3 +75,28 @@ cuBLAS fp16 reaches 37 to 38 of the 44 (85 percent). INT8 is a clean 2x, and it 
 **3. The layer and the model.** `INT8W8A8Linear` (per-channel weight scale, dynamic per-token activation scale, cuBLASLt for the product) behaves exactly like the FP8 layer: 1.44x of fp16 for a 2048 x 4096 x 4096 layer, 0.74 to 0.96x for the small layers of a 0.5B model, because the activation quantisation and the scale epilogue cost about 0.4 ms around a 0.86 ms GEMM. Whole-model prefill of 2048 tokens: Qwen2.5-0.5B 95.8 ms against 86.3 ms in fp16 (0.90x), Llama-3.2-1B 166.6 against 178.5 ms (1.07x). Quality is acceptable and matches FP8: wikitext-2 perplexity 19.20 against 18.79 (+0.41) and 18.23 against 17.91 (+0.33).
 
 So the 2x exists in the instruction and in the library GEMM, and is lost in the passes around it. That is the argument for a **compiler-generated** INT8 kernel with the epilogue (row scale, column scale, bias, f16 store) fused into the store, and the activation quantisation fused into the producer of the activations; with those two fused, the arithmetic above suggests about 1.0 ms instead of 1.29 ms for the 4096-wide layer, 1.8x fp16, and a W4A8 variant (int4 weights widened to int8, group scales applied to the int32 partial sums) would also halve the dequantisation work of the current W4A16 kernels. None of that is built yet; it is the most promising way to beat cuBLAS in the compute-bound regime, with accuracy (smoothing / rotation for W4A8) as its main risk.
+
+## Update 2: the compiler's own INT8 kernel (2026-11-21)
+
+The arithmetic of the previous update says the 2x is lost around the GEMM, so the first thing to know is whether the compiler's Tensor Core path reaches anything close to the instruction's peak. I pushed a plain `i8 x i8 -> i32` GEMM (`linalg.matmul_transpose_b`, B as `[N, K]` because `ldmatrix` cannot transpose 8-bit data) through the existing pipeline. It needed three small changes and one configuration discovery:
+
+* the vectorised matmul is `contract(extsi a, extsi b, acc)`, and the nvgpu lowering refuses the `extsi`: LLVM 18's `populateFoldArithExtensionPatterns` folds only `extf`, so the vectorization pass gets a pattern that folds the integer extensions into the contraction (about 20 lines);
+* the instruction was `m16n8k16` s8 (no faster than fp16); a new pipeline option `thread-tile-k=32` selects `m16n8k32`;
+* the first launch died with `misaligned address`: the shared-memory padding of 8 elements is 16 bytes for f16 but 8 for int8, so a tile row stopped being 16-byte aligned for `ldmatrix`; `smem-pad=16` fixes it;
+* the overwrite pass (`accumulate=false`) only knew f32 accumulators and silently kept accumulating into C for i32; it now handles both. I found this because my own test pre-filled the output.
+
+Result, every output **bit-exact** against cuBLASLt (RTX 4050, GPU pre-heated, overwrite mode, `benchmarks/int8_gemm_probe.py`):
+
+| shape (M x K x N) | compiler-generated INT8 | cuBLASLt INT8 | cuBLAS fp16 | vs fp16 | vs cuBLASLt |
+|---|--:|--:|--:|--:|--:|
+| 2048 x 4096 x 4096 | 57.2 TOPS | 73.0 | 38.5 | **1.49x** | 0.78x |
+| 4096 x 4096 x 4096 | 59.1 | 79.4 | 38.2 | **1.55x** | 0.74x |
+| 512 x 4096 x 4096 | 48.0 | 58.9 | 37.0 | 1.30x | 0.81x |
+| 2048 x 4096 x 11008 (swizzle 16) | 59.4 | 75.6 | 38.1 | **1.56x** | 0.79x |
+| 2048 x 4864 x 896 | 50.1 | 53.3 | 35.7 | 1.40x | 0.94x |
+| 2048 x 896 x 4864 | 39.3 | 54.8 | 35.4 | 1.11x | 0.72x |
+| 2048 x 1536 x 8960 | 46.5 | 64.0 | 36.8 | 1.26x | 0.73x |
+
+Compiled from the same machinery as the W4A16 kernels, with an untuned schedule, it reaches 57 to 59 TOPS on the large shapes (two thirds of the 88 TOPS instruction peak, three quarters of cuBLASLt) and is **1.1 to 1.6 times faster than cuBLAS fp16 on every shape tried**. Weights larger than the L2 want `block-swizzle=16` (2048 x 4096 x 11008: 21.7 to 56 TOPS before the overwrite fix, 59.4 after), a reminder that block order matters as much as the tile.
+
+What this is not: a raw int32 GEMM, with no scales, no epilogue and no activation quantisation, so it is not yet a layer and not yet a speed-up of anything the user sees. Three caveats: (1) **some tile combinations compile and run but give wrong results** on int8 (for example a 64 x 128 block with a 32 x 64 warp tile at K tile 64, found by the sweep because every result was compared with cuBLASLt); the schedule in `quantforge.e2e.INT8_GEMM_OPTS` is verified, others must be checked; (2) the small-K shapes are held back by the int32 output (4 bytes per element), which a fused f16-store epilogue would halve; (3) one GPU, sm_89. The next steps are the ones the arithmetic named: fuse the row / column scales and the bias into the store, and quantise the activations in the kernel that produces them; then W4A8.
