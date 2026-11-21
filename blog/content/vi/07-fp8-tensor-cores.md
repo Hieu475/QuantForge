@@ -225,3 +225,15 @@ q/k/v và gate/up đọc đầu ra của một RMSNorm, và đầu ra đó đư�
 | Qwen2.5-1.5B | 239.3 / 240.0 | 229.1 | 177.2 | **160.7** | 195.1 | **179.2** |
 
 Phép gộp đáng 7 đến 10 phần trăm cho INT8 và 5 đến 13 phần trăm cho W4A8 trên nền Cập nhật 6, perplexity không đổi (19.207 so với 19.201, 18.238 so với 18.235, 13.074 cả hai; W4A8 23.703 so với 23.714, 22.069 so với 22.057, 14.693 cả hai). So với trung bình hai lần chạy fp16 eager, INT8 là **1.37x, 1.46x và 1.49x** và W4A8 1.24x, 1.33x và 1.34x; so với fp16 có norm đã biên dịch, phép so sánh tôi sẽ trích dẫn vì một engine sẽ không chạy norm eager, INT8 là **1.28x, 1.34x và 1.43x** và W4A8 1.16x, 1.22x và 1.28x. (Các batch 8 x 512 còn được lợi nhiều hơn, ví dụ INT8 Llama 301.9 xuống 246.9 ms.) Mọi bước từ Cập nhật 3 đều là gộp một thứ nằm ngoài GEMM; phần còn lại của 28 phần trăm ban đầu là rotary embedding, phép cộng residual và chính attention.
+
+## Cập nhật 8: một model không vừa ở fp16 (2026-11-21)
+
+Qwen2.5-3B-Instruct nặng khoảng 6 GB ở fp16 mà card chỉ có 5.6 GB, nên không nạp nổi; mọi biến thể đã lượng tử hóa dưới đây đều chạy được trên nó (weight được lượng tử hóa trên CPU, từng lớp một). Một cái bẫy thực tế: với bộ cấp phát mặc định, benchmark hết bộ nhớ ở prefill 2048 token (một yêu cầu `1.16 GiB`, logits float32, trong khi còn hàng trăm MB nằm rời rạc thành mảnh); `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` sửa được cho mọi biến thể, kể cả biến thể INT4 W4A16 cũng đã thất bại. Prefill 2048 token (mỗi biến thể một tiến trình), head fp16, perplexity wikitext-2:
+
+| biến thể | prefill | bộ nhớ GPU | perplexity RTN | perplexity GPTQ |
+|---|--:|--:|--:|--:|
+| INT8 W8A8 | **310 ms** | 3.42 GB | 12.15 | |
+| **W4A8** | 356 ms | **2.07 GB** | 13.47 | 12.54 |
+| INT4 W4A16 | 498 ms | 2.25 GB | 13.13 | 12.06 |
+
+W4A8 nhanh hơn INT4 W4A16 1.40x ở prefill và dùng ít bộ nhớ hơn, đổi lại perplexity cao hơn 0.3 đến 0.5 điểm; INT8 còn nhanh hơn 15 phần trăm và gần fp16 nhất, nhưng cần gấp 1.65 lần bộ nhớ. (Không có hàng fp16: perplexity của model dense cần một card nhiều bộ nhớ hơn. Decode của cả ba định dạng không đổi trong bài này: W4A8 là định dạng cho prefill.) Bức tranh của các model 0.5B đến 1.5B giữ nguyên khi lên một cỡ: các kernel INT8 đã biên dịch biến prefill từ thua (INT4 W4A16 ở 0.8x của fp16) thành lời, và W4A8 với scale nguyên giữ được bộ nhớ 4-bit.

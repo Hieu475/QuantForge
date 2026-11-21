@@ -52,6 +52,8 @@ def main():
             qnn.quantize_model(m, "int4", 128); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
         elif v == "int8_w8a8":            # INT8 weights + per-token INT8 activations, GEMM + dequant epilogue compiled by QuantForge
             qnn.quantize_model(m, "int8_w8a8", fuse=True)          # q/k/v and gate/up share one quantisation + one GEMM
+        elif v == "int4_fphead":          # INT4 W4A16 with the head left in fp16 (the INT8 head of "int4" needs a large temporary on the 3B model)
+            qnn.quantize_model(m, "int4", 128)
         elif v == "w4a8":                 # INT4 weights (progressive quantisation) + per-token INT8 activations, one compiled kernel
             qnn.quantize_model(m, "w4a8", fuse=True)
         elif v in ("int8_w8a8_nonorm", "w4a8_nonorm"):    # the fused MLP activation, but the norms do not quantise their output

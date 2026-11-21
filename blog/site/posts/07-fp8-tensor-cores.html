@@ -27,6 +27,7 @@
 <li><a href="#update-5-w4a8-and-the-reason-i-gave-for-not-building-it-was-wrong-2026-11-21">Update 5: W4A8, and the reason I gave for not building it was wrong (2026-11-21)</a></li>
 <li><a href="#update-6-fusing-silu-up-into-the-quantisation-2026-11-21">Update 6: fusing silu * up into the quantisation (2026-11-21)</a></li>
 <li><a href="#update-7-the-norm-quantises-its-own-output-and-a-fairer-baseline-2026-11-21">Update 7: the norm quantises its own output, and a fairer baseline (2026-11-21)</a></li>
+<li><a href="#update-8-a-model-that-does-not-fit-in-fp16-2026-11-21">Update 8: a model that does not fit in fp16 (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p>The <a href="03-fp8-without-hardware.html">FP8 post</a> stored the <em>weights</em> in FP8 and still multiplied in fp16. The GeForce RTX 40 series has tensor cores that multiply FP8 operands directly, so a natural next step is <strong>W8A8</strong>: quantise the activations to FP8 too and run the GEMM on those cores. This post is the feasibility study and its (negative) result.</p>
@@ -625,7 +626,44 @@
 </tr>
 </tbody>
 </table>
-<p>The fusion is worth 7 to 10 percent for INT8 and 5 to 13 percent for W4A8 on top of Update 6, perplexity unchanged (19.207 against 19.201, 18.238 against 18.235, 13.074 both; W4A8 23.703 against 23.714, 22.069 against 22.057, 14.693 both). Against the mean of the two eager fp16 runs, INT8 is <strong>1.37x, 1.46x and 1.49x</strong> and W4A8 1.24x, 1.33x and 1.34x; against fp16 with compiled norms, which is the comparison I would quote because an engine would not run eager norms, INT8 is <strong>1.28x, 1.34x and 1.43x</strong> and W4A8 1.16x, 1.22x and 1.28x. (The 8 x 512 batches gain even more, for example INT8 Llama 301.9 to 246.9 ms.) Every step since Update 3 was a fusion of something outside the GEMM; what is left of the original 28 percent is the rotary embedding, the residual adds and the attention itself.</p></article>
+<p>The fusion is worth 7 to 10 percent for INT8 and 5 to 13 percent for W4A8 on top of Update 6, perplexity unchanged (19.207 against 19.201, 18.238 against 18.235, 13.074 both; W4A8 23.703 against 23.714, 22.069 against 22.057, 14.693 both). Against the mean of the two eager fp16 runs, INT8 is <strong>1.37x, 1.46x and 1.49x</strong> and W4A8 1.24x, 1.33x and 1.34x; against fp16 with compiled norms, which is the comparison I would quote because an engine would not run eager norms, INT8 is <strong>1.28x, 1.34x and 1.43x</strong> and W4A8 1.16x, 1.22x and 1.28x. (The 8 x 512 batches gain even more, for example INT8 Llama 301.9 to 246.9 ms.) Every step since Update 3 was a fusion of something outside the GEMM; what is left of the original 28 percent is the rotary embedding, the residual adds and the attention itself.</p>
+<h2 id="update-8-a-model-that-does-not-fit-in-fp16-2026-11-21">Update 8: a model that does not fit in fp16 (2026-11-21)<a class="headerlink" href="#update-8-a-model-that-does-not-fit-in-fp16-2026-11-21" title="Permanent link">#</a></h2>
+<p>Qwen2.5-3B-Instruct is about 6 GB in fp16 and the card has 5.6 GB, so it cannot be loaded at all; every quantised variant below runs on it (weights quantised on the CPU, one layer at a time). One practical trap: with the default allocator the benchmark ran out of memory at the 2048-token prefill (a <code>1.16 GiB</code> request, the float32 logits, with hundreds of MB free in fragments); <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> fixed it for every variant, including the INT4 W4A16 one that had also failed. Prefill of 2048 tokens (one process per variant), head in fp16, wikitext-2 perplexity:</p>
+<table>
+<thead>
+<tr>
+<th>variant</th>
+<th style="text-align: right;">prefill</th>
+<th style="text-align: right;">GPU memory</th>
+<th style="text-align: right;">perplexity RTN</th>
+<th style="text-align: right;">perplexity GPTQ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT8 W8A8</td>
+<td style="text-align: right;"><strong>310 ms</strong></td>
+<td style="text-align: right;">3.42 GB</td>
+<td style="text-align: right;">12.15</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td><strong>W4A8</strong></td>
+<td style="text-align: right;">356 ms</td>
+<td style="text-align: right;"><strong>2.07 GB</strong></td>
+<td style="text-align: right;">13.47</td>
+<td style="text-align: right;">12.54</td>
+</tr>
+<tr>
+<td>INT4 W4A16</td>
+<td style="text-align: right;">498 ms</td>
+<td style="text-align: right;">2.25 GB</td>
+<td style="text-align: right;">13.13</td>
+<td style="text-align: right;">12.06</td>
+</tr>
+</tbody>
+</table>
+<p>W4A8 is 1.40x faster than INT4 W4A16 at prefill, and uses less memory, for 0.3 to 0.5 more perplexity points; INT8 is 15 percent faster still and the closest to fp16, but needs 1.65x the memory. (There is no fp16 row: the perplexity of the dense model would need a card with more memory. The decode of all three formats is unchanged by this post: W4A8 is a prefill format.) The picture of the 0.5B to 1.5B models holds one size up: the compiled INT8 kernels turn the prefill from a loss (INT4 W4A16 at 0.8x of fp16) into a gain, and the integer-scale W4A8 keeps the 4-bit memory.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

@@ -225,3 +225,15 @@ q/k/v and gate/up read the output of an RMSNorm, and that output is quantised ri
 | Qwen2.5-1.5B | 239.3 / 240.0 | 229.1 | 177.2 | **160.7** | 195.1 | **179.2** |
 
 The fusion is worth 7 to 10 percent for INT8 and 5 to 13 percent for W4A8 on top of Update 6, perplexity unchanged (19.207 against 19.201, 18.238 against 18.235, 13.074 both; W4A8 23.703 against 23.714, 22.069 against 22.057, 14.693 both). Against the mean of the two eager fp16 runs, INT8 is **1.37x, 1.46x and 1.49x** and W4A8 1.24x, 1.33x and 1.34x; against fp16 with compiled norms, which is the comparison I would quote because an engine would not run eager norms, INT8 is **1.28x, 1.34x and 1.43x** and W4A8 1.16x, 1.22x and 1.28x. (The 8 x 512 batches gain even more, for example INT8 Llama 301.9 to 246.9 ms.) Every step since Update 3 was a fusion of something outside the GEMM; what is left of the original 28 percent is the rotary embedding, the residual adds and the attention itself.
+
+## Update 8: a model that does not fit in fp16 (2026-11-21)
+
+Qwen2.5-3B-Instruct is about 6 GB in fp16 and the card has 5.6 GB, so it cannot be loaded at all; every quantised variant below runs on it (weights quantised on the CPU, one layer at a time). One practical trap: with the default allocator the benchmark ran out of memory at the 2048-token prefill (a `1.16 GiB` request, the float32 logits, with hundreds of MB free in fragments); `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` fixed it for every variant, including the INT4 W4A16 one that had also failed. Prefill of 2048 tokens (one process per variant), head in fp16, wikitext-2 perplexity:
+
+| variant | prefill | GPU memory | perplexity RTN | perplexity GPTQ |
+|---|--:|--:|--:|--:|
+| INT8 W8A8 | **310 ms** | 3.42 GB | 12.15 | |
+| **W4A8** | 356 ms | **2.07 GB** | 13.47 | 12.54 |
+| INT4 W4A16 | 498 ms | 2.25 GB | 13.13 | 12.06 |
+
+W4A8 is 1.40x faster than INT4 W4A16 at prefill, and uses less memory, for 0.3 to 0.5 more perplexity points; INT8 is 15 percent faster still and the closest to fp16, but needs 1.65x the memory. (There is no fp16 row: the perplexity of the dense model would need a card with more memory. The decode of all three formats is unchanged by this post: W4A8 is a prefill format.) The picture of the 0.5B to 1.5B models holds one size up: the compiled INT8 kernels turn the prefill from a loss (INT4 W4A16 at 0.8x of fp16) into a gain, and the integer-scale W4A8 keeps the 4-bit memory.

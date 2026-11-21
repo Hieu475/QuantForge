@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* Measured on Qwen2.5-3B (fp16 does not fit the 5.6 GB card): W4A8 prefill 356 ms / 2.07 GB, INT4 W4A16 498 ms / 2.25 GB, INT8 W8A8 310 ms / 3.42 GB; perplexity RTN / GPTQ W4A8 13.47 / 12.54, W4A16 13.13 / 12.06, INT8 12.15. `benchmarks/hf_fp8_w8a8.py` variant `int4_fphead`.
+
 * INT8 W8A8 and W4A8: the RMSNorm in front of the shared q/k/v and gate/up layers quantises its own output (`_rmsnorm_quantize`, installed by `_fuse_int8(fuse_norm=True)`, matched on the identity of the tensor the norm returned): 5-10 % faster whole-model prefill. Against fp16 with compiled RMSNorms: INT8 1.28x / 1.34x / 1.43x, W4A8 1.16x / 1.22x / 1.28x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B); against eager fp16 1.37x / 1.46x / 1.49x and 1.24x / 1.33x / 1.34x. Perplexity unchanged.
 
 * INT8 W8A8 and W4A8: `silu(gate) * up` and the per-token INT8 quantisation of the `down_proj` input are one compiled function (`_silu_mul_quantize`, installed on the MLP by `_fuse_int8`; `fuse_activation=False` turns it off): whole-model prefill 8-14 % faster than without it, INT8 1.22x / 1.28x / 1.36x of fp16, W4A8 1.21x / 1.16x / 1.24x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), perplexity unchanged (+0.002..0.012).
