@@ -27,9 +27,9 @@ import torch
 import torch.nn as nn
 
 from . import quant
-from .nn import QuantLinear, _fuse
+from .nn import QuantLinear, W4A8Linear, _fuse, _fuse_int8
 
-__all__ = ["gptq_quantize_weight", "calibration_ids", "quantize_model_gptq"]
+__all__ = ["gptq_quantize_weight", "gptq_quantize_weight_w4a8", "calibration_ids", "quantize_model_gptq"]
 
 
 @torch.no_grad()
@@ -96,6 +96,51 @@ def gptq_quantize_weight(W: torch.Tensor, H: torch.Tensor, group_size: int = 128
     return codes.t().contiguous(), torch.stack(scales).contiguous(), torch.stack(zeros).contiguous(), perm
 
 
+@torch.no_grad()
+def gptq_quantize_weight_w4a8(W: torch.Tensor, H: torch.Tensor, group_size: int = 128, blocksize: int = 128, damp: float = 0.01):
+    """GPTQ for the W4A8 format (``quant.w4a8_quantize``): the weight is divided by its per-channel scale (taken from the original
+    weight, as round-to-nearest does) so that it lives in int8 steps, and every group of `group_size` columns gets an integer scale
+    and zero point (``quant.w4a8_group_params``) chosen from the weights *as updated by the compensation of the earlier columns*.
+
+    Returns ``(packed int8 [out, in/2], gs int8 [out, in/G], zp int8 [out, in/G], sw f32 [out])``."""
+    W = W.clone().float()
+    H = H.clone().float()
+    rows, cols = W.shape
+    if cols % group_size or cols % 2:
+        raise ValueError(f"in_features {cols} is not a multiple of the group size {group_size}")
+    blocksize = max(group_size, blocksize // group_size * group_size)
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W[:, dead] = 0
+    sw = (W.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
+    W = W / sw[:, None]
+    H += damp * torch.mean(torch.diag(H)) * torch.eye(cols, device=H.device)
+    L = torch.linalg.cholesky(H)
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(L), upper=True)
+
+    codes = torch.empty(rows, cols, dtype=torch.uint8, device=W.device)
+    gss, zps = [], []
+    for i1 in range(0, cols, blocksize):
+        i2 = min(i1 + blocksize, cols)
+        W1 = W[:, i1:i2].clone()
+        Err1 = torch.zeros_like(W1)
+        Hinv1 = Hinv[i1:i2, i1:i2]
+        for i in range(i2 - i1):
+            if i % group_size == 0:
+                gs, zp = quant.w4a8_group_params(W1[:, i:i + group_size].clamp(-127, 127))
+                gss.append(gs)
+                zps.append(zp)
+            w = W1[:, i]
+            q = (w / gs + zp).round().clamp(0, 15)
+            codes[:, i1 + i] = q.to(torch.uint8)
+            err = (w - (q - zp) * gs) / Hinv1[i, i]
+            W1[:, i:] -= err.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
+            Err1[:, i] = err
+        W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.int8).contiguous()
+    return (packed, torch.stack(gss, 1).to(torch.int8).contiguous(), torch.stack(zps, 1).to(torch.int8).contiguous(), sw)
+
+
 def calibration_ids(tokenizer, texts, nsamples: int = 128, seqlen: int = 512, seed: int = 0) -> torch.Tensor:
     """``nsamples`` random windows of ``seqlen`` tokens of the concatenated `texts` (a str or a list)."""
     if not isinstance(texts, str):
@@ -142,7 +187,7 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
 def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: int = 128,
                         damp: float = 0.01, act_order: bool = False, blocksize: int = 128, clip: bool = False,
                         fuse: bool = True, device="cuda", verbose: bool = True, rtn: tuple = (),
-                        token_clip: float = 10.0) -> dict:
+                        token_clip: float = 10.0, fmt: str = "int4") -> dict:
     """GPTQ-quantise every Linear inside the decoder layers of `model` (fp16, e.g. loaded on the CPU) to
     INT4 and replace them with :class:`QuantLinear`. ``calib_ids`` is ``[nsamples, seqlen]`` token ids
     (see :func:`calibration_ids`); the ``lm_head`` / embeddings are left alone (use
@@ -157,6 +202,8 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
 
     ``rtn``: exact names ``"<layer index>.<module path>"`` (e.g. ``"1.mlp.down_proj"``) of Linears that are quantised
     with plain round-to-nearest instead of GPTQ (see the note on massive-activation layers in the blog / README).
+    ``fmt="w4a8"`` produces :class:`W4A8Linear` layers (INT4 weights with integer group scale and zero point, see ``gptq_quantize_weight_w4a8``;
+    layers whose sizes are not multiples of 128 stay dense; ``act_order`` / ``clip`` are not available there).
     Returns ``{"quantized": n, "seconds": s, "fused_qkv": n, "fused_mlp": n, "act_order": n}``."""
     t0 = time.time()
     model.config.use_cache = False
@@ -192,6 +239,10 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
     kwargs = {k: v for k, v in kwargs.items() if k not in ("past_key_values", "past_key_value")}
     kwargs["use_cache"] = False
     n_tokens = len(inps) * inps[0].shape[1]
+    if fmt not in ("int4", "w4a8"):
+        raise ValueError('fmt must be "int4" or "w4a8"')
+    if fmt == "w4a8" and (act_order or clip):
+        raise ValueError("act_order / clip are not available for w4a8")
     stats = {"quantized": 0, "act_order": 0, "outlier_ratio": {}}
 
     for li, layer in enumerate(layers):
@@ -221,6 +272,19 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
             h.remove()
         rtn_set = set(rtn)
         for n, m in targets.items():
+            if fmt == "w4a8":
+                if m.in_features % 128 or m.out_features % 128:
+                    continue                                    # stays dense (the kernel needs multiples of 128)
+                if f"{li}.{n}" in rtn_set:
+                    ql = W4A8Linear.from_linear(m, device)
+                else:
+                    packed, gs, zp, sw = gptq_quantize_weight_w4a8(m.weight.data.to(device), hess[n], group_size, blocksize, damp)
+                    bias = None if m.bias is None else m.bias.data.to(device, torch.float16)
+                    ql = W4A8Linear(packed, gs, zp, sw, bias)
+                parent = layer.get_submodule(n.rsplit(".", 1)[0]) if "." in n else layer
+                setattr(parent, n.rsplit(".", 1)[-1], ql)
+                stats["quantized"] += 1
+                continue
             if f"{li}.{n}" in rtn_set:
                 q, scale, zero = quant.quantize_groupwise(m.weight.data.to(device).float().t().contiguous(), group_size)
                 perm = None
@@ -247,7 +311,7 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
         torch.cuda.empty_cache()
         if verbose:
             print(f"  layer {li + 1}/{len(layers)} quantised ({time.time() - t0:.0f} s)", flush=True)
-    stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
+    stats["fused_qkv"], stats["fused_mlp"] = (_fuse_int8(model) if fmt == "w4a8" else _fuse(model)) if fuse else (0, 0)
     model.to(device)
     gc.collect()
     torch.cuda.empty_cache()

@@ -114,3 +114,45 @@ def test_outlier_ratio_is_reported_for_every_linear():
     model = transformers.LlamaForCausalLM(cfg).half().eval()
     st = qg.quantize_model_gptq(model, torch.randint(0, 512, (8, 64)), group_size=64, verbose=False)
     assert len(st["outlier_ratio"]) == 14 and all(r >= 1.0 for r in st["outlier_ratio"].values())
+
+
+def test_gptq_w4a8_beats_the_w4a8_rtn_on_the_layer_output_error():
+    _require_gpu()
+    from quantforge import quant
+    import quantforge.gptq as qg
+
+    w, x, H = _layer_problem()
+    packed, gs, zp, sw = qg.gptq_quantize_weight_w4a8(w, H, 128)
+    assert packed.shape == (256, 256) and gs.shape == zp.shape == (256, 4) and 1 <= gs.min() and gs.max() <= 16
+    assert 0 <= zp.min() and zp.max() <= 15
+    deq = quant.w4a8_dequantize(packed, gs, zp, sw)                                # [out, in]
+    steps = deq / sw[:, None]
+    assert steps.min() >= -128 - 1e-3 and steps.max() <= 127 + 1e-3               # the kernel's int8 arithmetic cannot wrap
+    err_gptq = ((x @ deq.t() - x @ w.t()) ** 2).mean().item()
+    deq_r = quant.w4a8_dequantize(*quant.w4a8_quantize(w))
+    err_rtn = ((x @ deq_r.t() - x @ w.t()) ** 2).mean().item()
+    assert err_gptq < 0.8 * err_rtn, (err_gptq, err_rtn)
+
+
+def test_gptq_w4a8_on_a_tiny_llama_end_to_end():
+    transformers = pytest.importorskip("transformers")
+    _require_gpu()
+    import quantforge.nn as qnn
+    import quantforge.gptq as qg
+
+    torch.manual_seed(0)
+    cfg = transformers.LlamaConfig(vocab_size=512, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128)
+    model = transformers.LlamaForCausalLM(cfg).half().eval()
+    ids = torch.randint(0, 512, (16, 64))
+    dense = copy.deepcopy(model).cuda()
+    st = qg.quantize_model_gptq(model, ids, fmt="w4a8", verbose=False)
+    assert st["quantized"] == 2 * 7 and st["fused_qkv"] == 2 and st["fused_mlp"] == 2
+    assert sum(isinstance(m, qnn.W4A8Linear) for m in model.modules()) == 2 * 4   # per block: o_proj, down_proj, the shared q/k/v and the shared gate/up
+    x = torch.randint(0, 512, (2, 32), device="cuda")
+    with torch.no_grad():
+        d, q = dense(x).logits.float(), model(x).logits.float()
+    assert torch.isfinite(q).all()
+    assert (q - d).abs().mean().item() < 0.3 * d.abs().mean().item()
+    with pytest.raises(ValueError):
+        qg.quantize_model_gptq(copy.deepcopy(dense).cpu(), ids, fmt="w4a8", act_order=True, verbose=False)

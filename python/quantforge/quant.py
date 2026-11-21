@@ -270,23 +270,32 @@ def w4a8_quantize(w: torch.Tensor, group: int = 128):
     w = w.float()
     sw = (w.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
     g8 = (w / sw[:, None]).round().clamp(-127, 127).reshape(N, K // group, group)
-    mn = g8.amin(2)
-    best_err = torch.full(g8.shape[:2], float("inf"), device=w.device)
-    gs = torch.ones(g8.shape[:2], device=w.device)
-    zp = torch.zeros(g8.shape[:2], device=w.device)
-    for cand in range(1, 17):
-        zlo, zhi = max(0, -(-(15 * cand - 127) // cand)), min(15, 128 // cand)      # (0 - z) * cand >= -128 and (15 - z) * cand <= 127
-        z = (-mn / cand).round().clamp(zlo, zhi)
-        q = (g8 / cand + z[:, :, None]).round().clamp(0, 15)
-        err = (g8 - (q - z[:, :, None]) * cand).square().sum(2)
-        better = err < best_err
-        best_err = torch.where(better, err, best_err)
-        gs = torch.where(better, torch.full_like(gs, cand), gs)
-        zp = torch.where(better, z, zp)
+    gs, zp = w4a8_group_params(g8)
     q = (g8 / gs[:, :, None] + zp[:, :, None]).round().clamp(0, 15)
     nib = q.to(torch.uint8).reshape(N, K)
     packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.int8).contiguous()
     return packed, gs.to(torch.int8).contiguous(), zp.to(torch.int8).contiguous(), sw
+
+
+@torch.no_grad()
+def w4a8_group_params(g: torch.Tensor):
+    """Integer scale ``gs`` (1..16) and zero point ``z`` (0..15) of every group of ``g [..., group]`` (values in int8 steps, i.e. already
+    divided by the per-channel scale), minimising the squared error of ``(clamp(round(g / gs + z), 0, 15) - z) * gs``; only the pairs for
+    which ``(q - z) * gs`` stays inside int8 are candidates. Returns two float tensors of shape ``g.shape[:-1]``."""
+    mn = g.amin(-1)
+    best_err = torch.full(g.shape[:-1], float("inf"), device=g.device)
+    gs = torch.ones(g.shape[:-1], device=g.device)
+    zp = torch.zeros(g.shape[:-1], device=g.device)
+    for cand in range(1, 17):
+        zlo, zhi = max(0, -(-(15 * cand - 127) // cand)), min(15, 128 // cand)      # (0 - z) * cand >= -128 and (15 - z) * cand <= 127
+        z = (-mn / cand).round().clamp(zlo, zhi)
+        q = (g / cand + z[..., None]).round().clamp(0, 15)
+        err = (g - (q - z[..., None]) * cand).square().sum(-1)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        gs = torch.where(better, torch.full_like(gs, cand), gs)
+        zp = torch.where(better, z, zp)
+    return gs, zp
 
 
 def w4a8_dequantize(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, group: int = 128) -> torch.Tensor:

@@ -185,3 +185,13 @@ Cả model, prefill 2048 token, head ở fp16, bốn biến thể của mỗi mo
 (Biến thể INT4 W4A16 của 1.5B hết bộ nhớ trong benchmark Hugging Face nên không có số cho nó; các hàng 1.5B của những biến thể khác được chạy mỗi biến thể một tiến trình.) Tóm tắt trung thực: **W4A8 là bản thay thế cho lớp INT4 W4A16 ở prefill, giữ nguyên chất lượng** (nhanh hơn 1.2x với cùng số bit và gần cùng perplexity), và là định dạng nhỏ nhất ở đây, nhưng ở mức cả model nó chỉ chạm tốc độ fp16 vì 28 phần trăm prefill đó không phải GEMM; khi có thể chi thêm 1.5 lần bộ nhớ, INT8 W8A8 vừa nhanh hơn vừa tốt hơn W4A8 1.6 điểm perplexity ở model 1.5B (13.06 so với 14.70). Decode không đổi (bị giới hạn bởi băng thông: kernel W4A16 đã đọc cùng số byte). Weight đến từ việc lượng tử hóa model fp16 bằng làm tròn gần nhất; bù sai số kiểu GPTQ trên định dạng này chưa làm.
 
 Test: `test_w4a8_quantisation_never_overflows_int8_and_the_linear_matches_its_reference` (weight nguyên nằm trong int8 với đầu vào nhiều outlier, lớp đã biên dịch bằng tham chiếu số nguyên tới mức làm tròn f16) và `test_w4a8_shared_input_fusion_gives_the_same_model_output`.
+
+**Cập nhật 5b: GPTQ cho W4A8.** Làm tròn gần nhất để W4A8 thua INT4 W4A16 từ 0.3 đến 0.8 điểm perplexity ở hai trong ba model, nên tôi viết GPTQ cho định dạng này (`gptq_quantize_weight_w4a8`, `quantize_model_gptq(..., fmt="w4a8")`): weight được chia cho scale theo kênh để nằm trong bước int8, và với mỗi nhóm 128 cột, cặp (scale, zero point) nguyên được chọn từ các weight *đã được cập nhật bởi phần bù sai số của các cột trước*; phần còn lại là bù sai số từng cột như thường lệ với thừa số Cholesky của nghịch đảo Hessian. Perplexity wikitext-2 test, head fp16 ở mọi cột, 128 cửa sổ hiệu chỉnh 512 token:
+
+| model | fp16 | INT4 W4A16 RTN | INT4 W4A16 GPTQ | W4A8 RTN | **W4A8 GPTQ** |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 18.79 | 22.91 | 20.45 | 23.72 | **21.06** |
+| Llama-3.2-1B | 17.91 | 22.28 | 20.21 | 22.06 | **19.91** |
+| Qwen2.5-1.5B | 12.66 | 14.29 | 13.37 | 14.70 | **13.68** |
+
+GPTQ lấy lại 2.0 đến 2.7 điểm ở các model nhỏ và 1.0 ở model 1.5B, việc lượng tử hóa mất 49 đến 135 giây. W4A8 với GPTQ thua INT4 GPTQ 0.3 đến 0.6 ở các model Qwen và *hơn* 0.3 ở Llama-3.2-1B, nơi scale nguyên cùng phép tìm kiếm tình cờ khớp hơn; tôi sẽ không suy diễn thêm từ một model. (Với head fp16, INT4 W4A16 của 1.5B đo được 14.29; biến thể ở bảng trước dùng head INT8 và hết bộ nhớ trong benchmark đó.) Các lớp có kích thước không chia hết cho 128 giữ nguyên dense; `act_order` và tùy chọn thu hẹp dải không có cho định dạng này. Test: `test_gptq_w4a8_beats_the_w4a8_rtn_on_the_layer_output_error` (sai số đầu ra dưới 0.8 của RTN, tôn trọng dải int8) và một lần chạy end-to-end trên Llama nhỏ. `benchmarks/w4a8_gptq.py` tái tạo bảng này.
