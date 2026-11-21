@@ -24,6 +24,7 @@
 <li><a href="#update-2-the-compilers-own-int8-kernel-2026-11-21">Update 2: the compiler's own INT8 kernel (2026-11-21)</a></li>
 <li><a href="#update-3-fusing-the-dequantisation-and-the-model-2026-11-21">Update 3: fusing the dequantisation, and the model (2026-11-21)</a></li>
 <li><a href="#update-4-sharing-the-quantisation-a-profile-and-two-measurement-traps-2026-11-21">Update 4: sharing the quantisation, a profile, and two measurement traps (2026-11-21)</a></li>
+<li><a href="#update-5-w4a8-and-the-reason-i-gave-for-not-building-it-was-wrong-2026-11-21">Update 5: W4A8, and the reason I gave for not building it was wrong (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p>The <a href="03-fp8-without-hardware.html">FP8 post</a> stored the <em>weights</em> in FP8 and still multiplied in fp16. The GeForce RTX 40 series has tensor cores that multiply FP8 operands directly, so a natural next step is <strong>W8A8</strong>: quantise the activations to FP8 too and run the GEMM on those cores. This post is the feasibility study and its (negative) result.</p>
@@ -375,7 +376,125 @@
 </table>
 <p>The GEMMs really are 1.46x faster; what stops the model from following is that 24 ms, 28 percent of the fp16 prefill, are the element-wise operations of an eager Hugging Face model, which no GEMM kernel touches (an inference engine fuses them), plus a head that a real prefill does not even compute for every position. The quantisation pass itself costs 7.6 ms; <code>torch.compile</code> already makes it one kernel at 1.1 times the single-pass ideal, so a hand-written kernel would not help; only folding it into the producer of the activation would (a fused <code>silu(gate) * up</code> and quantise, for the input of <code>down_proj</code>, is the biggest single piece: about 5 ms here).</p>
 <p><strong>Two measurement traps.</strong> (1) A sweep of <code>block-swizzle</code> that timed each variant at a different moment said swizzle helped every layer shape by 3 to 28 percent. Interleaved rounds of all variants in one session said otherwise: it is 2.3x faster for a weight larger than the L2 (2048 x 2048 x 16384: 5.8 to 2.5 ms) and 12 to 14 percent slower for one that fits (2048 x 4096 x 4096), so the rule is now size-based. The clocks of a laptop GPU drift by 10 percent between measurements, more than most of the differences I was trying to measure. The earlier shared-input fusion had exposed it the other way round: with the old threshold the widened gate / up weight of Llama-3.2-1B (33.6 MB, just below the threshold) ran unswizzled at 2.9 times the time and made the model 32 percent slower, until I measured that shape in isolation. (2) The tables in this post come from different sessions; compare a column within a row, never across tables.</p>
-<p>Not done, and why: quantising the head (a real prefill needs the last position only), W4A8 (halves the weight bytes as well but needs a per-group int32 to float rescale inside the K loop, a new accumulation scheme in the compiler), and the fused <code>silu * up</code> quantisation, which is a kernel for one model family.</p></article>
+<p>Not done, and why: quantising the head (a real prefill needs the last position only), W4A8 (halves the weight bytes as well but needs a per-group int32 to float rescale inside the K loop, a new accumulation scheme in the compiler), and the fused <code>silu * up</code> quantisation, which is a kernel for one model family.</p>
+<h2 id="update-5-w4a8-and-the-reason-i-gave-for-not-building-it-was-wrong-2026-11-21">Update 5: W4A8, and the reason I gave for not building it was wrong (2026-11-21)<a class="headerlink" href="#update-5-w4a8-and-the-reason-i-gave-for-not-building-it-was-wrong-2026-11-21" title="Permanent link">#</a></h2>
+<p>Update 4 said W4A8 "needs a per-group int32 to float rescale inside the K loop, a new accumulation scheme in the compiler". It does not, if the quantisation is built for it. QServe's <em>progressive</em> quantisation does: the weight is first quantised to INT8 with one float scale per output channel, and that INT8 weight is then quantised to INT4 per group of 128 with an <strong>integer</strong> scale (1 to 16) and an integer zero point. The weight the tensor cores need is <code>(nibble - zero) * group_scale</code>, which is again an int8, so it can be built in registers while the tile is staged, the accumulation stays one int32 over all of K, and the only float scale left is the per-channel one in the epilogue that already exists. Nothing in the compiler changed.</p>
+<p><strong>The kernel is a producer, not a pass.</strong> The program is a <code>linalg.generic</code> that computes the int8 weight from the packed nibbles (<code>n, k</code> reads byte <code>k / 2</code>, selects the nibble by <code>k mod 2</code>, subtracts the group's zero point, multiplies by its scale; all in <code>i8</code>), then the <code>matmul_transpose_b</code> and the <code>int8-dequant</code> store of Update 3. The producer-fusion pass written for the INT4 dequantisation turned out not to be specific to it: any store whose backward slice is pure is recomputed at the loads of the GEMM. It compiled on the first try, bit-exact against the integer reference, in <strong>one kernel</strong> (<code>W4A8GemmDq</code>). The weights are the only weight traffic: 4 bits per weight.</p>
+<p><strong>Quantisation, and a quality trap.</strong> My first version used a symmetric 4-bit range per group, and the model got worse than plain INT4 by a lot (Qwen2.5-0.5B perplexity 28.9 against 22.9). I first blamed the integer group scale; choosing it per group by minimum squared error instead of rounding up moved it to 28.0 and Llama-3.2-1B not at all. The ablation that found it replaces the weights by their dequantised values and keeps the activations in fp16: symmetric INT4 with a <em>float</em> scale already gives 26.3, asymmetric gives 22.9. The library's INT4 has always used a per-group zero point; I had dropped it to save one tensor. With an integer zero point per group as well (the search keeps only (scale, zero) pairs for which <code>(q - z) * s</code> stays inside int8, because the kernel's 8-bit arithmetic wraps rather than saturates) the weights alone give 23.1 and the whole W4A8 layer 23.7 (Qwen2.5-0.5B), 22.06 (Llama-3.2-1B, against 22.28 for INT4 W4A16 with an INT8 head). So the quality is that of INT4, not better.</p>
+<p><strong>Speed</strong> (kernel, interleaved rounds in one session, L2 flushed, <code>benchmarks/w4a8_gemm.py</code>):</p>
+<table>
+<thead>
+<tr>
+<th>shape (M x K x N)</th>
+<th style="text-align: right;">cuBLAS fp16</th>
+<th style="text-align: right;">QF W4A16</th>
+<th style="text-align: right;">QF INT8 W8A8</th>
+<th style="text-align: right;"><strong>QF W4A8</strong></th>
+<th style="text-align: right;">W4A8 vs fp16 / W4A16 / INT8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">1424 us</td>
+<td style="text-align: right;">1767</td>
+<td style="text-align: right;">966</td>
+<td style="text-align: right;"><strong>1286</strong> (53 TOPS)</td>
+<td style="text-align: right;">1.11x / 1.37x / 0.75x</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 11008</td>
+<td style="text-align: right;">4359</td>
+<td style="text-align: right;">5455</td>
+<td style="text-align: right;">2630</td>
+<td style="text-align: right;"><strong>3709</strong></td>
+<td style="text-align: right;">1.18x / 1.47x / 0.71x</td>
+</tr>
+<tr>
+<td>2048 x 11008 x 4096</td>
+<td style="text-align: right;">4649</td>
+<td style="text-align: right;">5031</td>
+<td style="text-align: right;">2618</td>
+<td style="text-align: right;"><strong>3682</strong></td>
+<td style="text-align: right;">1.26x / 1.37x / 0.71x</td>
+</tr>
+<tr>
+<td>2048 x 896 x 4864</td>
+<td style="text-align: right;">449</td>
+<td style="text-align: right;">711</td>
+<td style="text-align: right;">304</td>
+<td style="text-align: right;"><strong>381</strong></td>
+<td style="text-align: right;">1.18x / 1.87x / 0.80x</td>
+</tr>
+<tr>
+<td>2048 x 2048 x 8192</td>
+<td style="text-align: right;">1639</td>
+<td style="text-align: right;">2062</td>
+<td style="text-align: right;">1022</td>
+<td style="text-align: right;"><strong>1304</strong></td>
+<td style="text-align: right;">1.26x / 1.58x / 0.78x</td>
+</tr>
+</tbody>
+</table>
+<p>It beats cuBLAS fp16 and the W4A16 kernel at prefill, and it is 20 to 30 percent behind the INT8 kernel: the unpacking is ALU work in the loop that stages the tile, repeated for every row block, and the generic producer is scalar code (a vectorised unpack like the one of the W4A16 path would be the next thing to try).</p>
+<p>Whole model, prefill of 2048 tokens, the head in fp16, each model's four variants in one session (<code>benchmarks/hf_fp8_w8a8.py</code>):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">INT4 W4A16 (+ INT8 head)</th>
+<th style="text-align: right;">INT8 W8A8</th>
+<th style="text-align: right;"><strong>W4A8</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B, ms (vs fp16)</td>
+<td style="text-align: right;">87.7</td>
+<td style="text-align: right;">105.4 (0.83x)</td>
+<td style="text-align: right;">79.5 (1.10x)</td>
+<td style="text-align: right;"><strong>87.0 (1.01x)</strong></td>
+</tr>
+<tr>
+<td>perplexity / GPU memory</td>
+<td style="text-align: right;">18.79 / 1.01 GB</td>
+<td style="text-align: right;">22.91 / 0.67</td>
+<td style="text-align: right;">19.20 / 0.64</td>
+<td style="text-align: right;"><strong>23.72 / 0.47</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-1B, ms</td>
+<td style="text-align: right;">184.2</td>
+<td style="text-align: right;">210.1 (0.88x)</td>
+<td style="text-align: right;">152.2 (1.21x)</td>
+<td style="text-align: right;"><strong>172.7 (1.07x)</strong></td>
+</tr>
+<tr>
+<td>perplexity / GPU memory</td>
+<td style="text-align: right;">17.91 / 2.48 GB</td>
+<td style="text-align: right;">22.28 / 1.40</td>
+<td style="text-align: right;">18.23 / 1.51</td>
+<td style="text-align: right;"><strong>22.06 / 1.05</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B, ms</td>
+<td style="text-align: right;">243.1</td>
+<td style="text-align: right;">out of memory in this benchmark</td>
+<td style="text-align: right;">199.6 (1.22x)</td>
+<td style="text-align: right;"><strong>233.5 (1.04x)</strong></td>
+</tr>
+<tr>
+<td>perplexity / GPU memory</td>
+<td style="text-align: right;">12.66 / 3.10 GB</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">13.06 / 1.79</td>
+<td style="text-align: right;"><strong>14.70 / 1.19</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(The INT4 W4A16 variant of the 1.5B ran out of memory in the Hugging Face benchmark, so there is no number for it; the 1.5B rows of the other variants were run one process each.) The honest summary: <strong>W4A8 is a prefill-speed and quality-neutral replacement of the INT4 W4A16 layer</strong> (1.2x faster for the same bits and about the same perplexity), and it is the smallest format here, but it only reaches fp16 speed at the whole-model level because 28 percent of that prefill is not GEMM; when 1.5 times the memory is affordable, INT8 W8A8 is both faster and 1.6 perplexity points better than W4A8 on the 1.5B (13.06 against 14.70). Decode is untouched (bandwidth bound: the W4A16 kernels already read the same bytes). Weights come from quantising the fp16 model with plain round-to-nearest; GPTQ-style error compensation on top of this format is not done.</p>
+<p>Tests: <code>test_w4a8_quantisation_never_overflows_int8_and_the_linear_matches_its_reference</code> (the integer weight stays inside int8 for outlier-heavy inputs, the compiled layer equals the integer reference to f16 rounding) and <code>test_w4a8_shared_input_fusion_gives_the_same_model_output</code>.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>
