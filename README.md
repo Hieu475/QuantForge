@@ -532,7 +532,7 @@ Measured on vLLM 0.25.1 (RTX 4050; `benchmarks/vllm_prefill.py`: prefill of 16 p
 | model, method | prefill | decode 1 | decode 16 |
 |---|--:|--:|--:|
 | Qwen2.5-0.5B fp16 | 31786 | 152 | 2297 |
-| 0.5B **quantforge_w4a8** (online) | **33320** | 257 | 3583 |
+| 0.5B **quantforge_w4a8** (online, two layouts) | **33320** | 257 | 3583 |
 | 0.5B GPTQ-Int4, `gptq_marlin` | 32880 | 297 | 4230 |
 | 0.5B GPTQ-Int4, `quantforge` (W4A16) | 20622 | 251 | 3524 |
 | Qwen2.5-1.5B **quantforge_w4a8** | **12045** | 114 | 1603 |
@@ -544,6 +544,14 @@ Measured on vLLM 0.25.1 (RTX 4050; `benchmarks/vllm_prefill.py`: prefill of 16 p
 So the prefill is at the level of fp16 / Marlin (1.05x on the 1.5B) and 1.6-1.7x the W4A16 plugin, the decode is the W4A16 kernels' (0.80-0.85x of Marlin). It is not a clear win over Marlin: its advantages are that it quantises a plain checkpoint and
 that the prefill GEMMs run on the INT8 tensor cores; its costs are that the weights are kept in both layouts (about one byte per weight, the memory of INT8 rather than of INT4), the quantisation is round-to-nearest (no GPTQ; perplexity of the 0.5B
 23.7 against 20.5 with GPTQ), and it was tested on vLLM 0.25.1 only. Tests: `test/E2E/test_w4a8_op.py` (both paths against the dequantised reference, `torch.compile(fullgraph=True)`, generation under vLLM with `QUANTFORGE_SLOW_TESTS=1`).
+
+### W4A8 checkpoints for vLLM (GPTQ quality, loads in seconds)
+
+`benchmarks/make_w4a8_checkpoint.py <model> <out_dir> --train <wikitext-2 train parquet>` quantises a Hugging Face model with the GPTQ of this format (`quantize_model_gptq(..., fmt="w4a8")`; `--rtn` for round-to-nearest) and writes it with
+`quantforge.w4a8_checkpoint.save_w4a8`: per decoder linear layer `weight` (int8 `[N, K/2]`, the `pack_k8` layout), `group_scale` / `group_zero` (int8 `[N, K/128]`), `w_scale` (f32 `[N]`), everything else dense fp16, and
+`quantization_config = {"quant_method": "quantforge_w4a8"}` in `config.json`. `LLM("out_dir", quantization="quantforge_w4a8")` then loads the quantised tensors as they are (the loader shards them like any other layer): no fp16 copy, no round-to-nearest
+step. Qwen2.5-3B (GPTQ, perplexity 12.54 against 13.47 for the online round-to-nearest): 1.99 GiB, **loads in 2 s** (25 s online), prefill 6678 tokens/s, decode 65 / 994 at 1 / 16 requests (compact mode), the same speed as the online path.
+The first-token log-probabilities of vLLM and of the Hugging Face model the checkpoint came from agree to 0.001 (`test/E2E/test_w4a8_checkpoint.py`, slow tests with `QUANTFORGE_SLOW_TESTS=1`). Every decoder linear layer must have sizes that are multiples of 128; the layout is `format_version` 1.
 
 ### FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)
 

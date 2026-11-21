@@ -32,6 +32,7 @@
 <li><a href="#update-10-one-copy-of-the-weights-and-what-it-costs-2026-11-21">Update 10: one copy of the weights, and what it costs (2026-11-21)</a></li>
 <li><a href="#update-11-qwen25-3b-in-vllm-on-a-card-that-cannot-hold-it-in-fp16-2026-11-21">Update 11: Qwen2.5-3B in vLLM on a card that cannot hold it in fp16 (2026-11-21)</a></li>
 <li><a href="#update-12-unpacking-four-weights-at-a-time-2026-11-22">Update 12: unpacking four weights at a time (2026-11-22)</a></li>
+<li><a href="#update-13-w4a8-checkpoints-so-that-the-gptq-quality-reaches-vllm-2026-11-22">Update 13: W4A8 checkpoints, so that the GPTQ quality reaches vLLM (2026-11-22)</a></li>
 </ul>
 </div>
 </details><p>The <a href="03-fp8-without-hardware.html">FP8 post</a> stored the <em>weights</em> in FP8 and still multiplied in fp16. The GeForce RTX 40 series has tensor cores that multiply FP8 operands directly, so a natural next step is <strong>W8A8</strong>: quantise the activations to FP8 too and run the GEMM on those cores. This post is the feasibility study and its (negative) result.</p>
@@ -809,7 +810,49 @@
 </tr>
 </tbody>
 </table>
-<p>The decode of the one-copy mode is now as fast as the two-layout mode was (0.5B: 253 and 3801 against 259 and 3592) at half the weight memory, and the prefill beats Marlin by 12 to 15 percent. Two honest notes. The decode kernel itself improved for the small shapes (16 x 896 x 4864: 1.11x to 1.01x of the dedicated W4A16 kernel; 4864 x 896: 1.55x to 1.35x) but not for 4096 x 4096 (1.76x), where <code>ncu</code> says the loads are the limit (DRAM at 52 percent against 88 for the dedicated kernel, <code>long_scoreboard</code> stalls); I tried hoisting the scalar scale / zero-point loads out of the K loop with the prefetch pass and it changed nothing, so I reverted it. And the layout change is incompatible with W4A8 tensors made earlier (there are none outside this repository).</p></article>
+<p>The decode of the one-copy mode is now as fast as the two-layout mode was (0.5B: 253 and 3801 against 259 and 3592) at half the weight memory, and the prefill beats Marlin by 12 to 15 percent. Two honest notes. The decode kernel itself improved for the small shapes (16 x 896 x 4864: 1.11x to 1.01x of the dedicated W4A16 kernel; 4864 x 896: 1.55x to 1.35x) but not for 4096 x 4096 (1.76x), where <code>ncu</code> says the loads are the limit (DRAM at 52 percent against 88 for the dedicated kernel, <code>long_scoreboard</code> stalls); I tried hoisting the scalar scale / zero-point loads out of the K loop with the prefetch pass and it changed nothing, so I reverted it. And the layout change is incompatible with W4A8 tensors made earlier (there are none outside this repository).</p>
+<h2 id="update-13-w4a8-checkpoints-so-that-the-gptq-quality-reaches-vllm-2026-11-22">Update 13: W4A8 checkpoints, so that the GPTQ quality reaches vLLM (2026-11-22)<a class="headerlink" href="#update-13-w4a8-checkpoints-so-that-the-gptq-quality-reaches-vllm-2026-11-22" title="Permanent link">#</a></h2>
+<p>The online method of Update 9 quantises with round-to-nearest, and the GPTQ of Update 5b is what makes W4A8 competitive in quality (3B: 12.54 against 13.47). To get one into the other, the quantised tensors have to travel: <code>save_w4a8</code> writes the state dict of a model quantised with <code>fuse=False</code> (per decoder linear layer: <code>weight</code>, the nibbles in the <code>pack_k8</code> layout, <code>group_scale</code> and <code>group_zero</code> as int8 per group of 128, <code>w_scale</code> as float32 per output channel; the embeddings, norms and head stay fp16) and adds <code>quantization_config = {"quant_method": "quantforge_w4a8"}</code> to <code>config.json</code>. vLLM sees that, builds the config in checkpoint mode, creates parameters with exactly those names and sizes (so its loaders shard them for tensor parallelism and merge q / k / v without a line of my own), and <code>process_weights_after_loading</code> hands them to the same install step as the online path. Nothing is quantised at load: the 3B model loads in <strong>2 seconds</strong> instead of 25 and never exists in fp16 on any device.</p>
+<p>Checking it was worth doing properly. The first generation from the 0.5B checkpoint in vLLM did not read like the Hugging Face model's (the second token of the first prompt differed), which is exactly the symptom of a layout or sharding bug. The first-token log-probabilities settled it: for the same checkpoint, vLLM gives <code>' The'</code> -1.037, <code>' Provide'</code> -2.607, <code>' Explain'</code> -2.779 and Hugging Face -1.038, -2.601, -2.780; the same tensors give the same distribution, and the difference with the fp16 model (<code>' The'</code> at -0.207) is the 0.5B model's own sensitivity to 4-bit weights. A slow test does this on a tiny random Llama in both decode modes (log-probabilities within 0.05).</p>
+<table>
+<thead>
+<tr>
+<th>Qwen2.5-3B in vLLM, compact mode</th>
+<th style="text-align: right;">weights</th>
+<th style="text-align: right;">load</th>
+<th style="text-align: right;">prefill</th>
+<th style="text-align: right;">decode 1 / 16 requests</th>
+<th style="text-align: right;">perplexity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>online round-to-nearest (Update 11)</td>
+<td style="text-align: right;">2.01 GiB</td>
+<td style="text-align: right;">25 s</td>
+<td style="text-align: right;">6678</td>
+<td style="text-align: right;">65 / 997</td>
+<td style="text-align: right;">13.47</td>
+</tr>
+<tr>
+<td><strong>GPTQ W4A8 checkpoint</strong></td>
+<td style="text-align: right;">1.99 GiB</td>
+<td style="text-align: right;"><strong>2 s</strong></td>
+<td style="text-align: right;">6678</td>
+<td style="text-align: right;">65 / 994</td>
+<td style="text-align: right;"><strong>12.54</strong></td>
+</tr>
+<tr>
+<td>GPTQ-Int4, <code>gptq_marlin</code></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">5782</td>
+<td style="text-align: right;">81 / 1201</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>The checkpoint costs nothing in speed and recovers 0.9 perplexity points. What it is not: a format other tools read (the layout is mine, <code>format_version</code> 1), nor does it handle layers whose sizes are not multiples of 128 (the saver refuses them).</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

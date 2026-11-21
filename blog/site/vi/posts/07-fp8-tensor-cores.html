@@ -32,6 +32,7 @@
 <li><a href="#cap-nhat-10-mot-ban-sao-weight-va-cai-gia-cua-no-2026-11-21">Cập nhật 10: một bản sao weight, và cái giá của nó (2026-11-21)</a></li>
 <li><a href="#cap-nhat-11-qwen25-3b-trong-vllm-tren-mot-card-khong-chua-noi-no-o-fp16-2026-11-21">Cập nhật 11: Qwen2.5-3B trong vLLM trên một card không chứa nổi nó ở fp16 (2026-11-21)</a></li>
 <li><a href="#cap-nhat-12-giai-nen-bon-weight-moi-lan-2026-11-22">Cập nhật 12: giải nén bốn weight mỗi lần (2026-11-22)</a></li>
+<li><a href="#cap-nhat-13-checkpoint-w4a8-e-chat-luong-gptq-en-uoc-vllm-2026-11-22">Cập nhật 13: checkpoint W4A8, để chất lượng GPTQ đến được vLLM (2026-11-22)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -809,7 +810,49 @@
 </tr>
 </tbody>
 </table>
-<p>Decode của chế độ một bản sao giờ nhanh như chế độ hai layout trước đây (0.5B: 253 và 3801 so với 259 và 3592) với một nửa bộ nhớ weight, và prefill vượt Marlin từ 12 đến 15 phần trăm. Hai ghi chú trung thực. Bản thân kernel decode cải thiện ở các shape nhỏ (16 x 896 x 4864: từ 1.11x xuống 1.01x của kernel W4A16 chuyên dụng; 4864 x 896: từ 1.55x xuống 1.35x) nhưng không cải thiện ở 4096 x 4096 (1.76x), nơi <code>ncu</code> nói các lần load là giới hạn (DRAM ở 52 phần trăm so với 88 của kernel chuyên dụng, stall <code>long_scoreboard</code>); tôi đã thử đưa các lần load scale / zero point vô hướng ra khỏi vòng K bằng pass prefetch và nó không thay đổi gì, nên đã hoàn nguyên. Và thay đổi layout không tương thích với các tensor W4A8 tạo trước đó (không có cái nào ngoài repo này).</p></article>
+<p>Decode của chế độ một bản sao giờ nhanh như chế độ hai layout trước đây (0.5B: 253 và 3801 so với 259 và 3592) với một nửa bộ nhớ weight, và prefill vượt Marlin từ 12 đến 15 phần trăm. Hai ghi chú trung thực. Bản thân kernel decode cải thiện ở các shape nhỏ (16 x 896 x 4864: từ 1.11x xuống 1.01x của kernel W4A16 chuyên dụng; 4864 x 896: từ 1.55x xuống 1.35x) nhưng không cải thiện ở 4096 x 4096 (1.76x), nơi <code>ncu</code> nói các lần load là giới hạn (DRAM ở 52 phần trăm so với 88 của kernel chuyên dụng, stall <code>long_scoreboard</code>); tôi đã thử đưa các lần load scale / zero point vô hướng ra khỏi vòng K bằng pass prefetch và nó không thay đổi gì, nên đã hoàn nguyên. Và thay đổi layout không tương thích với các tensor W4A8 tạo trước đó (không có cái nào ngoài repo này).</p>
+<h2 id="cap-nhat-13-checkpoint-w4a8-e-chat-luong-gptq-en-uoc-vllm-2026-11-22">Cập nhật 13: checkpoint W4A8, để chất lượng GPTQ đến được vLLM (2026-11-22)<a class="headerlink" href="#cap-nhat-13-checkpoint-w4a8-e-chat-luong-gptq-en-uoc-vllm-2026-11-22" title="Permanent link">#</a></h2>
+<p>Phương thức trực tuyến của Cập nhật 9 lượng tử hóa bằng làm tròn gần nhất, còn GPTQ của Cập nhật 5b mới là thứ làm W4A8 cạnh tranh được về chất lượng (3B: 12.54 so với 13.47). Để đưa cái này vào cái kia, các tensor đã lượng tử hóa phải đi theo: <code>save_w4a8</code> ghi state dict của một model đã lượng tử hóa với <code>fuse=False</code> (mỗi lớp tuyến tính của decoder: <code>weight</code>, các nibble theo layout <code>pack_k8</code>, <code>group_scale</code> và <code>group_zero</code> dạng int8 theo nhóm 128, <code>w_scale</code> dạng float32 theo kênh đầu ra; embedding, norm và head giữ fp16) và thêm <code>quantization_config = {"quant_method": "quantforge_w4a8"}</code> vào <code>config.json</code>. vLLM thấy điều đó, dựng cấu hình ở chế độ checkpoint, tạo các tham số đúng tên và kích thước đó (nên bộ nạp của nó tự chia shard cho tensor parallelism và gộp q / k / v mà tôi không viết thêm dòng nào), và <code>process_weights_after_loading</code> chuyển chúng vào cùng bước cài đặt như đường trực tuyến. Không có gì được lượng tử hóa lúc nạp: model 3B nạp trong <strong>2 giây</strong> thay vì 25 và không bao giờ tồn tại ở dạng fp16 trên bất kỳ thiết bị nào.</p>
+<p>Việc kiểm tra đáng làm cho cẩn thận. Lần sinh văn bản đầu tiên từ checkpoint 0.5B trong vLLM không giống model Hugging Face (token thứ hai của prompt đầu khác), đúng là triệu chứng của một lỗi layout hay sharding. Log-probability của token đầu đã phân xử: với cùng một checkpoint, vLLM cho <code>' The'</code> -1.037, <code>' Provide'</code> -2.607, <code>' Explain'</code> -2.779 còn Hugging Face -1.038, -2.601, -2.780; cùng tensor cho cùng phân phối, và khác biệt so với model fp16 (<code>' The'</code> ở -0.207) là độ nhạy của chính model 0.5B với weight 4-bit. Một test chậm làm điều này trên một Llama ngẫu nhiên nhỏ ở cả hai chế độ decode (log-probability trong khoảng 0.05).</p>
+<table>
+<thead>
+<tr>
+<th>Qwen2.5-3B trong vLLM, chế độ compact</th>
+<th style="text-align: right;">weight</th>
+<th style="text-align: right;">nạp</th>
+<th style="text-align: right;">prefill</th>
+<th style="text-align: right;">decode 1 / 16 request</th>
+<th style="text-align: right;">perplexity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>làm tròn gần nhất trực tuyến (Cập nhật 11)</td>
+<td style="text-align: right;">2.01 GiB</td>
+<td style="text-align: right;">25 s</td>
+<td style="text-align: right;">6678</td>
+<td style="text-align: right;">65 / 997</td>
+<td style="text-align: right;">13.47</td>
+</tr>
+<tr>
+<td><strong>checkpoint GPTQ W4A8</strong></td>
+<td style="text-align: right;">1.99 GiB</td>
+<td style="text-align: right;"><strong>2 s</strong></td>
+<td style="text-align: right;">6678</td>
+<td style="text-align: right;">65 / 994</td>
+<td style="text-align: right;"><strong>12.54</strong></td>
+</tr>
+<tr>
+<td>GPTQ-Int4, <code>gptq_marlin</code></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">5782</td>
+<td style="text-align: right;">81 / 1201</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Checkpoint không tốn gì về tốc độ và lấy lại 0.9 điểm perplexity. Nó không phải: một định dạng mà công cụ khác đọc được (layout là của tôi, <code>format_version</code> 1), cũng không xử lý các lớp có kích thước không chia hết cho 128 (bộ lưu từ chối chúng).</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

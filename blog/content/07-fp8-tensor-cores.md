@@ -291,3 +291,17 @@ Results, RTX 4050, same methods as before: the W4A8 kernel at 2048 rows is **1.3
 | Qwen2.5-3B | 6678 | 1.15x | 65 | 997 | 0.80x / 0.83x |
 
 The decode of the one-copy mode is now as fast as the two-layout mode was (0.5B: 253 and 3801 against 259 and 3592) at half the weight memory, and the prefill beats Marlin by 12 to 15 percent. Two honest notes. The decode kernel itself improved for the small shapes (16 x 896 x 4864: 1.11x to 1.01x of the dedicated W4A16 kernel; 4864 x 896: 1.55x to 1.35x) but not for 4096 x 4096 (1.76x), where `ncu` says the loads are the limit (DRAM at 52 percent against 88 for the dedicated kernel, `long_scoreboard` stalls); I tried hoisting the scalar scale / zero-point loads out of the K loop with the prefetch pass and it changed nothing, so I reverted it. And the layout change is incompatible with W4A8 tensors made earlier (there are none outside this repository).
+
+## Update 13: W4A8 checkpoints, so that the GPTQ quality reaches vLLM (2026-11-22)
+
+The online method of Update 9 quantises with round-to-nearest, and the GPTQ of Update 5b is what makes W4A8 competitive in quality (3B: 12.54 against 13.47). To get one into the other, the quantised tensors have to travel: `save_w4a8` writes the state dict of a model quantised with `fuse=False` (per decoder linear layer: `weight`, the nibbles in the `pack_k8` layout, `group_scale` and `group_zero` as int8 per group of 128, `w_scale` as float32 per output channel; the embeddings, norms and head stay fp16) and adds `quantization_config = {"quant_method": "quantforge_w4a8"}` to `config.json`. vLLM sees that, builds the config in checkpoint mode, creates parameters with exactly those names and sizes (so its loaders shard them for tensor parallelism and merge q / k / v without a line of my own), and `process_weights_after_loading` hands them to the same install step as the online path. Nothing is quantised at load: the 3B model loads in **2 seconds** instead of 25 and never exists in fp16 on any device.
+
+Checking it was worth doing properly. The first generation from the 0.5B checkpoint in vLLM did not read like the Hugging Face model's (the second token of the first prompt differed), which is exactly the symptom of a layout or sharding bug. The first-token log-probabilities settled it: for the same checkpoint, vLLM gives `' The'` -1.037, `' Provide'` -2.607, `' Explain'` -2.779 and Hugging Face -1.038, -2.601, -2.780; the same tensors give the same distribution, and the difference with the fp16 model (`' The'` at -0.207) is the 0.5B model's own sensitivity to 4-bit weights. A slow test does this on a tiny random Llama in both decode modes (log-probabilities within 0.05).
+
+| Qwen2.5-3B in vLLM, compact mode | weights | load | prefill | decode 1 / 16 requests | perplexity |
+|---|--:|--:|--:|--:|--:|
+| online round-to-nearest (Update 11) | 2.01 GiB | 25 s | 6678 | 65 / 997 | 13.47 |
+| **GPTQ W4A8 checkpoint** | 1.99 GiB | **2 s** | 6678 | 65 / 994 | **12.54** |
+| GPTQ-Int4, `gptq_marlin` | | | 5782 | 81 / 1201 | |
+
+The checkpoint costs nothing in speed and recovers 0.9 perplexity points. What it is not: a format other tools read (the layout is mine, `format_version` 1), nor does it handle layers whose sizes are not multiples of 128 (the saver refuses them).

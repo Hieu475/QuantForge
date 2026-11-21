@@ -291,3 +291,17 @@ Kết quả, RTX 4050, cùng phương pháp như trước: kernel W4A8 ở 2048 
 | Qwen2.5-3B | 6678 | 1.15x | 65 | 997 | 0.80x / 0.83x |
 
 Decode của chế độ một bản sao giờ nhanh như chế độ hai layout trước đây (0.5B: 253 và 3801 so với 259 và 3592) với một nửa bộ nhớ weight, và prefill vượt Marlin từ 12 đến 15 phần trăm. Hai ghi chú trung thực. Bản thân kernel decode cải thiện ở các shape nhỏ (16 x 896 x 4864: từ 1.11x xuống 1.01x của kernel W4A16 chuyên dụng; 4864 x 896: từ 1.55x xuống 1.35x) nhưng không cải thiện ở 4096 x 4096 (1.76x), nơi `ncu` nói các lần load là giới hạn (DRAM ở 52 phần trăm so với 88 của kernel chuyên dụng, stall `long_scoreboard`); tôi đã thử đưa các lần load scale / zero point vô hướng ra khỏi vòng K bằng pass prefetch và nó không thay đổi gì, nên đã hoàn nguyên. Và thay đổi layout không tương thích với các tensor W4A8 tạo trước đó (không có cái nào ngoài repo này).
+
+## Cập nhật 13: checkpoint W4A8, để chất lượng GPTQ đến được vLLM (2026-11-22)
+
+Phương thức trực tuyến của Cập nhật 9 lượng tử hóa bằng làm tròn gần nhất, còn GPTQ của Cập nhật 5b mới là thứ làm W4A8 cạnh tranh được về chất lượng (3B: 12.54 so với 13.47). Để đưa cái này vào cái kia, các tensor đã lượng tử hóa phải đi theo: `save_w4a8` ghi state dict của một model đã lượng tử hóa với `fuse=False` (mỗi lớp tuyến tính của decoder: `weight`, các nibble theo layout `pack_k8`, `group_scale` và `group_zero` dạng int8 theo nhóm 128, `w_scale` dạng float32 theo kênh đầu ra; embedding, norm và head giữ fp16) và thêm `quantization_config = {"quant_method": "quantforge_w4a8"}` vào `config.json`. vLLM thấy điều đó, dựng cấu hình ở chế độ checkpoint, tạo các tham số đúng tên và kích thước đó (nên bộ nạp của nó tự chia shard cho tensor parallelism và gộp q / k / v mà tôi không viết thêm dòng nào), và `process_weights_after_loading` chuyển chúng vào cùng bước cài đặt như đường trực tuyến. Không có gì được lượng tử hóa lúc nạp: model 3B nạp trong **2 giây** thay vì 25 và không bao giờ tồn tại ở dạng fp16 trên bất kỳ thiết bị nào.
+
+Việc kiểm tra đáng làm cho cẩn thận. Lần sinh văn bản đầu tiên từ checkpoint 0.5B trong vLLM không giống model Hugging Face (token thứ hai của prompt đầu khác), đúng là triệu chứng của một lỗi layout hay sharding. Log-probability của token đầu đã phân xử: với cùng một checkpoint, vLLM cho `' The'` -1.037, `' Provide'` -2.607, `' Explain'` -2.779 còn Hugging Face -1.038, -2.601, -2.780; cùng tensor cho cùng phân phối, và khác biệt so với model fp16 (`' The'` ở -0.207) là độ nhạy của chính model 0.5B với weight 4-bit. Một test chậm làm điều này trên một Llama ngẫu nhiên nhỏ ở cả hai chế độ decode (log-probability trong khoảng 0.05).
+
+| Qwen2.5-3B trong vLLM, chế độ compact | weight | nạp | prefill | decode 1 / 16 request | perplexity |
+|---|--:|--:|--:|--:|--:|
+| làm tròn gần nhất trực tuyến (Cập nhật 11) | 2.01 GiB | 25 s | 6678 | 65 / 997 | 13.47 |
+| **checkpoint GPTQ W4A8** | 1.99 GiB | **2 s** | 6678 | 65 / 994 | **12.54** |
+| GPTQ-Int4, `gptq_marlin` | | | 5782 | 81 / 1201 | |
+
+Checkpoint không tốn gì về tốc độ và lấy lại 0.9 điểm perplexity. Nó không phải: một định dạng mà công cụ khác đọc được (layout là của tôi, `format_version` 1), cũng không xử lý các lớp có kích thước không chia hết cho 128 (bộ lưu từ chối chúng).

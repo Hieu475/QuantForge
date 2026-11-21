@@ -11,7 +11,8 @@ QuantForge layout; every linear layer then calls ``torch.ops.quantforge.w4a16_ge
 ``torch.compile`` and CUDA-graph capture. The kernels are JIT-compiled per (layer shape, row bucket) on first use and cached
 on disk, so the first start of a model takes a while (about 0.3 s per kernel) and later starts do not.
 
-``quantization="quantforge_w4a8"`` quantises an ordinary fp16 / bf16 checkpoint to W4A8 while it loads (``QuantForgeW4A8Config``, ``w4a8_op.py``; tested on vLLM 0.25.1).
+``quantization="quantforge_w4a8"`` quantises an ordinary fp16 / bf16 checkpoint to W4A8 while it loads, or loads a W4A8 checkpoint written by
+``w4a8_checkpoint.save_w4a8`` (GPTQ quality, no fp16 round trip) (``QuantForgeW4A8Config``, ``w4a8_op.py``; tested on vLLM 0.25.1).
 
 K-folding (``kfold.py``) keeps a second copy of the narrow-output layers: ``QUANTFORGE_KFOLD=0`` disables it,
 ``QUANTFORGE_KFOLD_BUDGET_MB`` (default 256) caps the extra memory.
@@ -211,8 +212,32 @@ if HAVE_VLLM:
         calls ``torch.ops.quantforge.w4a8_hybrid``: the compiled W4A8 kernel (INT8 tensor cores) above 16 rows, the W4A16 decode kernels below,
         both from the same weight. Memory: about one byte per weight (the two layouts), a quarter of fp16 would need dropping the decode copy."""
 
+        def __init__(self, checkpoint: bool = False) -> None:
+            super().__init__()
+            self.checkpoint = checkpoint          # True: the checkpoint holds W4A8 tensors (w4a8_checkpoint.save_w4a8); False: online quantisation
+
         def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
                            **extra_weight_attrs):
+            if self.checkpoint:
+                from vllm.model_executor.parameter import ChannelQuantScaleParameter, ModelWeightParameter
+                from vllm.model_executor.utils import set_weight_attrs
+
+                N, K = sum(output_partition_sizes), input_size_per_partition
+                if N % 128 or K % 128:
+                    raise ValueError(f"a W4A8 checkpoint layer needs sizes that are multiples of 128 (got {N} x {K})")
+                loader = extra_weight_attrs.pop("weight_loader")
+                mk = lambda cols, dt: ModelWeightParameter(data=torch.empty(N, cols, dtype=dt), input_dim=1, output_dim=0,   # noqa: E731
+                                                           weight_loader=loader)
+                # the names are those of ``nn.W4A8Linear`` buffers, which is what ``save_w4a8`` writes
+                layer.register_parameter("weight", mk(K // 2, torch.int8))
+                layer.register_parameter("group_scale", mk(K // 128, torch.int8))
+                layer.register_parameter("group_zero", mk(K // 128, torch.int8))
+                layer.register_parameter("w_scale", ChannelQuantScaleParameter(data=torch.empty(N, dtype=torch.float32), output_dim=0,
+                                                                              weight_loader=loader))
+                for name in ("weight", "group_scale", "group_zero", "w_scale"):
+                    set_weight_attrs(getattr(layer, name), extra_weight_attrs)
+                layer.qf_w4a8 = True
+                return
             super().create_weights(layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
                                    **extra_weight_attrs)
             # the fp16 weight of a layer that will be quantised is held on the CPU while the checkpoint is read: vLLM moves each module to the
@@ -225,27 +250,35 @@ if HAVE_VLLM:
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
             from . import kfold, quant, w4a8_op
 
-            w = layer.weight.data
-            N, K = w.shape
-            layer.qf_w4a8 = bool(N % 128 == 0 and K % 128 == 0 and w.is_cuda and w.dtype in (torch.float16, torch.bfloat16))
-            if not layer.qf_w4a8:
-                return super().process_weights_after_loading(layer)
-            parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
-            packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
+            if self.checkpoint:
+                packed, gs, zp, sw = (layer.weight.data, layer.group_scale.data, layer.group_zero.data, layer.w_scale.data)
+                for name in ("weight", "group_scale", "group_zero", "w_scale"):
+                    delattr(layer, name)
+                w = packed
+                N, K = packed.shape[0], packed.shape[1] * 2
+            else:
+                w = layer.weight.data
+                N, K = w.shape
+                layer.qf_w4a8 = bool(N % 128 == 0 and K % 128 == 0 and w.is_cuda and w.dtype in (torch.float16, torch.bfloat16))
+                if not layer.qf_w4a8:
+                    return super().process_weights_after_loading(layer)
+                parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
+                packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
             if os.environ.get("QUANTFORGE_W4A8_DECODE", "w4a16") == "compact":
                 # one copy of the nibbles: the decode reads the W4A8 layout itself (slower, a quarter of fp16's memory)
                 e = kfold.no_fold(w.device)
-                del layer.weight
+                if not self.checkpoint:
+                    del layer.weight
                 layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), param(e[1]), param(e[2])
                 layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = param(e[0]), param(e[1]), param(e[2])
                 layer.qf_group = 128
-                layer.qf8_scale_nk = param((gs.float() * sw[:, None]).half())
+                layer.qf8_scale_nk = param((gs.float() * sw.float()[:, None]).half())
             else:
-                p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw)
-                _install(layer, p16, s16, z16, None, 128, ("weight",))
+                p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())
+                _install(layer, p16, s16, z16, None, 128, () if self.checkpoint else ("weight",))
                 layer.qf8_scale_nk = param(torch.empty(0, device=w.device, dtype=torch.float16))
-            layer.qf8_packed, layer.qf8_gs, layer.qf8_zp, layer.qf8_sw = param(packed), param(gs), param(zp), param(sw)
+            layer.qf8_packed, layer.qf8_gs, layer.qf8_zp, layer.qf8_sw = param(packed), param(gs), param(zp), param(sw.float())
 
         def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
             if not layer.qf_w4a8:
@@ -259,7 +292,12 @@ if HAVE_VLLM:
 
     @register_quantization_config("quantforge_w4a8")
     class QuantForgeW4A8Config(QuantizationConfig):
-        """Online W4A8: an unquantised checkpoint, quantised while loading (no quantization_config in the checkpoint is needed)."""
+        """W4A8: either an unquantised checkpoint quantised while loading (no quantization_config needed), or a checkpoint written by
+        ``w4a8_checkpoint.save_w4a8`` (GPTQ or round-to-nearest; its config.json says ``"quant_method": "quantforge_w4a8"``)."""
+
+        def __init__(self, checkpoint: bool = False) -> None:
+            super().__init__()
+            self.checkpoint = checkpoint
 
         @classmethod
         def get_name(cls):
@@ -279,7 +317,7 @@ if HAVE_VLLM:
 
         @classmethod
         def from_config(cls, config):
-            return cls()
+            return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8")
 
         def get_quant_method(self, layer, prefix):
-            return QuantForgeW4A8Method() if isinstance(layer, LinearBase) else None
+            return QuantForgeW4A8Method(self.checkpoint) if isinstance(layer, LinearBase) else None
