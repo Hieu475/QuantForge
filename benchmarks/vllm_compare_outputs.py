@@ -1,6 +1,7 @@
 """Do vLLM's Marlin kernels and the QuantForge kernels (quantization="quantforge") produce the same text?
 
-    python benchmarks/vllm_compare_outputs.py Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4
+    python benchmarks/vllm_compare_outputs.py Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4              # reference: gptq_marlin
+    python benchmarks/vllm_compare_outputs.py Qwen/Qwen2.5-0.5B-Instruct-AWQ awq_marlin         # any other reference method
 
 Runs the same GPTQ checkpoint with both methods (two engine launches), greedy decoding of 64 tokens for a few prompts, and compares
 the generated tokens and the log-probability of every generated token (max / mean absolute difference).
@@ -28,11 +29,12 @@ def main():
     model = sys.argv[1]
     if len(sys.argv) > 3 and sys.argv[2] == "--child":
         run(model, sys.argv[3], sys.argv[4]); return
+    ref = sys.argv[2] if len(sys.argv) > 2 else "gptq_marlin"
     outs = {}
-    for q in ("gptq_marlin", "quantforge"):
+    for q in (ref, "quantforge"):
         outs[q] = f"/tmp/vllm_cmp_{q}.json"
         subprocess.run([sys.executable, __file__, model, "--child", q, outs[q]], check=True, capture_output=True)
-    a, b = (json.load(open(outs[q])) for q in ("gptq_marlin", "quantforge"))
+    a, b = (json.load(open(outs[q])) for q in (ref, "quantforge"))
     same = 0; total = 0; diffs = []
     for x, y in zip(a, b):
         n = min(len(x["tokens"]), len(y["tokens"]))

@@ -422,3 +422,37 @@ def test_fp8_weights_through_the_op_eager_compile_graph():
     assert _close(y, x.float() @ deq)
     with pytest.raises(Exception):
         qt.w4a16_linear(x, w8, scale, zero, G, activation="swiglu")
+
+
+def test_gptq_8bit_conversion_matches_the_dense_reference_including_act_order():
+    """8-bit GPTQ words -> int8 kernel layout (weights and zero points shifted by 128); the op equals x @ dequant(W)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant
+
+    torch.manual_seed(0)
+    K, N, G = 512, 384, 128
+    q = torch.randint(0, 256, (K, N), dtype=torch.int64, device="cuda")
+    zero = torch.randint(100, 156, (K // G, N), dtype=torch.int64, device="cuda")
+    scale = (torch.rand(K // G, N, device="cuda") * 0.01 + 0.001).half()
+
+    def words(v, axis):                                    # four bytes per int32 along `axis` (0: K, 1: N)
+        v = v.reshape(-1, 4, v.shape[1]) if axis == 0 else v.reshape(v.shape[0], -1, 4).transpose(1, 2)
+        w = sum(v[:, i].to(torch.int64) << (8 * i) for i in range(4)) if axis == 0 else \
+            sum(v[:, i, :].to(torch.int64) << (8 * i) for i in range(4))
+        return torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32)
+
+    qweight, qzeros = words(q, 0), words(zero - 1, 1)      # GPTQ stores zero - 1
+    ref_w = (q.float() - zero.float().repeat_interleave(G, 0)) * scale.float().repeat_interleave(G, 0)
+    p, sc, zz = quant.from_gptq8(qweight, qzeros, scale)
+    assert p.dtype == torch.int8 and p.shape == (K, N) and zz.shape == (K // G, N)
+    x = torch.randn(5, K, device="cuda", dtype=torch.float16)
+    ref = x.float() @ ref_w
+    assert (qt.w4a16_linear(x, p, sc, zz, G).float() - ref).abs().max() < 2e-3 * ref.abs().max()
+    # act-order: scattered groups -> rows permuted, activations gathered
+    g_idx = torch.randperm(K, device="cuda") // G
+    p2, sc2, zz2, perm = quant.from_gptq8_act_order(qweight, qzeros, scale, g_idx)
+    group_of_row = g_idx.long()
+    ref_w2 = (q.float() - zero.float()[group_of_row]) * scale.float()[group_of_row]
+    ref2 = x.float() @ ref_w2
+    assert (qt.w4a16_linear(x, p2, sc2, zz2, G, perm=perm).float() - ref2).abs().max() < 2e-3 * ref2.abs().max()

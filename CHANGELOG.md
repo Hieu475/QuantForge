@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* vLLM plugin reads GPTQ 8-bit (`quant.from_gptq8`, act-order included) and AWQ 4-bit checkpoints; Qwen2.5-0.5B throughput vs the matching Marlin method: AWQ 0.81-0.89, GPTQ-Int8 0.85-0.93.
+
 * Width-aware default schedules: `_decode_opts` (32 / 64-column blocks for N <= 2048) and `_skinny_opts` (17..64 rows, shape dependent); `torch_ops.default_opts`
   is shared with `benchmarks/compare_marlin.py` (its non-autotuned mode used an empty schedule for M > 16, not the op's). vLLM, QuantForge / Marlin: 0.80-0.88 at 1-16 requests, 0.73-0.80 at 64.
 

@@ -139,6 +139,33 @@ def from_gptq(qweight, qzeros, scales, g_idx=None, zeros_offset: int = 1):
     return pack_int4(q.to(torch.int8)), scales.half().contiguous(), zero.to(torch.int8)
 
 
+def from_gptq8(qweight, qzeros, scales, g_idx=None, zeros_offset: int = 1):
+    """8-bit GPTQ checkpoint tensors -> (q int8 [K, N], scale f16 [K/G, N], zero int8 [K/G, N]).
+
+    GPTQ stores unsigned bytes (0..255) four to an int32 along K; the kernels take int8, so both the weights and the zero
+    points are shifted by 128 (``(q - 128) - (zero - 128) == q - zero``). Act-order checkpoints: ``from_gptq8_act_order``."""
+    K, N = qweight.shape[0] * 4, qweight.shape[1]
+    G = K // scales.shape[0]
+    if g_idx is not None:
+        expect = torch.arange(K, device=g_idx.device) // G
+        if not torch.equal(g_idx.to(expect.dtype), expect):
+            raise NotImplementedError("act-order 8-bit GPTQ: use from_gptq8_act_order()")
+    w = qweight.to(torch.int64) & 0xFFFFFFFF
+    q = torch.stack([(w >> (8 * i)) & 0xFF for i in range(4)], dim=1).reshape(K, N)            # k = 4*row + i
+    zw = qzeros.to(torch.int64) & 0xFFFFFFFF
+    zero = torch.stack([(zw >> (8 * i)) & 0xFF for i in range(4)], dim=-1).reshape(qzeros.shape[0], -1)
+    zero = (zero + zeros_offset) & 0xFF
+    return (q - 128).to(torch.int8).contiguous(), scales.half().contiguous(), (zero - 128).to(torch.int8)
+
+
+def from_gptq8_act_order(qweight, qzeros, scales, g_idx, zeros_offset: int = 1):
+    """8-bit GPTQ with ``desc_act=True`` -> (q, scale, zero, perm), the counterpart of ``from_gptq_act_order``."""
+    K = qweight.shape[0] * 4
+    perm = act_order_permutation(g_idx, K // scales.shape[0])
+    q, scale, zero = from_gptq8(qweight, qzeros, scales, None, zeros_offset)
+    return q[perm.to(q.device)].contiguous(), scale, zero, perm
+
+
 def act_order_permutation(g_idx, group_size: int):
     """Row permutation that makes an act-order GPTQ checkpoint group-contiguous.
 

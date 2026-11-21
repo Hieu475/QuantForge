@@ -86,6 +86,23 @@ Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến b
 
 A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa `~/.cache/vllm/torch_compile_cache` một lần.
 
+## Các định dạng checkpoint khác
+
+Plugin cũng đọc checkpoint AWQ 4-bit và GPTQ 8-bit (Qwen2.5-0.5B, cùng engine, token/s cộng trên các request, hai lần chạy khớp nhau trong 1 %; mỗi định dạng so với phương pháp Marlin của nó):
+
+| định dạng | request | Marlin | QuantForge | QuantForge / Marlin | đầu ra so với Marlin |
+|---|--:|--:|--:|--:|---|
+| AWQ 4-bit (`awq_marlin`) | 1 | 307 | 270 | 0.88 | 287 trên 320 token greedy trùng, chênh log-xác suất tuyệt đối trung bình 0.0020 |
+| | 4 | 1168 | 1040 | 0.89 | |
+| | 16 | 4357 | 3811 | 0.87 | |
+| | 64 | 11715 | 9509 | 0.81 | |
+| GPTQ 8-bit (`gptq_marlin`) | 1 | 239 | 222 | 0.93 | 320 trên 320 trùng, chênh trung bình 0.0018 |
+| | 4 | 919 | 856 | 0.93 | |
+| | 16 | 3482 | 3235 | 0.93 | |
+| | 64 | 10157 | 8600 | 0.85 | |
+
+Đường GPTQ 8-bit cần một chi tiết chuyển đổi: GPTQ lưu byte không dấu, kernel nhận int8, nên cả weight lẫn zero point đều được dịch đi 128, giữ nguyên `q - zero`. AWQ khác GPTQ ở cách đóng gói (theo chiều đầu ra, với thứ tự nibble hoán vị), bộ chuyển đổi đảo ngược nó.
+
 ## Hạn chế của plugin
 
-Chỉ GPTQ 4-bit: không AWQ, không 8-bit, không layer MoE. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.
+GPTQ 4-bit và 8-bit và AWQ 4-bit có zero point; không có layer MoE; AWQ không có zero point bị từ chối. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.

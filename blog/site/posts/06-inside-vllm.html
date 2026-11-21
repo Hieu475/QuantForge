@@ -22,6 +22,7 @@
 <li><a href="#a-measurement-trap">A measurement trap</a></li>
 </ul>
 </li>
+<li><a href="#other-checkpoint-formats">Other checkpoint formats</a></li>
 <li><a href="#limitations-of-the-plugin">Limitations of the plugin</a></li>
 </ul>
 </div>
@@ -259,8 +260,89 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal bloc
 <p>Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where <code>M * S</code> exceeds 16 and the plain kernel runs. The last column adds the width-aware default schedules: the fixed tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models (autotune picks 32 / 64-column blocks and a look-ahead there; I turned its winners into rules, <code>benchmarks/sweep_skinny.py</code>). Together with the fold, 1 to 16 requests reach 0.80 to 0.88 of Marlin and 64 requests 0.73 to 0.80 (+16 % and +10 % over the fold alone). Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.</p>
 <h3 id="a-measurement-trap">A measurement trap<a class="headerlink" href="#a-measurement-trap" title="Permanent link">#</a></h3>
 <p>My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear <code>~/.cache/vllm/torch_compile_cache</code> once.</p>
+<h2 id="other-checkpoint-formats">Other checkpoint formats<a class="headerlink" href="#other-checkpoint-formats" title="Permanent link">#</a></h2>
+<p>The plugin also reads AWQ 4-bit and GPTQ 8-bit checkpoints (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):</p>
+<table>
+<thead>
+<tr>
+<th>format</th>
+<th style="text-align: right;">requests</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+<th>output vs Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWQ 4-bit (<code>awq_marlin</code>)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">307</td>
+<td style="text-align: right;">270</td>
+<td style="text-align: right;">0.88</td>
+<td>287 of 320 greedy tokens identical, mean abs. log-prob diff 0.0020</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1168</td>
+<td style="text-align: right;">1040</td>
+<td style="text-align: right;">0.89</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4357</td>
+<td style="text-align: right;">3811</td>
+<td style="text-align: right;">0.87</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11715</td>
+<td style="text-align: right;">9509</td>
+<td style="text-align: right;">0.81</td>
+<td></td>
+</tr>
+<tr>
+<td>GPTQ 8-bit (<code>gptq_marlin</code>)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">239</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">0.93</td>
+<td>320 of 320 identical, mean diff 0.0018</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">919</td>
+<td style="text-align: right;">856</td>
+<td style="text-align: right;">0.93</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3482</td>
+<td style="text-align: right;">3235</td>
+<td style="text-align: right;">0.93</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">10157</td>
+<td style="text-align: right;">8600</td>
+<td style="text-align: right;">0.85</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>The 8-bit GPTQ path needed one conversion detail: GPTQ stores unsigned bytes, the kernels take int8, so the weights and the zero points are both shifted by 128, which leaves <code>q - zero</code> unchanged. AWQ differs from GPTQ in its packing (along the output dimension, with a permuted nibble order), which the converter undoes.</p>
 <h2 id="limitations-of-the-plugin">Limitations of the plugin<a class="headerlink" href="#limitations-of-the-plugin" title="Permanent link">#</a></h2>
-<p>4-bit GPTQ only: no AWQ, no 8-bit, no MoE layers. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.</p></article>
+<p>GPTQ 4-bit and 8-bit and AWQ 4-bit with zero points; no MoE layers; AWQ without zero points is refused. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

@@ -22,6 +22,7 @@
 <li><a href="#mot-cai-bay-khi-o">Một cái bẫy khi đo</a></li>
 </ul>
 </li>
+<li><a href="#cac-inh-dang-checkpoint-khac">Các định dạng checkpoint khác</a></li>
 <li><a href="#han-che-cua-plugin">Hạn chế của plugin</a></li>
 </ul>
 </div>
@@ -259,8 +260,89 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
 <p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Cột cuối thêm các schedule mặc định theo độ rộng: các tùy chọn tile cố định của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này (autotune chọn khối 32 / 64 cột và look-ahead ở đó; tôi biến các kết quả thắng thành quy tắc, <code>benchmarks/sweep_skinny.py</code>). Cùng với fold, 1 đến 16 request đạt 0.80 đến 0.88 của Marlin và 64 request đạt 0.73 đến 0.80 (+16 % và +10 % so với chỉ fold). Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.</p>
 <h3 id="mot-cai-bay-khi-o">Một cái bẫy khi đo<a class="headerlink" href="#mot-cai-bay-khi-o" title="Permanent link">#</a></h3>
 <p>A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa <code>~/.cache/vllm/torch_compile_cache</code> một lần.</p>
+<h2 id="cac-inh-dang-checkpoint-khac">Các định dạng checkpoint khác<a class="headerlink" href="#cac-inh-dang-checkpoint-khac" title="Permanent link">#</a></h2>
+<p>Plugin cũng đọc checkpoint AWQ 4-bit và GPTQ 8-bit (Qwen2.5-0.5B, cùng engine, token/s cộng trên các request, hai lần chạy khớp nhau trong 1 %; mỗi định dạng so với phương pháp Marlin của nó):</p>
+<table>
+<thead>
+<tr>
+<th>định dạng</th>
+<th style="text-align: right;">request</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+<th>đầu ra so với Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWQ 4-bit (<code>awq_marlin</code>)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">307</td>
+<td style="text-align: right;">270</td>
+<td style="text-align: right;">0.88</td>
+<td>287 trên 320 token greedy trùng, chênh log-xác suất tuyệt đối trung bình 0.0020</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1168</td>
+<td style="text-align: right;">1040</td>
+<td style="text-align: right;">0.89</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4357</td>
+<td style="text-align: right;">3811</td>
+<td style="text-align: right;">0.87</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11715</td>
+<td style="text-align: right;">9509</td>
+<td style="text-align: right;">0.81</td>
+<td></td>
+</tr>
+<tr>
+<td>GPTQ 8-bit (<code>gptq_marlin</code>)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">239</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">0.93</td>
+<td>320 trên 320 trùng, chênh trung bình 0.0018</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">919</td>
+<td style="text-align: right;">856</td>
+<td style="text-align: right;">0.93</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3482</td>
+<td style="text-align: right;">3235</td>
+<td style="text-align: right;">0.93</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">10157</td>
+<td style="text-align: right;">8600</td>
+<td style="text-align: right;">0.85</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>Đường GPTQ 8-bit cần một chi tiết chuyển đổi: GPTQ lưu byte không dấu, kernel nhận int8, nên cả weight lẫn zero point đều được dịch đi 128, giữ nguyên <code>q - zero</code>. AWQ khác GPTQ ở cách đóng gói (theo chiều đầu ra, với thứ tự nibble hoán vị), bộ chuyển đổi đảo ngược nó.</p>
 <h2 id="han-che-cua-plugin">Hạn chế của plugin<a class="headerlink" href="#han-che-cua-plugin" title="Permanent link">#</a></h2>
-<p>Chỉ GPTQ 4-bit: không AWQ, không 8-bit, không layer MoE. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.</p></article>
+<p>GPTQ 4-bit và 8-bit và AWQ 4-bit có zero point; không có layer MoE; AWQ không có zero point bị từ chối. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

@@ -86,6 +86,23 @@ Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests an
 
 My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear `~/.cache/vllm/torch_compile_cache` once.
 
+## Other checkpoint formats
+
+The plugin also reads AWQ 4-bit and GPTQ 8-bit checkpoints (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):
+
+| format | requests | Marlin | QuantForge | QuantForge / Marlin | output vs Marlin |
+|---|--:|--:|--:|--:|---|
+| AWQ 4-bit (`awq_marlin`) | 1 | 307 | 270 | 0.88 | 287 of 320 greedy tokens identical, mean abs. log-prob diff 0.0020 |
+| | 4 | 1168 | 1040 | 0.89 | |
+| | 16 | 4357 | 3811 | 0.87 | |
+| | 64 | 11715 | 9509 | 0.81 | |
+| GPTQ 8-bit (`gptq_marlin`) | 1 | 239 | 222 | 0.93 | 320 of 320 identical, mean diff 0.0018 |
+| | 4 | 919 | 856 | 0.93 | |
+| | 16 | 3482 | 3235 | 0.93 | |
+| | 64 | 10157 | 8600 | 0.85 | |
+
+The 8-bit GPTQ path needed one conversion detail: GPTQ stores unsigned bytes, the kernels take int8, so the weights and the zero points are both shifted by 128, which leaves `q - zero` unchanged. AWQ differs from GPTQ in its packing (along the output dimension, with a permuted nibble order), which the converter undoes.
+
 ## Limitations of the plugin
 
-4-bit GPTQ only: no AWQ, no 8-bit, no MoE layers. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.
+GPTQ 4-bit and 8-bit and AWQ 4-bit with zero points; no MoE layers; AWQ without zero points is refused. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.
