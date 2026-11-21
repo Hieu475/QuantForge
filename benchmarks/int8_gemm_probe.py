@@ -3,8 +3,7 @@
     QUANTFORGE_BUILD_DIR=<build> python benchmarks/int8_gemm_probe.py
 
 Raw int32 result, no scales / epilogue / activation quantisation: it measures what the Tensor Core path of the compiler reaches. Every
-result is checked bit-exact against cuBLASLt. Per shape both block-swizzle 0 and 16 are run and the faster is reported (swizzle helps
-when the weight is larger than the L2). The GPU is pre-heated before each measurement (an unheated laptop GPU gives numbers 25 % low).
+result is checked bit-exact against cuBLASLt. Per shape block-swizzle 0, the rule's value (`int8_gemm_swizzle`) and 16 are run and the fastest is reported. The GPU is pre-heated before each measurement (an unheated laptop GPU gives numbers 25 % low).
 """
 import sys
 import time
@@ -13,7 +12,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from quantforge.e2e import INT8_GEMM_OPTS, Int8Gemm  # noqa: E402
+from quantforge.e2e import INT8_GEMM_OPTS, Int8Gemm, int8_gemm_swizzle  # noqa: E402
 
 SHAPES = [(2048, 4096, 4096), (4096, 4096, 4096), (512, 4096, 4096), (2048, 4096, 11008), (2048, 4864, 896), (2048, 896, 4864),
           (2048, 1536, 8960)]
@@ -53,8 +52,8 @@ def main():
         a16, b16 = torch.randn(M, K, device="cuda", dtype=torch.float16), torch.randn(K, N, device="cuda", dtype=torch.float16)
         c = torch.empty(M, N, device="cuda", dtype=torch.int32)
         best = (1e9, None)
-        for sw in (0, 16):
-            k = Int8Gemm.build(M, K, N, pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={sw}")
+        for sw in sorted({0, int8_gemm_swizzle(K, N), 16}):
+            k = Int8Gemm.build(M, K, N, pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={sw}")  # the last occurrence of an option wins
             k.launch(a, bt, c)
             torch.cuda.synchronize()
             assert torch.equal(c, ref), f"WRONG result for {(M, K, N)} swizzle {sw}"

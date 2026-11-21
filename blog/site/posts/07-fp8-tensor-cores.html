@@ -23,6 +23,7 @@
 <li><a href="#update-what-the-int8-tensor-cores-give-2026-11-21">Update: what the INT8 tensor cores give (2026-11-21)</a></li>
 <li><a href="#update-2-the-compilers-own-int8-kernel-2026-11-21">Update 2: the compiler's own INT8 kernel (2026-11-21)</a></li>
 <li><a href="#update-3-fusing-the-dequantisation-and-the-model-2026-11-21">Update 3: fusing the dequantisation, and the model (2026-11-21)</a></li>
+<li><a href="#update-4-sharing-the-quantisation-a-profile-and-two-measurement-traps-2026-11-21">Update 4: sharing the quantisation, a profile, and two measurement traps (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p>The <a href="03-fp8-without-hardware.html">FP8 post</a> stored the <em>weights</em> in FP8 and still multiplied in fp16. The GeForce RTX 40 series has tensor cores that multiply FP8 operands directly, so a natural next step is <strong>W8A8</strong>: quantise the activations to FP8 too and run the GEMM on those cores. This post is the feasibility study and its (negative) result.</p>
@@ -252,52 +253,52 @@
 <tbody>
 <tr>
 <td>2048 x 4096 x 4096</td>
-<td style="text-align: right;">1.76 ms</td>
-<td style="text-align: right;">1.11</td>
-<td style="text-align: right;">1.03</td>
-<td style="text-align: right;"><strong>1.71x</strong></td>
+<td style="text-align: right;">1.70 ms</td>
+<td style="text-align: right;">1.05</td>
+<td style="text-align: right;">1.10</td>
+<td style="text-align: right;"><strong>1.54x</strong></td>
 </tr>
 <tr>
 <td>4096 x 4096 x 4096</td>
-<td style="text-align: right;">3.51</td>
-<td style="text-align: right;">2.12</td>
-<td style="text-align: right;">2.12</td>
-<td style="text-align: right;">1.66x</td>
+<td style="text-align: right;">3.66</td>
+<td style="text-align: right;">2.18</td>
+<td style="text-align: right;">2.02</td>
+<td style="text-align: right;"><strong>1.81x</strong></td>
 </tr>
 <tr>
 <td>2048 x 4096 x 11008</td>
-<td style="text-align: right;">5.06</td>
-<td style="text-align: right;">3.09</td>
-<td style="text-align: right;">2.96</td>
-<td style="text-align: right;">1.71x</td>
+<td style="text-align: right;">4.92</td>
+<td style="text-align: right;">3.12</td>
+<td style="text-align: right;">3.00</td>
+<td style="text-align: right;">1.64x</td>
 </tr>
 <tr>
 <td>2048 x 4864 x 896</td>
-<td style="text-align: right;">0.48</td>
-<td style="text-align: right;">0.33</td>
-<td style="text-align: right;">0.30</td>
+<td style="text-align: right;">0.51</td>
+<td style="text-align: right;">0.34</td>
+<td style="text-align: right;">0.31</td>
 <td style="text-align: right;">1.61x</td>
 </tr>
 <tr>
 <td>2048 x 1536 x 8960</td>
-<td style="text-align: right;">1.50</td>
-<td style="text-align: right;">1.09</td>
-<td style="text-align: right;">0.93</td>
-<td style="text-align: right;">1.61x</td>
+<td style="text-align: right;">1.55</td>
+<td style="text-align: right;">1.07</td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">1.62x</td>
 </tr>
 <tr>
 <td>2048 x 896 x 4864</td>
-<td style="text-align: right;">0.48</td>
-<td style="text-align: right;">0.46</td>
-<td style="text-align: right;">0.37</td>
-<td style="text-align: right;">1.31x</td>
+<td style="text-align: right;">0.51</td>
+<td style="text-align: right;">0.45</td>
+<td style="text-align: right;">0.40</td>
+<td style="text-align: right;">1.29x</td>
 </tr>
 <tr>
 <td>512 x 4096 x 4096</td>
-<td style="text-align: right;">0.46</td>
-<td style="text-align: right;">0.35</td>
-<td style="text-align: right;">0.32</td>
-<td style="text-align: right;">1.44x</td>
+<td style="text-align: right;">0.47</td>
+<td style="text-align: right;">0.36</td>
+<td style="text-align: right;">0.33</td>
+<td style="text-align: right;">1.43x</td>
 </tr>
 </tbody>
 </table>
@@ -316,28 +317,65 @@
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B</td>
-<td style="text-align: right;">93.1 ms</td>
-<td style="text-align: right;">103.7 (0.90x)</td>
-<td style="text-align: right;">86.7 (<strong>1.07x</strong>)</td>
+<td style="text-align: right;">87.0 ms</td>
+<td style="text-align: right;">95.5 (0.91x)</td>
+<td style="text-align: right;">79.3 (<strong>1.10x</strong>)</td>
 <td style="text-align: right;">18.79 -&gt; 19.20</td>
 </tr>
 <tr>
 <td>Llama-3.2-1B</td>
-<td style="text-align: right;">186.9</td>
-<td style="text-align: right;">177.4 (1.05x)</td>
-<td style="text-align: right;">159.4 (<strong>1.17x</strong>)</td>
+<td style="text-align: right;">178.5</td>
+<td style="text-align: right;">166.5 (1.07x)</td>
+<td style="text-align: right;">151.7 (<strong>1.18x</strong>)</td>
 <td style="text-align: right;">17.91 -&gt; 18.23</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B</td>
-<td style="text-align: right;">238.1</td>
-<td style="text-align: right;">226.6 (1.05x)</td>
-<td style="text-align: right;">204.4 (<strong>1.16x</strong>)</td>
+<td style="text-align: right;">236.1</td>
+<td style="text-align: right;">218.8 (1.08x)</td>
+<td style="text-align: right;">196.7 (<strong>1.20x</strong>)</td>
 <td style="text-align: right;">12.66 -&gt; 13.06</td>
 </tr>
 </tbody>
 </table>
-<p>So the same arithmetic that cuBLASLt could not turn into a whole-model gain is a 7 to 17 percent prefill speed-up when the epilogue is fused in the compiler. It is far less than the 1.5 to 1.7x of the GEMM, and the arithmetic says why: attention, the norms, the head (kept in fp16: for the 0.5B model it is about a sixth of the fp16 time), the activation quantisation pass and the host overhead of a Python layer are not touched. The obvious next steps are fusing the activation quantisation into the producer of the activations, quantising the head, and a W4A8 variant that halves the weight bytes as well; the quality cost (0.3 to 0.4 perplexity points for plain per-token / per-channel INT8) is the price to watch.</p></article>
+<p>So the same arithmetic that cuBLASLt could not turn into a whole-model gain is a 10 to 20 percent prefill speed-up when the epilogue is fused in the compiler. It is far less than the 1.5 to 1.7x of the GEMM, and the arithmetic says why: attention, the norms, the head (kept in fp16: for the 0.5B model it is about a sixth of the fp16 time), the activation quantisation pass and the host overhead of a Python layer are not touched. The obvious next steps are fusing the activation quantisation into the producer of the activations, quantising the head, and a W4A8 variant that halves the weight bytes as well; the quality cost (0.3 to 0.4 perplexity points for plain per-token / per-channel INT8) is the price to watch.</p>
+<h2 id="update-4-sharing-the-quantisation-a-profile-and-two-measurement-traps-2026-11-21">Update 4: sharing the quantisation, a profile, and two measurement traps (2026-11-21)<a class="headerlink" href="#update-4-sharing-the-quantisation-a-profile-and-two-measurement-traps-2026-11-21" title="Permanent link">#</a></h2>
+<p><strong>Sharing the activation quantisation.</strong> q, k and v read the same activations, and so do gate and up; each layer quantised them again. <code>quantize_model(..., "int8_w8a8")</code> now fuses them (a shared-input layer: one quantisation pass, one wider GEMM, each original layer takes its slice). It gains only 1 to 3 percent of prefill (0.5B: 80.6 to 81.1 ms, within the noise; Llama-3.2-1B 155.2 to 151.8; Qwen2.5-1.5B 203.5 to 201.3), so the repeated quantisation was not where the time went. A bug of mine on the way: the shared layer kept the outputs of its last call, about 80 MB per layer for a gate / up at 4096 rows, which ran the model out of memory; they are dropped as soon as every part has been taken, and a test compares the fused and unfused model outputs.</p>
+<p><strong>Where the time goes</strong> (Qwen2.5-0.5B, one 2048-token prefill, kernel device time):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">INT8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GEMMs of the layers</td>
+<td style="text-align: right;">41.4 ms</td>
+<td style="text-align: right;"><strong>28.3</strong> (1.46x)</td>
+</tr>
+<tr>
+<td><code>lm_head</code> (kept in fp16)</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">14.3</td>
+</tr>
+<tr>
+<td>norms, rotary, silu x up, residual, quantisation...</td>
+<td style="text-align: right;">24.1</td>
+<td style="text-align: right;">31.7 (+7.6 for the quantisation)</td>
+</tr>
+<tr>
+<td>attention</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">5.7</td>
+</tr>
+</tbody>
+</table>
+<p>The GEMMs really are 1.46x faster; what stops the model from following is that 24 ms, 28 percent of the fp16 prefill, are the element-wise operations of an eager Hugging Face model, which no GEMM kernel touches (an inference engine fuses them), plus a head that a real prefill does not even compute for every position. The quantisation pass itself costs 7.6 ms; <code>torch.compile</code> already makes it one kernel at 1.1 times the single-pass ideal, so a hand-written kernel would not help; only folding it into the producer of the activation would (a fused <code>silu(gate) * up</code> and quantise, for the input of <code>down_proj</code>, is the biggest single piece: about 5 ms here).</p>
+<p><strong>Two measurement traps.</strong> (1) A sweep of <code>block-swizzle</code> that timed each variant at a different moment said swizzle helped every layer shape by 3 to 28 percent. Interleaved rounds of all variants in one session said otherwise: it is 2.3x faster for a weight larger than the L2 (2048 x 2048 x 16384: 5.8 to 2.5 ms) and 12 to 14 percent slower for one that fits (2048 x 4096 x 4096), so the rule is now size-based. The clocks of a laptop GPU drift by 10 percent between measurements, more than most of the differences I was trying to measure. The earlier shared-input fusion had exposed it the other way round: with the old threshold the widened gate / up weight of Llama-3.2-1B (33.6 MB, just below the threshold) ran unswizzled at 2.9 times the time and made the model 32 percent slower, until I measured that shape in isolation. (2) The tables in this post come from different sessions; compare a column within a row, never across tables.</p>
+<p>Not done, and why: quantising the head (a real prefill needs the last position only), W4A8 (halves the weight bytes as well but needs a per-group int32 to float rescale inside the K loop, a new accumulation scheme in the compiler), and the fused <code>silu * up</code> quantisation, which is a kernel for one model family.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

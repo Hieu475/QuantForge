@@ -305,16 +305,16 @@ class INT8W8A8Linear(nn.Module):
         return -(-m // 4096) * 4096
 
     def _compiled_forward(self, x2: torch.Tensor, dt) -> torch.Tensor:
-        from .e2e import INT8_GEMM_OPTS, Int8GemmDq
+        from .e2e import INT8_GEMM_OPTS, Int8GemmDq, int8_gemm_swizzle
 
         M, K = x2.shape
         Mp = self._bucket(M)
         key = Mp
         k = self._kernels.get(key)
         if k is None:
-            swz = 16 if self.out_features * K > 2 ** 25 else 0           # a weight larger than the L2: raster the blocks
-            k = self._kernels[key] = Int8GemmDq.build(Mp, K, self.out_features, bias=True,
-                                                      pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={swz}")
+            k = self._kernels[key] = Int8GemmDq.build(
+                Mp, K, self.out_features, bias=True,
+                pipeline_opts=f"{INT8_GEMM_OPTS} block-swizzle={int8_gemm_swizzle(K, self.out_features)}")
         xq, s_x = _int8_quantize_tokens(x2)
         s_x = s_x.reshape(-1)
         if Mp != M:                                                       # zero rows (scale 0) up to the bucket
@@ -392,7 +392,8 @@ class _QKVPart(nn.Module):
         self.fused, self.index = fused, index
 
     def forward(self, x):
-        return self.fused.parts(x)[self.index]
+        take = getattr(self.fused, "take", None)
+        return take(x, self.index) if take is not None else self.fused.parts(x)[self.index]
 
 
 class _QuantGatedMLP(nn.Module):
@@ -424,6 +425,67 @@ class _QuantGatedMLP(nn.Module):
                                   self.group_size, self.gate_proj.bias, "silu")
             h = g * self.up_proj(xh)
         return self.down_proj(h if x.dtype == torch.float16 else h.to(x.dtype))
+
+
+class _Int8Shared(nn.Module):
+    """Several ``INT8W8A8Linear`` layers that read the SAME input (q / k / v; gate / up) as ONE layer: the activations are quantised
+    once and one GEMM (one launch, a wider N) computes all the outputs; each original layer becomes a ``_QKVPart`` that takes its
+    slice (the first call computes, the others reuse it: keyed on the identity and the in-place version of the input, as ``_QuantQKV``)."""
+
+    def __init__(self, layers):
+        super().__init__()
+        w = torch.cat([m.weight for m in layers], 0).contiguous()
+        sc = torch.cat([m.w_scale for m in layers])
+        sizes = [m.out_features for m in layers]
+        if any(m.bias is not None for m in layers):
+            bias = torch.cat([m.bias if m.bias is not None else torch.zeros(n, dtype=torch.float16, device=w.device)
+                              for m, n in zip(layers, sizes)])
+        else:
+            bias = None
+        self.inner = INT8W8A8Linear(w, sc, bias, layers[0].backend)
+        self.sizes = sizes
+        self._key, self._outs, self._taken = None, None, 0
+
+    def parts(self, x: torch.Tensor):
+        try:
+            version = x._version
+        except RuntimeError:       # inference-mode tensors have no version counter
+            version = None
+        key = (id(x), version)
+        if self._key != key or self._outs is None:
+            self._outs = tuple(self.inner(x).split(self.sizes, -1))
+            self._key, self._x, self._taken = key, x, 0      # keep x alive so that its id cannot be reused
+        return self._outs
+
+    def take(self, x: torch.Tensor, index: int) -> torch.Tensor:
+        """Part ``index`` of the shared GEMM. The cache (the outputs of the last call, ~80 MB for a gate / up at 4096 rows) is dropped
+        as soon as every part was taken: otherwise every layer would hold its last activations until the next forward."""
+        out = self.parts(x)[index]
+        self._taken += 1
+        if self._taken >= len(self.sizes):
+            self._key = self._outs = self._x = None
+            self._taken = 0
+        return out
+
+
+def _fuse_int8(model: nn.Module) -> tuple[int, int]:
+    """Share the activation quantisation and the GEMM between q/k/v and between gate/up of INT8 W8A8 blocks; returns (#qkv, #gate-up)."""
+    n_qkv = n_mlp = 0
+    for module in list(model.modules()):
+        for names, counter in ((("q_proj", "k_proj", "v_proj"), "qkv"), (("gate_proj", "up_proj"), "mlp")):
+            layers = [getattr(module, n, None) for n in names]
+            if not all(isinstance(m, INT8W8A8Linear) for m in layers):
+                continue
+            if len({(m.in_features, m.backend) for m in layers}) != 1:
+                continue
+            shared = _Int8Shared(layers)
+            for i, n in enumerate(names):
+                setattr(module, n, _QKVPart(shared, i))
+            if counter == "qkv":
+                n_qkv += 1
+            else:
+                n_mlp += 1
+    return n_qkv, n_mlp
 
 
 def _is_silu(module: nn.Module) -> bool:
@@ -531,7 +593,7 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
-    stats["fused_qkv"], stats["fused_mlp"] = _fuse(model) if fuse else (0, 0)
+    stats["fused_qkv"], stats["fused_mlp"] = (_fuse_int8(model) if fmt == INT8_W8A8_FORMAT else _fuse(model)) if fuse else (0, 0)
     model.to(device)       # embeddings / norms / any dense layer left; the quantised buffers are there
     if kfold:
         stats["kfold"] = enable_kfold(model)

@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-* `epilogue=int8-dequant` (`quantforge-fuse-epilogue`) and `quantforge.e2e.Int8GemmDq`: INT8 GEMM + `* sx[m] * sw[n] + bias[n]` -> f16 in ONE kernel with no int32 intermediate (1.31-1.71x cuBLAS fp16 for GEMM + dequantisation).
-  `INT8W8A8Linear` uses it by default (`backend="quantforge"`, `quantize_model(..., int8_backend=)`): whole-model prefill 1.07x / 1.17x / 1.16x of fp16 for Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B (cuBLASLt route: 0.90-1.05x).
+* `epilogue=int8-dequant` (`quantforge-fuse-epilogue`) and `quantforge.e2e.Int8GemmDq`: INT8 GEMM + `* sx[m] * sw[n] + bias[n]` -> f16 in ONE kernel with no int32 intermediate (1.29-1.81x cuBLAS fp16 for GEMM + dequantisation).
+  `INT8W8A8Linear` uses it by default (`backend="quantforge"`, `quantize_model(..., int8_backend=)`): whole-model prefill 1.10x / 1.18x / 1.20x of fp16 for Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B (cuBLASLt route: 0.91-1.08x). q/k/v and gate/up share one activation quantisation and one GEMM (`_Int8Shared`, 1-3 %); `int8_gemm_swizzle`: block rastering only for weights larger than the L2.
 
 * Experimental compiler-generated INT8 GEMM (`quantforge.e2e.Int8Gemm`, `benchmarks/int8_gemm_probe.py`): `mma.m16n8k32.s8` through the existing pipeline, bit-exact for 129 schedules, 59-65 TOPS on large shapes, 1.1-1.7x cuBLAS fp16.
   Compiler: `arith.extsi` operands are folded into `vector.contract` (vectorization pass), new `thread-tile-k` pipeline option, `quantforge-overwrite-output` handles i32 accumulators; `quantforge-smem-promotion` recognises a transposed-B tile `[N-tile x K]` (48 of 180 block/warp combinations of the int8 GEMM gave wrong results before).

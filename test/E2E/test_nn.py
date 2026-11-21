@@ -307,3 +307,25 @@ def test_int8_w8a8_linear_matches_the_quantised_reference_and_handles_few_rows()
     assert q(torch.randn(2, 3, 512, device="cuda", dtype=torch.float16)).shape == (2, 3, 384)
     with pytest.raises(ValueError):
         qnn.INT8W8A8Linear.from_linear(torch.nn.Linear(500, 384).half().cuda())
+
+
+def test_int8_w8a8_shared_input_fusion_gives_the_same_model_output():
+    """q/k/v and gate/up of a block share one activation quantisation and one GEMM: the output equals the unfused model's."""
+    _require_gpu()
+    transformers = pytest.importorskip("transformers")
+    import quantforge.nn as qnn
+
+    cfg = transformers.LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, vocab_size=512, max_position_embeddings=64)
+    torch.manual_seed(0)
+    base = transformers.LlamaForCausalLM(cfg).half().eval()
+    ids = torch.randint(0, 512, (1, 64), device="cuda")
+    outs = {}
+    for fuse in (False, True):
+        m = copy.deepcopy(base)
+        st = qnn.quantize_model(m, "int8_w8a8", fuse=fuse)
+        assert (st["fused_qkv"], st["fused_mlp"]) == ((2, 2) if fuse else (0, 0))
+        with torch.no_grad():
+            outs[fuse] = m(ids).logits.float()
+    assert torch.isfinite(outs[True]).all()
+    assert (outs[True] - outs[False]).abs().max() < 1e-2 * outs[False].abs().max()

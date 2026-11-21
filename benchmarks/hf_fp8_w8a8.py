@@ -51,6 +51,8 @@ def main():
         elif v == "int4":
             qnn.quantize_model(m, "int4", 128); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
         elif v == "int8_w8a8":            # INT8 weights + per-token INT8 activations, GEMM + dequant epilogue compiled by QuantForge
+            qnn.quantize_model(m, "int8_w8a8", fuse=True)          # q/k/v and gate/up share one quantisation + one GEMM
+        elif v == "int8_w8a8_nofuse":
             qnn.quantize_model(m, "int8_w8a8", fuse=False)
         elif v == "int8_w8a8_cublaslt":   # the same through cuBLASLt (torch._int_mm) with the epilogue as separate torch ops
             qnn.quantize_model(m, "int8_w8a8", fuse=False, int8_backend="cublaslt")

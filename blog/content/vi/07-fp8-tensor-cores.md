@@ -112,13 +112,13 @@ GEMM cộng dequantisation, một lần launch, ra f16 (RTX 4050, GPU được l
 
 | shape (M x K x N) | cuBLAS fp16 | chỉ GEMM int32 | GEMM + dequant hợp nhất | so với fp16 |
 |---|--:|--:|--:|--:|
-| 2048 x 4096 x 4096 | 1.76 ms | 1.11 | 1.03 | **1.71x** |
-| 4096 x 4096 x 4096 | 3.51 | 2.12 | 2.12 | 1.66x |
-| 2048 x 4096 x 11008 | 5.06 | 3.09 | 2.96 | 1.71x |
-| 2048 x 4864 x 896 | 0.48 | 0.33 | 0.30 | 1.61x |
-| 2048 x 1536 x 8960 | 1.50 | 1.09 | 0.93 | 1.61x |
-| 2048 x 896 x 4864 | 0.48 | 0.46 | 0.37 | 1.31x |
-| 512 x 4096 x 4096 | 0.46 | 0.35 | 0.32 | 1.44x |
+| 2048 x 4096 x 4096 | 1.70 ms | 1.05 | 1.10 | **1.54x** |
+| 4096 x 4096 x 4096 | 3.66 | 2.18 | 2.02 | **1.81x** |
+| 2048 x 4096 x 11008 | 4.92 | 3.12 | 3.00 | 1.64x |
+| 2048 x 4864 x 896 | 0.51 | 0.34 | 0.31 | 1.61x |
+| 2048 x 1536 x 8960 | 1.55 | 1.07 | 0.96 | 1.62x |
+| 2048 x 896 x 4864 | 0.51 | 0.45 | 0.40 | 1.29x |
+| 512 x 4096 x 4096 | 0.47 | 0.36 | 0.33 | 1.43x |
 
 Kernel hợp nhất còn nhanh hơn GEMM int32 thô, vì nó ghi một nửa số byte, và các shape K nhỏ vốn yếu nhất khi là GEMM thô giờ được lợi nhiều nhất từ epilogue.
 
@@ -126,8 +126,27 @@ Kernel hợp nhất còn nhanh hơn GEMM int32 thô, vì nó ghi một nửa s�
 
 | model | fp16 | INT8, đường cuBLASLt | INT8, kernel hợp nhất đã biên dịch | perplexity (fp16 -> INT8) |
 |---|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 93.1 ms | 103.7 (0.90x) | 86.7 (**1.07x**) | 18.79 -> 19.20 |
-| Llama-3.2-1B | 186.9 | 177.4 (1.05x) | 159.4 (**1.17x**) | 17.91 -> 18.23 |
-| Qwen2.5-1.5B | 238.1 | 226.6 (1.05x) | 204.4 (**1.16x**) | 12.66 -> 13.06 |
+| Qwen2.5-0.5B | 87.0 ms | 95.5 (0.91x) | 79.3 (**1.10x**) | 18.79 -> 19.20 |
+| Llama-3.2-1B | 178.5 | 166.5 (1.07x) | 151.7 (**1.18x**) | 17.91 -> 18.23 |
+| Qwen2.5-1.5B | 236.1 | 218.8 (1.08x) | 196.7 (**1.20x**) | 12.66 -> 13.06 |
 
-Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 7 đến 17 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.
+Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 10 đến 20 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.
+
+## Cập nhật 4: dùng chung lượng tử hóa, một bản profile, và hai cái bẫy đo lường (2026-11-21)
+
+**Dùng chung lượng tử hóa activation.** q, k và v đọc cùng một activation, gate và up cũng vậy; mỗi layer đều lượng tử hóa lại chúng. `quantize_model(..., "int8_w8a8")` giờ gộp chúng (một layer dùng chung đầu vào: một lượt lượng tử hóa, một GEMM rộng hơn, mỗi layer gốc lấy phần của mình). Nó chỉ tăng 1 đến 3 phần trăm prefill (0.5B: 80.6 lên 81.1 ms, trong sai số; Llama-3.2-1B 155.2 xuống 151.8; Qwen2.5-1.5B 203.5 xuống 201.3), nên việc lượng tử hóa lặp lại không phải là chỗ mất thời gian. Một lỗi của tôi trên đường đi: layer dùng chung giữ đầu ra của lần gọi cuối, khoảng 80 MB mỗi layer với gate / up ở 4096 hàng, làm model hết bộ nhớ; chúng được giải phóng ngay khi mọi phần đã được lấy, và một test so sánh đầu ra của model gộp và không gộp.
+
+**Thời gian đi đâu** (Qwen2.5-0.5B, một lượt prefill 2048 token, thời gian thiết bị của kernel):
+
+| | fp16 | INT8 |
+|---|--:|--:|
+| GEMM của các layer | 41.4 ms | **28.3** (1.46x) |
+| `lm_head` (giữ ở fp16) | 14.3 | 14.3 |
+| norm, rotary, silu x up, residual, lượng tử hóa... | 24.1 | 31.7 (+7.6 cho lượng tử hóa) |
+| attention | 6.0 | 5.7 |
+
+GEMM thật sự nhanh hơn 1.46x; điều ngăn cả model theo kịp là 24 ms, 28 phần trăm prefill fp16, là các phép theo phần tử của một model Hugging Face chạy eager, thứ không kernel GEMM nào đụng tới (engine suy luận gộp chúng), cộng một head mà prefill thật còn không tính cho mọi vị trí. Bản thân lượt lượng tử hóa tốn 7.6 ms; `torch.compile` đã làm nó thành một kernel ở mức 1.1 lần lý tưởng của một lượt bộ nhớ, nên một kernel viết tay không giúp được gì; chỉ việc gộp nó vào nơi sinh ra activation mới giúp (một kernel `silu(gate) * up` rồi lượng tử hóa, cho đầu vào của `down_proj`, là mảnh đơn lẻ lớn nhất: khoảng 5 ms ở đây).
+
+**Hai cái bẫy đo lường.** (1) Một sweep `block-swizzle` đo từng biến thể ở một thời điểm khác nhau nói rằng swizzle giúp mọi shape layer từ 3 đến 28 phần trăm. Các vòng xen kẽ của mọi biến thể trong một phiên nói điều khác: nó nhanh hơn 2.3x với weight lớn hơn L2 (2048 x 2048 x 16384: 5.8 xuống 2.5 ms) và chậm hơn 12 đến 14 phần trăm với weight vừa trong L2 (2048 x 4096 x 4096), nên quy tắc giờ dựa trên kích thước. Xung nhịp của GPU laptop trôi 10 phần trăm giữa các lần đo, nhiều hơn phần lớn các khác biệt tôi đang cố đo. Phép gộp đầu vào dùng chung trước đó đã làm lộ ra điều này theo chiều ngược lại: với ngưỡng cũ, weight gate / up được nới rộng của Llama-3.2-1B (33.6 MB, ngay dưới ngưỡng) chạy không swizzle với thời gian gấp 2.9 lần và làm model chậm đi 32 phần trăm, cho đến khi tôi đo riêng shape đó. (2) Các bảng trong bài này đến từ các phiên khác nhau; hãy so sánh các cột trong cùng một hàng, đừng bao giờ so giữa các bảng.
+
+Chưa làm, và vì sao: lượng tử hóa head (prefill thật chỉ cần vị trí cuối), W4A8 (giảm một nửa số byte weight nhưng cần phép đổi tỷ lệ int32 sang float theo từng nhóm ngay trong vòng K, một cách tích lũy mới trong compiler), và lượng tử hóa `silu * up` gộp, vốn là một kernel cho một họ model.

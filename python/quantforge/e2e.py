@@ -594,9 +594,16 @@ def reference_gemm(act, q, scale, zero_point):
 INT8_GEMM_OPTS = ("block-tile-m=128 block-tile-n=128 block-tile-k=64 warp-tile-m=64 warp-tile-n=64 smem-stages=1 "
                   "thread-tile-k=32 smem-pad=16 accumulate=false")
 """The best schedule of a sweep of 129 block / warp / K-tile / stage combinations, every one bit-exact against cuBLASLt (``thread-tile-k=32``:
-``mma.m16n8k32`` s8; ``smem-pad=16``: a row of an int8 tile must stay 16-byte aligned for ``ldmatrix``). For weights larger than the L2 add
-``block-swizzle=16``. (Before the shared-memory promotion pass learned about a transposed B, the combinations with block N different
+``mma.m16n8k32`` s8; ``smem-pad=16``: a row of an int8 tile must stay 16-byte aligned for ``ldmatrix``). Block rastering is a separate decision (``int8_gemm_swizzle``): ``block-swizzle=8`` is 2.3x faster for a weight larger than the L2
+(2048 x 2048 x 16384: 5.8 -> 2.5 ms) and 12 to 14 percent SLOWER for one that fits (2048 x 4096 x 4096, 2048 x 1536 x 8960). (Before the shared-memory promotion pass learned about a transposed B, the combinations with block N different
 from block M gave wrong results; they are covered by ``test/E2E/test_int8_gemm.py`` now.)"""
+
+
+def int8_gemm_swizzle(K: int, N: int) -> int:
+    """``block-swizzle`` for an int8 weight ``[N, K]``: 8 when it is larger than the L2 cache (24 MB on the RTX 4050; 22 MB here), else 0.
+    (A first sweep that timed each variant at a different moment said swizzle helped every shape; interleaved rounds in one session showed it
+    costs 12-14 percent on the shapes that fit. The clocks of a laptop drift by 10 percent between measurements.)"""
+    return 8 if N * K > 22_000_000 else 0
 
 
 class Int8Gemm:

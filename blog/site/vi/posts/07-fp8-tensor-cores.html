@@ -23,6 +23,7 @@
 <li><a href="#cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21">Cập nhật: tensor core INT8 cho được gì (2026-11-21)</a></li>
 <li><a href="#cap-nhat-2-kernel-int8-cua-chinh-compiler-2026-11-21">Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)</a></li>
 <li><a href="#cap-nhat-3-gop-dequantisation-va-ca-model-2026-11-21">Cập nhật 3: gộp dequantisation, và cả model (2026-11-21)</a></li>
+<li><a href="#cap-nhat-4-dung-chung-luong-tu-hoa-mot-ban-profile-va-hai-cai-bay-o-luong-2026-11-21">Cập nhật 4: dùng chung lượng tử hóa, một bản profile, và hai cái bẫy đo lường (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -252,52 +253,52 @@
 <tbody>
 <tr>
 <td>2048 x 4096 x 4096</td>
-<td style="text-align: right;">1.76 ms</td>
-<td style="text-align: right;">1.11</td>
-<td style="text-align: right;">1.03</td>
-<td style="text-align: right;"><strong>1.71x</strong></td>
+<td style="text-align: right;">1.70 ms</td>
+<td style="text-align: right;">1.05</td>
+<td style="text-align: right;">1.10</td>
+<td style="text-align: right;"><strong>1.54x</strong></td>
 </tr>
 <tr>
 <td>4096 x 4096 x 4096</td>
-<td style="text-align: right;">3.51</td>
-<td style="text-align: right;">2.12</td>
-<td style="text-align: right;">2.12</td>
-<td style="text-align: right;">1.66x</td>
+<td style="text-align: right;">3.66</td>
+<td style="text-align: right;">2.18</td>
+<td style="text-align: right;">2.02</td>
+<td style="text-align: right;"><strong>1.81x</strong></td>
 </tr>
 <tr>
 <td>2048 x 4096 x 11008</td>
-<td style="text-align: right;">5.06</td>
-<td style="text-align: right;">3.09</td>
-<td style="text-align: right;">2.96</td>
-<td style="text-align: right;">1.71x</td>
+<td style="text-align: right;">4.92</td>
+<td style="text-align: right;">3.12</td>
+<td style="text-align: right;">3.00</td>
+<td style="text-align: right;">1.64x</td>
 </tr>
 <tr>
 <td>2048 x 4864 x 896</td>
-<td style="text-align: right;">0.48</td>
-<td style="text-align: right;">0.33</td>
-<td style="text-align: right;">0.30</td>
+<td style="text-align: right;">0.51</td>
+<td style="text-align: right;">0.34</td>
+<td style="text-align: right;">0.31</td>
 <td style="text-align: right;">1.61x</td>
 </tr>
 <tr>
 <td>2048 x 1536 x 8960</td>
-<td style="text-align: right;">1.50</td>
-<td style="text-align: right;">1.09</td>
-<td style="text-align: right;">0.93</td>
-<td style="text-align: right;">1.61x</td>
+<td style="text-align: right;">1.55</td>
+<td style="text-align: right;">1.07</td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">1.62x</td>
 </tr>
 <tr>
 <td>2048 x 896 x 4864</td>
-<td style="text-align: right;">0.48</td>
-<td style="text-align: right;">0.46</td>
-<td style="text-align: right;">0.37</td>
-<td style="text-align: right;">1.31x</td>
+<td style="text-align: right;">0.51</td>
+<td style="text-align: right;">0.45</td>
+<td style="text-align: right;">0.40</td>
+<td style="text-align: right;">1.29x</td>
 </tr>
 <tr>
 <td>512 x 4096 x 4096</td>
-<td style="text-align: right;">0.46</td>
-<td style="text-align: right;">0.35</td>
-<td style="text-align: right;">0.32</td>
-<td style="text-align: right;">1.44x</td>
+<td style="text-align: right;">0.47</td>
+<td style="text-align: right;">0.36</td>
+<td style="text-align: right;">0.33</td>
+<td style="text-align: right;">1.43x</td>
 </tr>
 </tbody>
 </table>
@@ -316,28 +317,65 @@
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B</td>
-<td style="text-align: right;">93.1 ms</td>
-<td style="text-align: right;">103.7 (0.90x)</td>
-<td style="text-align: right;">86.7 (<strong>1.07x</strong>)</td>
+<td style="text-align: right;">87.0 ms</td>
+<td style="text-align: right;">95.5 (0.91x)</td>
+<td style="text-align: right;">79.3 (<strong>1.10x</strong>)</td>
 <td style="text-align: right;">18.79 -&gt; 19.20</td>
 </tr>
 <tr>
 <td>Llama-3.2-1B</td>
-<td style="text-align: right;">186.9</td>
-<td style="text-align: right;">177.4 (1.05x)</td>
-<td style="text-align: right;">159.4 (<strong>1.17x</strong>)</td>
+<td style="text-align: right;">178.5</td>
+<td style="text-align: right;">166.5 (1.07x)</td>
+<td style="text-align: right;">151.7 (<strong>1.18x</strong>)</td>
 <td style="text-align: right;">17.91 -&gt; 18.23</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B</td>
-<td style="text-align: right;">238.1</td>
-<td style="text-align: right;">226.6 (1.05x)</td>
-<td style="text-align: right;">204.4 (<strong>1.16x</strong>)</td>
+<td style="text-align: right;">236.1</td>
+<td style="text-align: right;">218.8 (1.08x)</td>
+<td style="text-align: right;">196.7 (<strong>1.20x</strong>)</td>
 <td style="text-align: right;">12.66 -&gt; 13.06</td>
 </tr>
 </tbody>
 </table>
-<p>Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 7 đến 17 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.</p></article>
+<p>Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 10 đến 20 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.</p>
+<h2 id="cap-nhat-4-dung-chung-luong-tu-hoa-mot-ban-profile-va-hai-cai-bay-o-luong-2026-11-21">Cập nhật 4: dùng chung lượng tử hóa, một bản profile, và hai cái bẫy đo lường (2026-11-21)<a class="headerlink" href="#cap-nhat-4-dung-chung-luong-tu-hoa-mot-ban-profile-va-hai-cai-bay-o-luong-2026-11-21" title="Permanent link">#</a></h2>
+<p><strong>Dùng chung lượng tử hóa activation.</strong> q, k và v đọc cùng một activation, gate và up cũng vậy; mỗi layer đều lượng tử hóa lại chúng. <code>quantize_model(..., "int8_w8a8")</code> giờ gộp chúng (một layer dùng chung đầu vào: một lượt lượng tử hóa, một GEMM rộng hơn, mỗi layer gốc lấy phần của mình). Nó chỉ tăng 1 đến 3 phần trăm prefill (0.5B: 80.6 lên 81.1 ms, trong sai số; Llama-3.2-1B 155.2 xuống 151.8; Qwen2.5-1.5B 203.5 xuống 201.3), nên việc lượng tử hóa lặp lại không phải là chỗ mất thời gian. Một lỗi của tôi trên đường đi: layer dùng chung giữ đầu ra của lần gọi cuối, khoảng 80 MB mỗi layer với gate / up ở 4096 hàng, làm model hết bộ nhớ; chúng được giải phóng ngay khi mọi phần đã được lấy, và một test so sánh đầu ra của model gộp và không gộp.</p>
+<p><strong>Thời gian đi đâu</strong> (Qwen2.5-0.5B, một lượt prefill 2048 token, thời gian thiết bị của kernel):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">INT8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GEMM của các layer</td>
+<td style="text-align: right;">41.4 ms</td>
+<td style="text-align: right;"><strong>28.3</strong> (1.46x)</td>
+</tr>
+<tr>
+<td><code>lm_head</code> (giữ ở fp16)</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">14.3</td>
+</tr>
+<tr>
+<td>norm, rotary, silu x up, residual, lượng tử hóa...</td>
+<td style="text-align: right;">24.1</td>
+<td style="text-align: right;">31.7 (+7.6 cho lượng tử hóa)</td>
+</tr>
+<tr>
+<td>attention</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">5.7</td>
+</tr>
+</tbody>
+</table>
+<p>GEMM thật sự nhanh hơn 1.46x; điều ngăn cả model theo kịp là 24 ms, 28 phần trăm prefill fp16, là các phép theo phần tử của một model Hugging Face chạy eager, thứ không kernel GEMM nào đụng tới (engine suy luận gộp chúng), cộng một head mà prefill thật còn không tính cho mọi vị trí. Bản thân lượt lượng tử hóa tốn 7.6 ms; <code>torch.compile</code> đã làm nó thành một kernel ở mức 1.1 lần lý tưởng của một lượt bộ nhớ, nên một kernel viết tay không giúp được gì; chỉ việc gộp nó vào nơi sinh ra activation mới giúp (một kernel <code>silu(gate) * up</code> rồi lượng tử hóa, cho đầu vào của <code>down_proj</code>, là mảnh đơn lẻ lớn nhất: khoảng 5 ms ở đây).</p>
+<p><strong>Hai cái bẫy đo lường.</strong> (1) Một sweep <code>block-swizzle</code> đo từng biến thể ở một thời điểm khác nhau nói rằng swizzle giúp mọi shape layer từ 3 đến 28 phần trăm. Các vòng xen kẽ của mọi biến thể trong một phiên nói điều khác: nó nhanh hơn 2.3x với weight lớn hơn L2 (2048 x 2048 x 16384: 5.8 xuống 2.5 ms) và chậm hơn 12 đến 14 phần trăm với weight vừa trong L2 (2048 x 4096 x 4096), nên quy tắc giờ dựa trên kích thước. Xung nhịp của GPU laptop trôi 10 phần trăm giữa các lần đo, nhiều hơn phần lớn các khác biệt tôi đang cố đo. Phép gộp đầu vào dùng chung trước đó đã làm lộ ra điều này theo chiều ngược lại: với ngưỡng cũ, weight gate / up được nới rộng của Llama-3.2-1B (33.6 MB, ngay dưới ngưỡng) chạy không swizzle với thời gian gấp 2.9 lần và làm model chậm đi 32 phần trăm, cho đến khi tôi đo riêng shape đó. (2) Các bảng trong bài này đến từ các phiên khác nhau; hãy so sánh các cột trong cùng một hàng, đừng bao giờ so giữa các bảng.</p>
+<p>Chưa làm, và vì sao: lượng tử hóa head (prefill thật chỉ cần vị trí cuối), W4A8 (giảm một nửa số byte weight nhưng cần phép đổi tỷ lệ int32 sang float theo từng nhóm ngay trong vòng K, một cách tích lũy mới trong compiler), và lượng tử hóa <code>silu * up</code> gộp, vốn là một kernel cho một họ model.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

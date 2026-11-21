@@ -112,13 +112,13 @@ GEMM plus dequantisation, one launch, f16 out (RTX 4050, GPU pre-heated; the fp1
 
 | shape (M x K x N) | cuBLAS fp16 | int32 GEMM only | fused GEMM + dequant | vs fp16 |
 |---|--:|--:|--:|--:|
-| 2048 x 4096 x 4096 | 1.76 ms | 1.11 | 1.03 | **1.71x** |
-| 4096 x 4096 x 4096 | 3.51 | 2.12 | 2.12 | 1.66x |
-| 2048 x 4096 x 11008 | 5.06 | 3.09 | 2.96 | 1.71x |
-| 2048 x 4864 x 896 | 0.48 | 0.33 | 0.30 | 1.61x |
-| 2048 x 1536 x 8960 | 1.50 | 1.09 | 0.93 | 1.61x |
-| 2048 x 896 x 4864 | 0.48 | 0.46 | 0.37 | 1.31x |
-| 512 x 4096 x 4096 | 0.46 | 0.35 | 0.32 | 1.44x |
+| 2048 x 4096 x 4096 | 1.70 ms | 1.05 | 1.10 | **1.54x** |
+| 4096 x 4096 x 4096 | 3.66 | 2.18 | 2.02 | **1.81x** |
+| 2048 x 4096 x 11008 | 4.92 | 3.12 | 3.00 | 1.64x |
+| 2048 x 4864 x 896 | 0.51 | 0.34 | 0.31 | 1.61x |
+| 2048 x 1536 x 8960 | 1.55 | 1.07 | 0.96 | 1.62x |
+| 2048 x 896 x 4864 | 0.51 | 0.45 | 0.40 | 1.29x |
+| 512 x 4096 x 4096 | 0.47 | 0.36 | 0.33 | 1.43x |
 
 The fused kernel is even faster than the raw int32 GEMM, because it writes half the bytes, and the small-K shapes that were the weakest as raw GEMMs now gain the most from the epilogue.
 
@@ -126,8 +126,27 @@ The fused kernel is even faster than the raw int32 GEMM, because it writes half 
 
 | model | fp16 | INT8, cuBLASLt route | INT8, compiled fused kernel | perplexity (fp16 -> INT8) |
 |---|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 93.1 ms | 103.7 (0.90x) | 86.7 (**1.07x**) | 18.79 -> 19.20 |
-| Llama-3.2-1B | 186.9 | 177.4 (1.05x) | 159.4 (**1.17x**) | 17.91 -> 18.23 |
-| Qwen2.5-1.5B | 238.1 | 226.6 (1.05x) | 204.4 (**1.16x**) | 12.66 -> 13.06 |
+| Qwen2.5-0.5B | 87.0 ms | 95.5 (0.91x) | 79.3 (**1.10x**) | 18.79 -> 19.20 |
+| Llama-3.2-1B | 178.5 | 166.5 (1.07x) | 151.7 (**1.18x**) | 17.91 -> 18.23 |
+| Qwen2.5-1.5B | 236.1 | 218.8 (1.08x) | 196.7 (**1.20x**) | 12.66 -> 13.06 |
 
-So the same arithmetic that cuBLASLt could not turn into a whole-model gain is a 7 to 17 percent prefill speed-up when the epilogue is fused in the compiler. It is far less than the 1.5 to 1.7x of the GEMM, and the arithmetic says why: attention, the norms, the head (kept in fp16: for the 0.5B model it is about a sixth of the fp16 time), the activation quantisation pass and the host overhead of a Python layer are not touched. The obvious next steps are fusing the activation quantisation into the producer of the activations, quantising the head, and a W4A8 variant that halves the weight bytes as well; the quality cost (0.3 to 0.4 perplexity points for plain per-token / per-channel INT8) is the price to watch.
+So the same arithmetic that cuBLASLt could not turn into a whole-model gain is a 10 to 20 percent prefill speed-up when the epilogue is fused in the compiler. It is far less than the 1.5 to 1.7x of the GEMM, and the arithmetic says why: attention, the norms, the head (kept in fp16: for the 0.5B model it is about a sixth of the fp16 time), the activation quantisation pass and the host overhead of a Python layer are not touched. The obvious next steps are fusing the activation quantisation into the producer of the activations, quantising the head, and a W4A8 variant that halves the weight bytes as well; the quality cost (0.3 to 0.4 perplexity points for plain per-token / per-channel INT8) is the price to watch.
+
+## Update 4: sharing the quantisation, a profile, and two measurement traps (2026-11-21)
+
+**Sharing the activation quantisation.** q, k and v read the same activations, and so do gate and up; each layer quantised them again. `quantize_model(..., "int8_w8a8")` now fuses them (a shared-input layer: one quantisation pass, one wider GEMM, each original layer takes its slice). It gains only 1 to 3 percent of prefill (0.5B: 80.6 to 81.1 ms, within the noise; Llama-3.2-1B 155.2 to 151.8; Qwen2.5-1.5B 203.5 to 201.3), so the repeated quantisation was not where the time went. A bug of mine on the way: the shared layer kept the outputs of its last call, about 80 MB per layer for a gate / up at 4096 rows, which ran the model out of memory; they are dropped as soon as every part has been taken, and a test compares the fused and unfused model outputs.
+
+**Where the time goes** (Qwen2.5-0.5B, one 2048-token prefill, kernel device time):
+
+| | fp16 | INT8 |
+|---|--:|--:|
+| GEMMs of the layers | 41.4 ms | **28.3** (1.46x) |
+| `lm_head` (kept in fp16) | 14.3 | 14.3 |
+| norms, rotary, silu x up, residual, quantisation... | 24.1 | 31.7 (+7.6 for the quantisation) |
+| attention | 6.0 | 5.7 |
+
+The GEMMs really are 1.46x faster; what stops the model from following is that 24 ms, 28 percent of the fp16 prefill, are the element-wise operations of an eager Hugging Face model, which no GEMM kernel touches (an inference engine fuses them), plus a head that a real prefill does not even compute for every position. The quantisation pass itself costs 7.6 ms; `torch.compile` already makes it one kernel at 1.1 times the single-pass ideal, so a hand-written kernel would not help; only folding it into the producer of the activation would (a fused `silu(gate) * up` and quantise, for the input of `down_proj`, is the biggest single piece: about 5 ms here).
+
+**Two measurement traps.** (1) A sweep of `block-swizzle` that timed each variant at a different moment said swizzle helped every layer shape by 3 to 28 percent. Interleaved rounds of all variants in one session said otherwise: it is 2.3x faster for a weight larger than the L2 (2048 x 2048 x 16384: 5.8 to 2.5 ms) and 12 to 14 percent slower for one that fits (2048 x 4096 x 4096), so the rule is now size-based. The clocks of a laptop GPU drift by 10 percent between measurements, more than most of the differences I was trying to measure. The earlier shared-input fusion had exposed it the other way round: with the old threshold the widened gate / up weight of Llama-3.2-1B (33.6 MB, just below the threshold) ran unswizzled at 2.9 times the time and made the model 32 percent slower, until I measured that shape in isolation. (2) The tables in this post come from different sessions; compare a column within a row, never across tables.
+
+Not done, and why: quantising the head (a real prefill needs the last position only), W4A8 (halves the weight bytes as well but needs a per-group int32 to float rescale inside the K loop, a new accumulation scheme in the compiler), and the fused `silu * up` quantisation, which is a kernel for one model family.
