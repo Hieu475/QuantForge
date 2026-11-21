@@ -108,3 +108,19 @@ def test_vllm_generates_sensible_text_with_online_w4a8(mode):
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, "QUANTFORGE_W4A8_DECODE": mode})
     assert "TEXT:" in r.stdout, r.stderr[-1500:]
     assert "Paris" in r.stdout.split("TEXT:")[1]
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_compact_decode_reads_only_its_own_rows(rows):
+    """The one-copy decode kernel for exactly 1 / 2 / 4 / 8 rows takes the activations as they are: NaN in the neighbouring rows must not reach the output."""
+    _require_gpu()
+    from quantforge import quant
+
+    (packed, gs, zp, sw), dec, snk, g = _args(True)
+    x = torch.randn(rows, 512, device="cuda", dtype=torch.float16, generator=g)
+    buf = torch.full((rows + 16, 512), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:rows] = x
+    b = torch.randn(256, device="cuda", dtype=torch.float16, generator=g)
+    y = torch.ops.quantforge.w4a8_hybrid(buf[:rows], packed, gs, zp, sw, b, *dec, 128, snk)
+    ref = x.float() @ quant.w4a8_dequantize(packed, gs, zp, sw).t() + b.float()
+    assert torch.isfinite(y).all() and (y.float() - ref).norm() / ref.norm() < 0.01

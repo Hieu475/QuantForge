@@ -777,12 +777,16 @@ class W4A8DecodeGemm:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS,
-              f16_out: bool = False, bias: bool = False) -> "W4A8DecodeGemm":
+              f16_out: bool = False, bias: bool = False, valid_rows: int = 0) -> "W4A8DecodeGemm":
         """`f16_out=True`: the kernel writes f16 itself (``epilogue=f16-store``, with an optional f16 `bias`): one kernel, ``launch(a, bp, zp, sc,
         bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``."""
         G = W4A8_GROUP
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
+        if valid_rows:
+            if not f16_out or not 0 < valid_rows < M:
+                raise ValueError("valid_rows needs f16_out and 0 < valid_rows < M")
+            pipeline_opts = f"{pipeline_opts} valid-rows={valid_rows}"
         if f16_out:
             extra_arg = (f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else "") + f"%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}"
             ret = f"tensor<{M}x{N}xf16>"

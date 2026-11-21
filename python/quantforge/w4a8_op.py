@@ -48,13 +48,13 @@ def _kernel(Mp: int, K: int, N: int, has_bias: bool):
     return k
 
 
-def _decode_kernel(K: int, N: int, has_bias: bool):
-    key = ("dec", K, N, has_bias)
+def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16):
+    key = ("dec", K, N, has_bias, rows)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8DecodeGemm
 
-        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias)
+        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias, valid_rows=rows if rows < 16 else 0)
     return k
 
 
@@ -89,8 +89,13 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
     if M <= 16 and packed16.numel() == 0:                             # compact: decode from the W4A8 layout itself (no second copy)
+        b = None if bias is None else bias.contiguous()
+        if M in (1, 2, 4, 8) and x2.is_contiguous() and x2.data_ptr() % 16 == 0:         # exactly M rows: no padded copy (valid-rows kernel)
+            out = torch.empty(M, N, device=x.device, dtype=torch.float16)
+            _decode_kernel(K, N, bias is not None, M).launch(x2, p8, zp, scale_nk, out, b)
+            return out.reshape(*lead, N)
         out = torch.empty(16, N, device=x.device, dtype=torch.float16)
-        _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, None if bias is None else bias.contiguous())
+        _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
         return out[:M].reshape(*lead, N)
     if M <= 16:                                                       # decode: the W4A16 kernels (memory bound, same bytes)
         y = kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
