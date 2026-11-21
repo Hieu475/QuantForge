@@ -685,21 +685,27 @@ class W4A8GemmDq:
 #mm = affine_map<(m, n) -> (m)>
 #mn = affine_map<(m, n) -> (n)>
 #nk = affine_map<(n, k) -> (n, k)>
-#pk = affine_map<(n, k) -> (n, k floordiv 2)>
-#gk = affine_map<(n, k) -> (n, k floordiv {G})>
 func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs: tensor<{N}x{K // G}xi8>,
                       %zp: tensor<{N}x{K // G}xi8>, %sx: tensor<{M}xf32> {{quantforge.int8_row_scale}}, %sw: tensor<{N}xf32> {{quantforge.int8_col_scale}},
                       {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %cg = arith.constant {G} : index
   %m15 = arith.constant 15 : i8
   %c4 = arith.constant 4 : i8
   %eb = tensor.empty() : tensor<{N}x{K}xi8>
-  %bt = linalg.generic {{indexing_maps = [#pk, #gk, #gk, #nk], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
-      ins(%bp, %gs, %zp : tensor<{N}x{K // 2}xi8>, tensor<{N}x{K // G}xi8>, tensor<{N}x{K // G}xi8>) outs(%eb : tensor<{N}x{K}xi8>) {{
-    ^bb0(%p: i8, %s: i8, %z: i8, %o: i8):
+  %bt = linalg.generic {{indexing_maps = [#nk], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      outs(%eb : tensor<{N}x{K}xi8>) {{
+    ^bb0(%o: i8):
+      %n = linalg.index 0 : index
       %k = linalg.index 1 : index
-      %par = arith.andi %k, %c1 : index
+      %kb = arith.divui %k, %c2 : index
+      %kg = arith.divui %k, %cg : index
+      %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
+      %s = tensor.extract %gs[%n, %kg] : tensor<{N}x{K // G}xi8>
+      %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
+      %par = arith.remui %k, %c2 : index
       %odd = arith.cmpi ne, %par, %c0 : index
       %lo = arith.andi %p, %m15 : i8
       %hi0 = arith.shrui %p, %c4 : i8
