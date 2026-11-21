@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from test_w4a16_e2e import _group_inputs, _require_gpu  # noqa: E402
@@ -479,3 +480,37 @@ def test_long_inputs_are_processed_in_chunks_with_a_bounded_temporary():
     assert peak_extra < 0.8 * M * N * 6, (peak_extra, out_bytes)     # unchunked: f32 accumulator + its f16 cast = M*N*6 (147 MB here, chunked ~100)
     y3 = qt.w4a16_linear(act.reshape(2, 3000, K), packed, scale, zp, G)             # leading dims are kept
     assert y3.shape == (2, 3000, N) and _close(y3.reshape(M, N), ref)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("bias", [False, True])
+def test_decode_call_reads_only_its_own_rows_and_is_one_kernel(rows, bias):
+    """M in {1, 2, 4, 8}: the f16-store kernel for exactly that many rows of a 16-row tile (cp.async zero-fills the rest, the stores are skipped): the
+    activations may sit in a buffer whose neighbouring rows are NaN, and the call is a single kernel (no padded copy, no conversion)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from torch.profiler import ProfilerActivity, profile
+
+    if qt._cpp is None:
+        pytest.skip("needs the C++ runtime")
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    K, N = 512, 256
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.05
+    from quantforge import quant
+    q, s, z = quant.quantize_groupwise(w, 128)
+    packed = quant.pack_int4(q)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    buf = torch.full((rows + 16, K), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:rows] = x
+    b = torch.randn(N, device="cuda", dtype=torch.float16, generator=g) if bias else None
+    deq = (q.float() - z.float().repeat_interleave(128, 0)) * s.float().repeat_interleave(128, 0)
+    ref = x.float() @ deq + (b.float() if bias else 0)
+    y = torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, 128, b, "none")
+    assert y.shape == (rows, N) and torch.isfinite(y).all() and _close(y, ref)
+    for _ in range(3):
+        torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, 128, b, "none")
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, 128, b, "none")
+        torch.cuda.synchronize()
+    assert len([e for e in p.events() if e.device_time > 0]) == 1

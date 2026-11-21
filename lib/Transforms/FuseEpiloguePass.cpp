@@ -29,6 +29,7 @@
 #include "QuantForge/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -52,15 +53,20 @@ struct FuseEpiloguePass
            "they are stored to the output.";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, LLVM::LLVMDialect, vector::VectorDialect>();
+    registry.insert<arith::ArithDialect, LLVM::LLVMDialect, vector::VectorDialect, scf::SCFDialect>();
   }
   Option<std::string> kind{*this, "kind",
                            llvm::cl::desc("relu | silu | gelu (none: no-op)"),
                            llvm::cl::init("none")};
   FuseEpiloguePass() = default;
+  Option<int64_t> validRows{*this, "valid-rows",
+                            llvm::cl::desc("f16-store / int8-dequant: only the first N rows of the output exist; the stores of the others are skipped "
+                                           "(0 = all rows)"),
+                            llvm::cl::init(0)};
   FuseEpiloguePass(const FuseEpiloguePass &other)
       : PassWrapper<FuseEpiloguePass, OperationPass<func::FuncOp>>(other) {
     kind.setValue(other.kind.getValue());
+    validRows.setValue(other.validRows.getValue());
   }
 
   static Value constant(OpBuilder &b, Location loc, Type ty, double v) {
@@ -214,6 +220,12 @@ struct FuseEpiloguePass
       Value two = b.create<arith::ConstantIndexOp>(loc, 2);
       Value off = b.create<arith::MulIOp>(loc, b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, row, stride), col), two);
       Value addr = b.create<arith::IndexCastOp>(loc, i64, b.create<arith::AddIOp>(loc, baseIdx, off));
+      if (validRows > 0) {                       // rows past the real row count do not exist in the output tensor
+        Value inside = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row,
+                                               b.create<arith::ConstantIndexOp>(loc, validRows));
+        auto guard = b.create<scf::IfOp>(loc, inside, /*withElseRegion=*/false);
+        b.setInsertionPointToStart(guard.thenBlock());
+      }
       b.create<LLVM::InlineAsmOp>(loc, /*resultTypes=*/TypeRange{}, /*operands=*/ValueRange{addr, packed},
                                   "st.global.b32 [$0], $1;", "l,r", /*has_side_effects=*/true, /*is_align_stack=*/false,
                                   LLVM::AsmDialectAttr::get(b.getContext(), LLVM::AsmDialect::AD_ATT),

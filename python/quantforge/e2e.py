@@ -886,8 +886,14 @@ class W4A16GemmF16:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, group_size: int = 128, bias: bool = False, workdir=None, chip: str = "sm_80",
-              pipeline_opts: str = "") -> "W4A16GemmF16":
+              pipeline_opts: str = "", valid_rows: int = 0) -> "W4A16GemmF16":
+        """`valid_rows` R (1 <= R < M, one M block): the caller passes activations ``[R, K]`` and gets ``[R, N]`` back, no padded copy: the
+        kernel zero-fills the missing rows of the activation tile (cp.async src-size 0, nothing is read past the tensor) and does not store them."""
         _check_shape(M, K, N, tile_sizes(pipeline_opts))
+        if valid_rows:
+            if not 0 < valid_rows < M or M > 16:
+                raise ValueError("valid_rows must satisfy 0 < valid_rows < M <= 16")
+            pipeline_opts = f"{pipeline_opts} valid-rows={valid_rows}".strip()
         G = group_size
         b_arg = f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else ""
         b_in, b_ty, b_map, b_blk = (", %bias", f", tensor<{N}xf16>", ", #mn", ", %b: f16") if bias else ("", "", "", "")

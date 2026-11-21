@@ -223,6 +223,7 @@ struct SharedMemoryPromotionPass
     smemStages.setValue(other.smemStages.getValue());
     vectorCopy.setValue(other.vectorCopy.getValue());
     asyncCopy.setValue(other.asyncCopy.getValue());
+    validRows.setValue(other.validRows.getValue());
   }
 
   //------------------------------------------------------------------
@@ -288,6 +289,13 @@ struct SharedMemoryPromotionPass
                      "path) while iteration i computes. Only applied inside "
                      "gpu.launch with a static K-loop trip count."),
       llvm::cl::init(1)};
+  Option<int64_t> validRows{
+      *this, "valid-rows",
+      llvm::cl::desc("Rows of the first function argument (the activations) that exist in memory; the rows of its tile "
+                     "past this count are zero-filled by cp.async (src-size 0, nothing is read) instead of read, so a "
+                     "kernel compiled for 16 rows can be given an [M < 16, K] tensor without padding it (0 = all rows "
+                     "exist). Single M block only; needs the cp.async copy path."),
+      llvm::cl::init(0)};
   Option<int64_t> copyUnroll{
       *this, "copy-unroll",
       llvm::cl::desc("Unroll factor of the cooperative HBM->SRAM copy loop "
@@ -310,6 +318,16 @@ struct SharedMemoryPromotionPass
   //------------------------------------------------------------------
   // runOnOperation
   //------------------------------------------------------------------
+  /// Is `v` (a chain of subviews) a view of the first argument of the enclosing function (the activations)?
+  static bool isFirstArgument(Value v) {
+    while (auto sv = v.getDefiningOp<memref::SubViewOp>())
+      v = sv.getSource();
+    auto ba = dyn_cast<BlockArgument>(v);
+    return ba && ba.getArgNumber() == 0 && isa<func::FuncOp>(ba.getOwner()->getParentOp());
+  }
+
+  bool copyFailed = false; // valid-rows was requested but the activation tile is not copied with cp.async
+
   struct CopyResult {
     scf::ForOp loop;
     Operation *store = nullptr;
@@ -394,12 +412,26 @@ struct SharedMemoryPromotionPass
             Value c0 = rewriter.create<arith::MulIOp>(
                 loc, colItem, rewriter.create<arith::ConstantIndexOp>(loc, W));
             auto tokTy = nvgpu::DeviceAsyncTokenType::get(ctx);
+            Value srcElements;
+            if (validRows > 0 && isFirstArgument(src)) {
+              Value inside = rewriter.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::ult, rowIV,
+                  rewriter.create<arith::ConstantIndexOp>(loc, validRows));
+              srcElements = rewriter.create<arith::SelectOp>(
+                  loc, inside, rewriter.create<arith::ConstantIndexOp>(loc, W),
+                  rewriter.create<arith::ConstantIndexOp>(loc, 0));
+            }
             storeOp = rewriter.create<nvgpu::DeviceAsyncCopyOp>(
                 loc, tokTy, sramView, ValueRange{rowIV, c0},
                 src, ValueRange{rowIV, c0},
-                rewriter.getIndexAttr(W), Value(), UnitAttr());
+                rewriter.getIndexAttr(W), srcElements, UnitAttr());
             res.async = true;
           } else if (vecOK) {
+            if (validRows > 0 && isFirstArgument(src)) {
+              launch.emitError("quantforge-smem-promotion: valid-rows needs the cp.async copy of the activation tile "
+                               "(a plain copy would read the rows past the tensor)");
+              copyFailed = true;
+            }
             // 8 scalar loads (the producer of a fused tile is recomputed per
             // element later) packed into one vector and stored with a single
             // 128-bit st.shared.
@@ -424,6 +456,11 @@ struct SharedMemoryPromotionPass
             storeOp = rewriter.create<vector::StoreOp>(loc, vec, sramView,
                                                        ValueRange{rowIV, c0});
           } else {
+            if (validRows > 0 && isFirstArgument(src)) {
+              launch.emitError("quantforge-smem-promotion: valid-rows needs the cp.async copy of the activation tile "
+                               "(a plain copy would read the rows past the tensor)");
+              copyFailed = true;
+            }
             Value val = rewriter.create<memref::LoadOp>(
                 loc, src, ValueRange{rowIV, colItem});
             storeOp = rewriter.create<memref::StoreOp>(
@@ -917,6 +954,8 @@ struct SharedMemoryPromotionPass
 
     LLVM_DEBUG(llvm::dbgs() << "[SmemPromotion] promoted " << promotedCount
                             << " subview(s) to shared memory\n");
+    if (copyFailed)
+      signalPassFailure();
   }
 };
 

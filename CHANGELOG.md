@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* `valid-rows=R` (`quantforge-gpu-pipeline`, `quantforge-smem-promotion`, `quantforge-fuse-epilogue`): a kernel compiled for a 16-row tile serves an `[R, K]` activation tensor without a padded copy (cp.async zero-fill, stores of the missing rows skipped). The C++ op uses it for M = 1, 2, 4, 8: the unfolded INT4 layers are ONE kernel per decode call (qkv 5.4 us at M = 1, Marlin 6.4; gate / up 19.6 against 27.3 with warm weights). `QUANTFORGE_NO_VALID_ROWS=1` turns it off. vLLM decode vs Marlin: 0.5B 0.95 / 0.95 / 0.92 / 0.88, 1.5B 0.91 / 0.88 / 0.86 / 0.81 at 1 / 4 / 16 / 64 requests.
+
 * `epilogue=f16-store` (`quantforge-fuse-epilogue`, the `int8-dequant` machinery for an f32 accumulator; `e2e.W4A16GemmF16`): the INT4 GEMM writes f16 (+ f16 bias) itself. The C++ op uses it for plain GEMMs (no activation, INT4 group-wise): 2 kernels per decode call instead of 3-5 (qkv with bias 10.7 -> 6.5 us, Marlin 6.4), no f32 buffer; the other layouts use `kfold_reduce` for the bias + conversion. `QUANTFORGE_NO_F16STORE=1` turns it off. vLLM, QuantForge / Marlin decode on Qwen2.5-1.5B 0.74-0.87 -> 0.81-0.91, plugin prefill 20.6k -> 28.0k tokens/s; the W4A8 compact decode kernel uses it too (264 / 3952 on the 0.5B).
 
 * Checked `quantforge_w4a8` (online and checkpoint, hybrid and compact) on vLLM 0.34.0 / torch 2.14 in a separate venv: it works unchanged, 41 tests (slow ones included) pass; Qwen2.5-0.5B prefill 37370 tokens/s (Marlin 33998), decode 252 / 3911 (Marlin 300 / 4481).

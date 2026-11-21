@@ -181,8 +181,11 @@ def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
     """The W4A16 kernel with the f16-store epilogue for M rows (decode / skinny / prefill buckets), INT4 group-wise weights."""
     from .e2e import W4A16GemmF16, padded_shape
 
-    Mb = bucket_rows(M)
-    key = (Mb, K, N, group_size, has_bias)
+    # M in {1, 2, 4, 8} (the sizes of vLLM's CUDA graphs): a kernel for exactly M rows of a 16-row tile; its activation tile is zero-filled past
+    # M and its stores skipped, so the caller passes x itself, no padded copy. Other M use the bucket's kernel on a padded copy.
+    exact = M in (1, 2, 4, 8) and not os.environ.get("QUANTFORGE_NO_VALID_ROWS")
+    Mb = M if exact else bucket_rows(M)
+    key = (Mb, K, N, group_size, has_bias, exact)
     k = _kernels_f16.get(key)
     if k is not None:
         return k
@@ -194,8 +197,8 @@ def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
             if _autotune or (Kp, Np) != (K, N) or os.environ.get("QUANTFORGE_NO_F16STORE"):
                 k = _NoKernel(Mp, Kp, Np)
             else:
-                k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts)
-                k.Mp, k.Kp, k.Np = Mp, K, N
+                k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts, valid_rows=Mb if exact and Mb < Mp else 0)
+                k.Mp, k.Kp, k.Np = (Mb if exact and Mb < Mp else Mp), K, N
             _kernels_f16[key] = k
     return k
 

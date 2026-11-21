@@ -217,6 +217,13 @@ struct GPUPipelineOptions
                      "int8 (m16n8k32)"),
       llvm::cl::init(16)};
 
+  Option<int> validRows{
+      *this, "valid-rows",
+      llvm::cl::desc("Decode kernels: only this many rows of the activations / output exist (1..15 for a 16-row tile): "
+                     "cp.async zero-fills the others and their stores are skipped, so the caller passes the [M, K] tensor "
+                     "itself instead of a padded copy (0 = all rows exist)"),
+      llvm::cl::init(0)};
+
   Option<int> splitK{
       *this, "split-k",
       llvm::cl::desc("Cut the K reduction into this many chunks run by "
@@ -306,6 +313,7 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
             " smem-stages=" + std::to_string(stages) +
             " smem-async-copy=" + (opts.asyncCopy ? "true" : "false") +
             " smem-vector-copy=" + (opts.vectorCopy ? "true" : "false") +
+            " valid-rows=" + std::to_string(opts.validRows.getValue()) +
             "}),canonicalize,cse,";
   if (opts.sharedMemory && opts.fuseDequant)
     text += "func.func(quantforge-fuse-producer-into-loads),canonicalize,cse,";
@@ -346,7 +354,8 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
       llvm::report_fatal_error("quantforge-gpu-pipeline: epilogue must be "
                                "none | relu | silu | gelu | swiglu | int8-dequant | f16-store");
     text += "func.func(quantforge-fuse-epilogue{kind=" +
-            opts.epilogue.getValue() + "}),canonicalize,";
+            opts.epilogue.getValue() +
+            " valid-rows=" + std::to_string(opts.validRows.getValue()) + "}),canonicalize,";
   }
   // 4. Device lowering (outlined kernels + host-side prep)
   // Constants / index arithmetic created outside gpu.launch would otherwise be
