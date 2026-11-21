@@ -649,7 +649,7 @@ W4A8_GROUP = 128
 class W4A8GemmDq:
     """W4A8: INT4 weights, INT8 activations, the INT8 Tensor Cores, ONE kernel: ``y[f16] = (A @ unpack(Bp)^T)[i32] * sx[m] * sw[n] + bias[n]``.
 
-    ``bp`` int8 ``[N, K/2]`` holds two 4-bit values per byte (even k in the low nibble); ``gs`` and ``zp`` int8 ``[N, K/128]`` the integer
+    ``bp`` int8 ``[N, K/2]`` holds two 4-bit values per byte (``quant.pack_k8`` layout: in each block of 8 consecutive k, byte j holds element j low and j + 4 high); ``gs`` and ``zp`` int8 ``[N, K/128]`` the integer
     scale and zero point of each group of 128 along K. The weight the tensor cores see is ``(nibble - zp) * gs`` as int8 (``quantforge.quant.w4a8_quantize``
     keeps the product inside int8 so it cannot wrap), built while the tile is staged into shared memory by the producer-fusion pass: the INT4
     weights are the only weight traffic and the accumulation is int32 over the whole of K, so there is no per-group rescale in the K loop;
@@ -690,7 +690,10 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs:
                       {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
-  %c2 = arith.constant 2 : index
+  %i2 = arith.constant 2 : index
+  %i4 = arith.constant 4 : index
+  %i8 = arith.constant 8 : index
+  %i16 = arith.constant 16 : index
   %cg = arith.constant {G} : index
   %m15 = arith.constant 15 : i8
   %c4 = arith.constant 4 : i8
@@ -700,13 +703,19 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs:
     ^bb0(%o: i8):
       %n = linalg.index 0 : index
       %k = linalg.index 1 : index
-      %kb = arith.divui %k, %c2 : index
-      %kg = arith.divui %k, %cg : index
+      %k8 = arith.divui %k, %i8 : index
+      %k8b = arith.muli %k8, %i4 : index
+      %k4 = arith.remui %k, %i4 : index
+      %kb = arith.addi %k8b, %k4 : index
+      %k16d = arith.divui %k, %i16 : index
+      %kf = arith.muli %k16d, %i16 : index
+      %kg = arith.divui %kf, %cg : index
       %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
       %s = tensor.extract %gs[%n, %kg] : tensor<{N}x{K // G}xi8>
       %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
-      %par = arith.remui %k, %c2 : index
-      %odd = arith.cmpi ne, %par, %c0 : index
+      %k4d = arith.divui %k, %i4 : index
+      %hi4 = arith.remui %k4d, %i2 : index
+      %odd = arith.cmpi ne, %hi4, %c0 : index
       %lo = arith.andi %p, %m15 : i8
       %hi0 = arith.shrui %p, %c4 : i8
       %nib = arith.select %odd, %hi0, %lo : i8
@@ -775,7 +784,10 @@ class W4A8DecodeGemm:
 func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp: tensor<{N}x{K // G}xi8>, %sc: tensor<{N}x{K // G}xf16>,
                       %c: tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32> {{
   %c0 = arith.constant 0 : index
-  %c2 = arith.constant 2 : index
+  %i2 = arith.constant 2 : index
+  %i4 = arith.constant 4 : index
+  %i8 = arith.constant 8 : index
+  %i16 = arith.constant 16 : index
   %cg = arith.constant {G} : index
   %m15 = arith.constant 15 : i8
   %c4 = arith.constant 4 : i8
@@ -785,13 +797,19 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp
     ^bb0(%o: f16):
       %n = linalg.index 0 : index
       %k = linalg.index 1 : index
-      %kb = arith.divui %k, %c2 : index
-      %kg = arith.divui %k, %cg : index
+      %k8 = arith.divui %k, %i8 : index
+      %k8b = arith.muli %k8, %i4 : index
+      %k4 = arith.remui %k, %i4 : index
+      %kb = arith.addi %k8b, %k4 : index
+      %k16d = arith.divui %k, %i8 : index
+      %kf = arith.muli %k16d, %i8 : index
+      %kg = arith.divui %kf, %cg : index
       %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
       %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
       %s = tensor.extract %sc[%n, %kg] : tensor<{N}x{K // G}xf16>
-      %par = arith.remui %k, %c2 : index
-      %odd = arith.cmpi ne, %par, %c0 : index
+      %k4d = arith.divui %k, %i4 : index
+      %hi4 = arith.remui %k4d, %i2 : index
+      %odd = arith.cmpi ne, %hi4, %c0 : index
       %lo = arith.andi %p, %m15 : i8
       %hi0 = arith.shrui %p, %c4 : i8
       %nib = arith.select %odd, %hi0, %lo : i8

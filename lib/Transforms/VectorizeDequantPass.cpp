@@ -24,6 +24,14 @@
 // differences are exact integers < 2048 and the single rounding happens in the
 // multiply, so the result is bit-identical to the scalar expression.
 //
+// W4A8 (``e2e.W4A8GemmDq``): the INT8 weight tile is built from nibbles in the ``pack_k8`` layout (within a block of 8 consecutive k, byte j holds
+// element j low and element j + 4 high), one vector<16xi8> per work item,
+//   e[p] = (nibble(P[4 (p / 8) + p % 4], hi = (p % 8) >= 4) - z) * s            in i8 arithmetic (mod 256)
+// with ONE (z, s) per work item. As 32-bit words, ``w & 0x0F0F0F0F`` is four consecutive elements and ``(w >> 4) & 0x0F0F0F0F`` the next four;
+// ``word * s`` multiplies the four bytes at once (a nibble times s <= 16 is at most 240: no carry into the next byte) and the zero point is
+// subtracted per byte with the SWAR identity ``((x | H) - (y & ~H)) ^ ((x ^ ~y) & H)``, H = 0x80808080 -- about 10 integer instructions per four
+// elements instead of ~30, bit-identical to the scalar trees (wrapping arithmetic).
+//
 // int8 weights (W8A16) use the same form with the weight byte instead of a
 // nibble ((w ^ 0x80) | 0x6400 = 1152 + w).
 //
@@ -360,6 +368,106 @@ struct Emitter {
   }
 };
 
+/// 16 lanes of i8: e[p] = (nibble - z) * s  (see the header). Returns the packed replacement or null.
+struct W4A8Match {
+  Value packed;  // vector<8xi8>
+  Value z, s;    // i8 scalars shared by all 16 elements
+};
+
+static bool matchConstAnd15(Value v, Value &x) {
+  auto a = v.getDefiningOp<arith::AndIOp>();
+  if (!a)
+    return false;
+  if (isConst(a.getRhs(), 15)) { x = a.getLhs(); return true; }
+  if (isConst(a.getLhs(), 15)) { x = a.getRhs(); return true; }
+  return false;
+}
+
+static std::optional<W4A8Match> matchW4A8(ArrayRef<Value> elems) {
+  W4A8Match m;
+  for (int64_t p = 0; p < 16; ++p) {
+    auto mul = elems[p].getDefiningOp<arith::MulIOp>();
+    if (!mul)
+      return std::nullopt;
+    Value diff, s;
+    for (int side = 0; side < 2; ++side) {
+      Value a = mul->getOperand(side), b = mul->getOperand(1 - side);
+      if (a.getDefiningOp<arith::SubIOp>()) { diff = a; s = b; break; }
+    }
+    if (!diff)
+      return std::nullopt;
+    auto sub = diff.getDefiningOp<arith::SubIOp>();
+    Value x = sub.getLhs(), z = sub.getRhs(), byte;
+    bool hi = (p % 8) >= 4;
+    if (hi) {
+      auto sh = x.getDefiningOp<arith::ShRUIOp>();
+      if (!sh || !isConst(sh.getRhs(), 4))
+        return std::nullopt;
+      byte = sh.getLhs();
+    } else if (!matchConstAnd15(x, byte)) {
+      return std::nullopt;
+    }
+    int64_t idx = 4 * (p / 8) + (p % 4);
+    Value src = m.packed;
+    if (!matchExtract(byte, idx, src))
+      return std::nullopt;
+    m.packed = src;
+    if (p == 0) {
+      m.z = z;
+      m.s = s;
+    } else if (m.z != z || m.s != s) {
+      return std::nullopt;
+    }
+  }
+  auto pt = dyn_cast<VectorType>(m.packed.getType());
+  if (!pt || pt.getNumElements() != 8 || !pt.getElementType().isInteger(8))
+    return std::nullopt;
+  return m;
+}
+
+/// 8 lanes of f16 of the W4A8 decode kernel: e[j] = f16(nibble - z) * s with the ``pack_k8`` nibble order of one 8-block
+/// (byte j low nibble = element j, high nibble = element j + 4), one (z, s) per work item.
+struct W4A8F16Match {
+  Value packed;  // vector<4xi8>
+  Value z, s;    // i8 scalar, f16 scalar
+};
+
+static std::optional<W4A8F16Match> matchW4A8F16(ArrayRef<Value> elems) {
+  W4A8F16Match m;
+  for (int64_t j = 0; j < kLanes; ++j) {
+    Value cvt, s;
+    auto isCvt = [](Value v) { return v.getDefiningOp<arith::SIToFPOp>() != nullptr; };
+    if (!matchCommutative<arith::MulFOp>(elems[j], cvt, s, isCvt))
+      return std::nullopt;
+    auto sub = cvt.getDefiningOp<arith::SIToFPOp>().getIn().getDefiningOp<arith::SubIOp>();
+    if (!sub)
+      return std::nullopt;
+    Value x = sub.getLhs(), z = sub.getRhs(), byte;
+    if (j >= 4) {
+      auto sh = x.getDefiningOp<arith::ShRUIOp>();
+      if (!sh || !isConst(sh.getRhs(), 4))
+        return std::nullopt;
+      byte = sh.getLhs();
+    } else if (!matchConstAnd15(x, byte)) {
+      return std::nullopt;
+    }
+    Value src = m.packed;
+    if (!matchExtract(byte, j % 4, src))
+      return std::nullopt;
+    m.packed = src;
+    if (j == 0) {
+      m.z = z;
+      m.s = s;
+    } else if (m.z != z || m.s != s) {
+      return std::nullopt;
+    }
+  }
+  auto pt = dyn_cast<VectorType>(m.packed.getType());
+  if (!pt || pt.getNumElements() != 4 || !pt.getElementType().isInteger(8) || !m.s.getType().isF16())
+    return std::nullopt;
+  return m;
+}
+
 struct VectorizeDequantPass
     : public PassWrapper<VectorizeDequantPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorizeDequantPass)
@@ -373,8 +481,56 @@ struct VectorizeDequantPass
     registry.insert<vector::VectorDialect, arith::ArithDialect>();
   }
 
+  /// vector<16xi8> weight tile of the W4A8 kernel: 16 trees of (nibble - z) * s with one (z, s).
+  bool tryRewriteW4A8(vector::StoreOp store) {
+    SmallVector<Value> elems(16);
+    Value cur = store.getValueToStore();
+    for (int64_t j = 15; j >= 0; --j) {
+      auto ins = cur.getDefiningOp<vector::InsertOp>();
+      if (!ins || ins.getStaticPosition().size() != 1 || ins.getStaticPosition()[0] != j)
+        return false;
+      elems[j] = ins.getSource();
+      cur = ins.getDest();
+    }
+    std::optional<W4A8Match> m = matchW4A8(elems);
+    if (!m)
+      return false;
+    OpBuilder b(store);
+    Location loc = store.getLoc();
+    Emitter e{b, loc};
+    Type i32 = b.getI32Type();
+    Value s32 = b.create<arith::ExtUIOp>(loc, i32, m->s);
+    Value z32 = b.create<arith::ExtUIOp>(loc, i32, m->z);
+    Value zs = e.andi(b.create<arith::MulIOp>(loc, z32, s32), 0xFF);
+    Value y = b.create<arith::MulIOp>(loc, zs, e.c32(0x01010101));          // z * s in all four bytes
+    Value ylow = e.andi(y, 0x7F7F7F7F);
+    Value ynot = b.create<arith::XOrIOp>(loc, y, e.c32(-1));
+    Value H = e.c32(static_cast<int32_t>(0x80808080));
+    auto swarSub = [&](Value x) {                                            // per-byte (x - y) mod 256
+      Value t1 = b.create<arith::SubIOp>(loc, e.ori(x, H), ylow);
+      Value t2 = b.create<arith::AndIOp>(loc, b.create<arith::XOrIOp>(loc, x, ynot), H);
+      return b.create<arith::XOrIOp>(loc, t1, t2).getResult();
+    };
+    SmallVector<Value> ws = e.words(m->packed), out;
+    for (Value w : ws) {
+      Value lo = b.create<arith::MulIOp>(loc, e.andi(w, 0x0F0F0F0F), s32);
+      Value hi = b.create<arith::MulIOp>(loc, e.andi(e.shr(w, 4), 0x0F0F0F0F), s32);
+      out.push_back(swarSub(lo));
+      out.push_back(swarSub(hi));
+    }
+    Value v = b.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(VectorType::get({4}, i32), b.getI32IntegerAttr(0)));
+    for (int64_t i = 0; i < 4; ++i)
+      v = b.create<vector::InsertOp>(loc, out[i], v, ArrayRef<int64_t>{i});
+    Value res = b.create<vector::BitCastOp>(loc, VectorType::get({16}, b.getI8Type()), v);
+    store.getValueToStoreMutable().assign(res);
+    return true;
+  }
+
   bool tryRewrite(vector::StoreOp store) {
     auto vecTy = dyn_cast<VectorType>(store.getValueToStore().getType());
+    if (vecTy && vecTy.getNumElements() == 16 && vecTy.getElementType().isInteger(8))
+      return tryRewriteW4A8(store);
     if (!vecTy || vecTy.getNumElements() != kLanes || !vecTy.getElementType().isF16())
       return false;
     // the insert chain: insert(e7, insert(e6, ... insert(e0, zeros)))
@@ -398,6 +554,29 @@ struct VectorizeDequantPass
       Value exact = b.create<arith::MulFOp>(store.getLoc(), raw, k256);
       Value w = b.create<arith::MulFOp>(store.getLoc(), exact, e.scaleVec(f->scale));
       store.getValueToStoreMutable().assign(w);
+      return true;
+    }
+    if (std::optional<W4A8F16Match> w = matchW4A8F16(elems)) {
+      OpBuilder b(store);
+      Location loc = store.getLoc();
+      Emitter e{b, loc};
+      Type i32 = b.getI32Type();
+      Value x = e.words(w->packed)[0];
+      Value lo = e.andi(x, 0x0F0F0F0F), hi = e.andi(e.shr(x, 4), 0x0F0F0F0F);
+      SmallVector<Value> pairs;                      // f16x2 words of 1152 + nibble: (e0,e1) (e2,e3) (e4,e5) (e6,e7)
+      for (Value v : {lo, hi}) {
+        Value p01 = e.ori(e.andi(v, 0xFF), e.andi(e.shl(v, 8), 0x00FF0000));
+        Value p23 = e.ori(e.andi(e.shr(v, 16), 0xFF), e.andi(e.shr(v, 8), 0x00FF0000));
+        pairs.push_back(e.ori(p01, e.c32(0x64806480)));
+        pairs.push_back(e.ori(p23, e.c32(0x64806480)));
+      }
+      Value q = e.asF16x8(pairs);
+      Value z32 = e.andi(b.create<arith::ExtUIOp>(loc, i32, w->z), 0xFF);
+      Value zp = e.ori(e.ori(z32, e.shl(z32, 16)), e.c32(0x64806480));
+      Value zv = e.asF16x8({zp, zp, zp, zp});
+      Value diff = b.create<arith::SubFOp>(loc, q, zv);
+      Value out = b.create<arith::MulFOp>(loc, diff, e.scaleVec(LaneSource{Value(), w->s, true}));
+      store.getValueToStoreMutable().assign(out);
       return true;
     }
     std::optional<Match> m = matchTrees(elems);

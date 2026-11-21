@@ -273,3 +273,21 @@ Giới hạn nêu ở Cập nhật 10 (toàn bộ model fp16 phải vừa GPU tr
 | GPTQ-Int4, `quantforge` (W4A16) | 3923 | 71 | 1063 | |
 
 Prefill cao hơn Marlin 9 phần trăm và gấp 1.6x plugin W4A16; decode bằng 0.75 và 0.78x của Marlin, cái giá của kernel decode compact (chế độ hai layout cần khoảng 3.9 GiB và không vừa). Vậy trên card này W4A8 online biến một model không nạp nổi thành một model phục vụ prefill nhanh hơn checkpoint GPTQ với kernel tốt nhất hiện có, với throughput decode thấp hơn 25 phần trăm; chất lượng là của làm tròn gần nhất (Cập nhật 8).
+
+## Cập nhật 12: giải nén bốn weight mỗi lần (2026-11-22)
+
+Cập nhật 9 và 10 kết thúc bằng cùng một việc dang dở: tile weight W4A8 được dựng bằng mã vô hướng (khoảng ba mươi lệnh cho bốn weight; `ncu` nói kernel bị giới hạn bởi tốc độ phát lệnh với số lệnh gấp 3.7 lần kernel INT8) và tôi dừng vì nó trông như một pattern C++ cho mức tăng 3 phần trăm prefill cả model. Hóa ra nó đáng giá hơn nhiều, vì cùng producer đó nuôi cả kernel decode của chế độ một bản sao. Hai phần.
+
+**Một layout không cần hoán vị.** Trước đây các nibble được đóng gói kiểu hiển nhiên (k chẵn thấp, k lẻ cao), nên giải nén bốn weight liên tiếp từ một từ 32-bit cần một phép xáo byte. Giờ chúng được đóng gói theo `pack_k8`: trong mỗi khối 8 k liên tiếp, byte j chứa phần tử j ở nibble thấp và phần tử j + 4 ở nibble cao. Khi đó `w & 0x0F0F0F0F` *chính là* bốn weight liên tiếp, và `(w >> 4) & 0x0F0F0F0F` là bốn weight kế tiếp. Làm cho compiler nhìn xuyên qua phép tính chỉ số tốn ba lần thử và là phần đáng nhớ: một `floordiv` affine mở ra thành chuỗi chia sàn có dấu, `k & 4` không được gấp, và chỉ số nhóm `(k + j) / 128` cho một giá trị SSA khác nhau với mỗi phần tử nên các lần load scale không được dùng chung; viết producer chỉ với `divui` / `remui`, chọn nibble bằng `(k / 4) % 2` và lấy chỉ số nhóm từ `(k / 16) * 16` làm mọi phép chọn gấp thành hằng và mọi phần tử của một đơn vị công việc dùng chung một cặp (scale, zero point).
+
+**Pattern.** `quantforge-vectorize-dequant`, pass vốn đã làm dequantise f16 đóng gói của đường INT4, giờ nhận ra mười sáu cây vô hướng `(nibble - z) * s` của một tile int8 và phát ra phép số học trên từ: nhân cả từ với scale (một nibble nhân scale tối đa 16 cho nhiều nhất 240, nên bốn byte không bao giờ nhớ sang nhau), và trừ zero point theo từng byte bằng đẳng thức SWAR `((x | H) - (y & ~H)) ^ ((x ^ ~y) & H)`; kết quả giống từng bit với các cây vô hướng. Với tile decode f16 nó dùng dạng số ma thuật 1152 (`sub.f16x2`, `mul.f16x2`). Một test FileCheck bao gồm một trường hợp khớp và một trường hợp suýt khớp phải bị bỏ qua.
+
+Kết quả, RTX 4050, cùng phương pháp như trước: kernel W4A8 ở 2048 hàng đạt **1.30 đến 1.48x cuBLAS fp16** (trước 1.19 đến 1.40x; 1095 us và 63 TOPS ở 4096 x 4096), 1.45 đến 2.20x kernel W4A16 và 0.79 đến 0.94x kernel INT8. Prefill cả model so với fp16 có norm đã biên dịch, cùng phiên: W4A8 **1.23x, 1.26x và 1.34x** cho Qwen2.5-0.5B, Llama-3.2-1B và Qwen2.5-1.5B (trước 1.16, 1.22, 1.28), INT8 1.30, 1.33 và 1.43. Trong vLLM, chế độ một bản sao, token mỗi giây:
+
+| model | prefill | so với Marlin | decode 1 request | decode 16 request | so với Marlin |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 36948 | 1.12x | 253 | 3801 | 0.85x / 0.90x |
+| Qwen2.5-1.5B | 13273 | 1.15x | 108 | 1667 | 0.80x / 0.83x |
+| Qwen2.5-3B | 6678 | 1.15x | 65 | 997 | 0.80x / 0.83x |
+
+Decode của chế độ một bản sao giờ nhanh như chế độ hai layout trước đây (0.5B: 253 và 3801 so với 259 và 3592) với một nửa bộ nhớ weight, và prefill vượt Marlin từ 12 đến 15 phần trăm. Hai ghi chú trung thực. Bản thân kernel decode cải thiện ở các shape nhỏ (16 x 896 x 4864: từ 1.11x xuống 1.01x của kernel W4A16 chuyên dụng; 4864 x 896: từ 1.55x xuống 1.35x) nhưng không cải thiện ở 4096 x 4096 (1.76x), nơi `ncu` nói các lần load là giới hạn (DRAM ở 52 phần trăm so với 88 của kernel chuyên dụng, stall `long_scoreboard`); tôi đã thử đưa các lần load scale / zero point vô hướng ra khỏi vòng K bằng pass prefetch và nó không thay đổi gì, nên đã hoàn nguyên. Và thay đổi layout không tương thích với các tensor W4A8 tạo trước đó (không có cái nào ngoài repo này).

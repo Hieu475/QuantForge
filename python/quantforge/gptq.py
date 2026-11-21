@@ -137,7 +137,7 @@ def gptq_quantize_weight_w4a8(W: torch.Tensor, H: torch.Tensor, group_size: int 
             W1[:, i:] -= err.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err
         W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.int8).contiguous()
+    packed = quant.pack_k8(codes)
     return (packed, torch.stack(gss, 1).to(torch.int8).contiguous(), torch.stack(zps, 1).to(torch.int8).contiguous(), sw)
 
 

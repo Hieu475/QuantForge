@@ -25,8 +25,7 @@ _BUCKETS = (128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
 def from_w4a8(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor):
     """The W4A16 layout of a W4A8 weight: ``(packed int8 [K, N/2], scale f16 [K/G, N], zero int8 [K/G, N])``. The dequantised weights are
     equal: ``(q - zp) * gs * sw``; only the group scale ``gs * sw`` is rounded to f16."""
-    p = packed.view(torch.uint8)
-    nib = torch.stack((p & 15, p >> 4), dim=2).reshape(p.shape[0], -1)              # [N, K]
+    nib = quant.unpack_k8(packed)                                                    # [N, K]
     q = nib.t().contiguous().to(torch.int8)                                          # [K, N]
     scale = (gs.float() * sw[:, None]).t().contiguous().half()                       # [K/G, N]
     return quant.pack_int4(q).contiguous(), scale, zp.t().contiguous()

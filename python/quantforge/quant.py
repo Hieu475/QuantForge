@@ -255,6 +255,23 @@ def concat_columns(*parts):
             torch.cat([p[2] for p in parts], dim=1).contiguous())
 
 
+def pack_k8(nib: torch.Tensor) -> torch.Tensor:
+    """Nibbles ``[N, K]`` (0..15, K a multiple of 8) -> int8 ``[N, K/2]`` in the W4A8 layout: within each block of 8 consecutive k, byte j (0..3)
+    holds element j in its low nibble and element j + 4 in its high nibble, so that ``w & 0x0F0F0F0F`` of a 32-bit word is four CONSECUTIVE
+    elements and ``(w >> 4) & 0x0F0F0F0F`` the next four (no byte permutation to unpack; the producer of ``e2e.W4A8GemmDq`` relies on it)."""
+    N, K = nib.shape
+    b = nib.to(torch.uint8).reshape(N, K // 8, 2, 4)
+    return (b[:, :, 0, :] | (b[:, :, 1, :] << 4)).reshape(N, K // 2).to(torch.int8).contiguous()
+
+
+def unpack_k8(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of `pack_k8`: int8 ``[N, K/2]`` -> uint8 nibbles ``[N, K]``."""
+    p = packed.view(torch.uint8)
+    N = p.shape[0]
+    p = p.reshape(N, -1, 4)
+    return torch.stack((p & 15, p >> 4), dim=2).reshape(N, -1)
+
+
 @torch.no_grad()
 def w4a8_quantize(w: torch.Tensor, group: int = 128):
     """Progressive INT4 quantisation of a weight ``[N, K]`` for the W4A8 kernel (QServe's scheme): INT8 per output channel (the usual
@@ -263,7 +280,7 @@ def w4a8_quantize(w: torch.Tensor, group: int = 128):
     the rest). The weight the tensor cores see is ``(q - z) * gs`` with q in 0..15; the candidates are limited to the (gs, z) for which
     that stays inside int8 ([-128, 127]), so the kernel's 8-bit arithmetic cannot wrap, and the only float scale is per channel.
 
-    Returns ``(packed int8 [N, K/2] (even k in the low nibble), gs int8 [N, K/group], z int8 [N, K/group], sw f32 [N])``."""
+    Returns ``(packed int8 [N, K/2] (`pack_k8` layout), gs int8 [N, K/group], z int8 [N, K/group], sw f32 [N])``."""
     N, K = w.shape
     if K % group or K % 2:
         raise ValueError(f"in_features={K} must be a multiple of {group}")
@@ -273,7 +290,7 @@ def w4a8_quantize(w: torch.Tensor, group: int = 128):
     gs, zp = w4a8_group_params(g8)
     q = (g8 / gs[:, :, None] + zp[:, :, None]).round().clamp(0, 15)
     nib = q.to(torch.uint8).reshape(N, K)
-    packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.int8).contiguous()
+    packed = pack_k8(nib)
     return packed, gs.to(torch.int8).contiguous(), zp.to(torch.int8).contiguous(), sw
 
 
@@ -300,7 +317,6 @@ def w4a8_group_params(g: torch.Tensor):
 
 def w4a8_dequantize(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, group: int = 128) -> torch.Tensor:
     """Float weight ``[N, K]`` that `w4a8_quantize` represents (reference / fallback)."""
-    p = packed.view(torch.uint8)
-    nib = torch.stack((p & 15, p >> 4), dim=2).reshape(p.shape[0], -1).int()
+    nib = unpack_k8(packed).int()
     rep = lambda t: t.int().repeat_interleave(group, 1)      # noqa: E731
     return (nib - rep(zp)) * rep(gs) * sw[:, None]

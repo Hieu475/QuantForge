@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* W4A8: new nibble layout (`quant.pack_k8`: byte j of an 8-block holds elements j and j + 4) and a packed dequantisation pattern in `quantforge-vectorize-dequant` (32-bit word multiply by the scale + SWAR per-byte subtract of the zero point for the int8 prefill tile; `f16x2` magic numbers for the f16 decode tile; FileCheck `vectorize_dequant_w4a8.mlir`). Kernel 1.30-1.48x cuBLAS fp16 (was 1.19-1.40x), 55-63 TOPS; whole-model prefill vs fp16 with compiled norms 1.23x / 1.26x / 1.34x (was 1.16x / 1.22x / 1.28x). vLLM compact mode: prefill 36948 / 13273 / 6678 tokens/s on Qwen2.5-0.5B / 1.5B / 3B (1.12x / 1.15x / 1.15x of Marlin), decode 0.80-0.90x of Marlin. Breaking: W4A8 tensors made with the previous layout are not readable.
+
 * vLLM W4A8: the fp16 weights of the layers to quantise are created on the CPU and moved to the GPU one module at a time by vLLM's `device_loading_context` while they are quantised, so a model larger than the GPU in fp16 loads: Qwen2.5-3B on the 5.6 GB card, compact mode, 2.01 GiB, prefill 6308 tokens/s (Marlin 5782), decode 61 / 935 at 1 / 16 requests (Marlin 81 / 1201). `QUANTFORGE_W4A8_LOAD_ON_CPU=0` turns it off.
 
 * vLLM W4A8: `QUANTFORGE_W4A8_DECODE=compact` keeps one copy of the nibbles (`e2e.W4A8DecodeGemm`: the decode reads the W4A8 layout through a fused producer, 1.1-1.7x slower than the W4A16 decode kernel): weights 1.13 GiB instead of 2.04 GiB (Qwen2.5-1.5B), decode 10-17 % lower at 1 request, 2-10 % at 16, prefill unchanged. `w4a8_hybrid` got a `scale_nk` argument. `benchmarks/w4a8_decode_layout.py`.

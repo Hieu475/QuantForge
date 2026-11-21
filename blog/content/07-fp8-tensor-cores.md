@@ -273,3 +273,21 @@ The limit named in Update 10 (the whole fp16 model has to fit on the GPU while i
 | GPTQ-Int4, `quantforge` (W4A16) | 3923 | 71 | 1063 | |
 
 Prefill is 9 percent above Marlin and 1.6x the W4A16 plugin; decode is 0.75 and 0.78x of Marlin, the cost of the compact decode kernel (the two-layout mode would take about 3.9 GiB and does not fit). So on this card the online W4A8 turns a model that could not be loaded at all into one that serves faster at prefill than the GPTQ checkpoint does with the best kernel there is, at 25 percent lower decode throughput; quality is that of round-to-nearest (Update 8).
+
+## Update 12: unpacking four weights at a time (2026-11-22)
+
+Update 9 and 10 ended with the same loose end: the W4A8 weight tile is built by scalar code (about thirty instructions for four weights; `ncu` said the kernel was issue-bound with 3.7 times the instructions of the INT8 one) and I stopped because it looked like a C++ pattern for a gain of 3 percent of a whole-model prefill. It turned out to be worth much more, because the same producer feeds the decode kernel of the one-copy mode too. Two parts.
+
+**A layout that needs no permutation.** The nibbles used to be packed the obvious way (even k low, odd k high), so unpacking four consecutive weights from a 32-bit word needs a byte shuffle. They are now packed as `pack_k8`: in each block of 8 consecutive k, byte j holds element j in the low nibble and element j + 4 in the high one. Then `w & 0x0F0F0F0F` *is* four consecutive weights, and `(w >> 4) & 0x0F0F0F0F` the next four. Getting the compiler to see through the index arithmetic took three tries and is the part worth remembering: an affine `floordiv` expands into signed floor-division sequences, `k & 4` is not folded, and a group index `(k + j) / 128` gives a different SSA value for every element so the scale loads are not shared; writing the producer with `divui` / `remui` only, the nibble select as `(k / 4) % 2` and the group index from `(k / 16) * 16` makes every select fold to a constant and every element of a work item share one (scale, zero point) pair.
+
+**The pattern.** `quantforge-vectorize-dequant`, the pass that already does the packed f16 dequantisation of the INT4 path, now recognises the sixteen scalar trees `(nibble - z) * s` of an int8 tile and emits word arithmetic: multiply the whole word by the scale (a nibble times a scale of at most 16 is at most 240, so four bytes never carry into each other), and subtract the zero point per byte with the SWAR identity `((x | H) - (y & ~H)) ^ ((x ^ ~y) & H)`; the result is bit-identical to the scalar trees. For the f16 decode tile it uses the 1152 magic-number form (`sub.f16x2`, `mul.f16x2`). A FileCheck test covers a match and a near-miss that must be left alone.
+
+Results, RTX 4050, same methods as before: the W4A8 kernel at 2048 rows is **1.30 to 1.48x cuBLAS fp16** (was 1.19 to 1.40x; 1095 us and 63 TOPS at 4096 x 4096), 1.45 to 2.20x the W4A16 kernel and 0.79 to 0.94x the INT8 kernel. Whole-model prefill against fp16 with compiled norms, same session: W4A8 **1.23x, 1.26x and 1.34x** for Qwen2.5-0.5B, Llama-3.2-1B and Qwen2.5-1.5B (was 1.16, 1.22, 1.28), INT8 1.30, 1.33 and 1.43. In vLLM, one-copy mode, tokens per second:
+
+| model | prefill | vs Marlin | decode 1 request | decode 16 requests | vs Marlin |
+|---|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 36948 | 1.12x | 253 | 3801 | 0.85x / 0.90x |
+| Qwen2.5-1.5B | 13273 | 1.15x | 108 | 1667 | 0.80x / 0.83x |
+| Qwen2.5-3B | 6678 | 1.15x | 65 | 997 | 0.80x / 0.83x |
+
+The decode of the one-copy mode is now as fast as the two-layout mode was (0.5B: 253 and 3801 against 259 and 3592) at half the weight memory, and the prefill beats Marlin by 12 to 15 percent. Two honest notes. The decode kernel itself improved for the small shapes (16 x 896 x 4864: 1.11x to 1.01x of the dedicated W4A16 kernel; 4864 x 896: 1.55x to 1.35x) but not for 4096 x 4096 (1.76x), where `ncu` says the loads are the limit (DRAM at 52 percent against 88 for the dedicated kernel, `long_scoreboard` stalls); I tried hoisting the scalar scale / zero-point loads out of the K loop with the prefetch pass and it changed nothing, so I reverted it. And the layout change is incompatible with W4A8 tensors made earlier (there are none outside this repository).

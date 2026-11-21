@@ -16,54 +16,17 @@ from quantforge.quant import w4a8_quantize
 from quantforge import w4a8_op
 
 M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]); G = 128
-from quantforge.e2e import W4A8_DECODE_OPTS
-extra = os.environ.get("DEC_OPTS") or W4A8_DECODE_OPTS.replace(" accumulate=false", "")      # the schedule W4A8DecodeGemm uses
-ir = f"""#nk = affine_map<(n, k) -> (n, k)>
-func.func @dec(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K//2}xi8>, %zp: tensor<{N}x{K//G}xi8>, %sc: tensor<{N}x{K//G}xf16>,
-               %c: tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32> {{
-  %c0 = arith.constant 0 : index
-  %c2 = arith.constant 2 : index
-  %cg = arith.constant {G} : index
-  %m15 = arith.constant 15 : i8
-  %c4 = arith.constant 4 : i8
-  %eb = tensor.empty() : tensor<{N}x{K}xf16>
-  %bt = linalg.generic {{indexing_maps = [#nk], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
-      outs(%eb : tensor<{N}x{K}xf16>) {{
-    ^bb0(%o: f16):
-      %n = linalg.index 0 : index
-      %k = linalg.index 1 : index
-      %kb = arith.divui %k, %c2 : index
-      %kg = arith.divui %k, %cg : index
-      %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K//2}xi8>
-      %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K//G}xi8>
-      %s = tensor.extract %sc[%n, %kg] : tensor<{N}x{K//G}xf16>
-      %par = arith.remui %k, %c2 : index
-      %odd = arith.cmpi ne, %par, %c0 : index
-      %lo = arith.andi %p, %m15 : i8
-      %hi0 = arith.shrui %p, %c4 : i8
-      %nib = arith.select %odd, %hi0, %lo : i8
-      %v = arith.subi %nib, %z : i8
-      %vf = arith.sitofp %v : i8 to f16
-      %w = arith.mulf %vf, %s : f16
-      linalg.yield %w : f16
-  }} -> tensor<{N}x{K}xf16>
-  %r = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xf16>, tensor<{N}x{K}xf16>) outs(%c : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
-  return %r : tensor<{M}x{N}xf32>
-}}
-"""
-c = compile_ir(ir, tempfile.mkdtemp(), "sm_80", extra + " accumulate=false")
-lib = ctypes.CDLL(str(c.lib_path)); fn = lib._mlir_ciface_dec; fn.argtypes = [ctypes.c_void_p] * 6; fn.restype = None
+from quantforge.e2e import W4A8_DECODE_OPTS, W4A8DecodeGemm
+opts = os.environ.get("DEC_OPTS")
+dec = W4A8DecodeGemm.build(M, K, N, pipeline_opts=(opts + " accumulate=false") if opts else W4A8_DECODE_OPTS)
 dev = "cuda"; g = torch.Generator(device=dev).manual_seed(0)
 w = torch.randn(N, K, device=dev, generator=g) * 0.05
 packed, gs, zp, sw = w4a8_quantize(w)
 sc = (gs.float() * sw[:, None]).half().contiguous()
 x = torch.randn(M, K, device=dev, dtype=torch.float16, generator=g)
 out = torch.zeros(M, N, device=dev)
-res = _descriptor_type(2)()
 def run_new():
-    lib.mgpuSetStream(_current_raw_stream(torch, 0))
-    ds = [_descriptor(t) for t in (x, packed, zp, sc, out)]
-    fn(ctypes.byref(res), *(ctypes.byref(d) for d in ds))
+    dec.launch(x, packed, zp, sc, out)
 run_new(); torch.cuda.synchronize()
 from quantforge import quant
 ref = x.float() @ quant.w4a8_dequantize(packed, gs, zp, sw).t()
