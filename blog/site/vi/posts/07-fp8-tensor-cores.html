@@ -37,30 +37,25 @@
 <tbody>
 <tr>
 <td>512 x 4096 x 4096</td>
-<td style="text-align: right;">27.8 TFLOP/s</td>
-<td style="text-align: right;">73.3</td>
-<td style="text-align: right;">2.64x</td>
+<td style="text-align: right;">37.0 TFLOP/s</td>
+<td style="text-align: right;">77.4</td>
+<td style="text-align: right;">2.09x</td>
 </tr>
 <tr>
 <td>2048 x 4096 x 4096</td>
-<td style="text-align: right;">29.0</td>
-<td style="text-align: right;">56.8</td>
-<td style="text-align: right;">1.96x</td>
+<td style="text-align: right;">38.0</td>
+<td style="text-align: right;">72.6</td>
+<td style="text-align: right;">1.91x</td>
 </tr>
 <tr>
 <td>4096 x 4096 x 4096</td>
-<td style="text-align: right;">28.7</td>
-<td style="text-align: right;">52.9</td>
-<td style="text-align: right;">1.84x</td>
-</tr>
-<tr>
-<td>2048 x 11008 x 4096</td>
-<td style="text-align: right;">28.7</td>
-<td style="text-align: right;">55.7</td>
-<td style="text-align: right;">1.94x</td>
+<td style="text-align: right;">37.8</td>
+<td style="text-align: right;">72.7</td>
+<td style="text-align: right;">1.92x</td>
 </tr>
 </tbody>
 </table>
+<p>Đính chính (2026-11-21): phiên bản đầu của bảng này có mốc fp16 là 28 TFLOP/s, đo trước khi GPU laptop đạt xung ổn định, làm tỷ lệ bị thổi phồng (2.64x ở 512 hàng). Đo lại khi GPU đã được làm nóng và hai kernel chạy xen kẽ qua ba vòng: fp16 37 đến 38 TFLOP/s, FP8 72 đến 77, tức <strong>1.9 đến 2.1 lần</strong>. Dòng 2048 x 11008 x 4096 chưa được đo lại nên bị bỏ. Các kết luận bên dưới không đổi.</p>
 <p>Vậy các core FP8 nhanh gấp khoảng hai lần: có thật, và nhiều hơn những gì kernel W4A16 đạt được ở cỡ prefill (khoảng 0.85 của Marlin, tức khoảng tốc độ fp16).</p>
 <h2 id="layer">Layer<a class="headerlink" href="#layer" title="Permanent link">#</a></h2>
 <p><code>FP8W8A8Linear</code> (<code>quantize_model(model, "fp8_w8a8")</code>) lưu weight FP8 E4M3 với scale theo kênh đầu ra và lượng tử hóa activation tức thời với scale theo token. Hai chi tiết mỗi cái tốn của tôi một giờ:</p>

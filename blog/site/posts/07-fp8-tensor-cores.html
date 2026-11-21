@@ -37,30 +37,25 @@
 <tbody>
 <tr>
 <td>512 x 4096 x 4096</td>
-<td style="text-align: right;">27.8 TFLOP/s</td>
-<td style="text-align: right;">73.3</td>
-<td style="text-align: right;">2.64x</td>
+<td style="text-align: right;">37.0 TFLOP/s</td>
+<td style="text-align: right;">77.4</td>
+<td style="text-align: right;">2.09x</td>
 </tr>
 <tr>
 <td>2048 x 4096 x 4096</td>
-<td style="text-align: right;">29.0</td>
-<td style="text-align: right;">56.8</td>
-<td style="text-align: right;">1.96x</td>
+<td style="text-align: right;">38.0</td>
+<td style="text-align: right;">72.6</td>
+<td style="text-align: right;">1.91x</td>
 </tr>
 <tr>
 <td>4096 x 4096 x 4096</td>
-<td style="text-align: right;">28.7</td>
-<td style="text-align: right;">52.9</td>
-<td style="text-align: right;">1.84x</td>
-</tr>
-<tr>
-<td>2048 x 11008 x 4096</td>
-<td style="text-align: right;">28.7</td>
-<td style="text-align: right;">55.7</td>
-<td style="text-align: right;">1.94x</td>
+<td style="text-align: right;">37.8</td>
+<td style="text-align: right;">72.7</td>
+<td style="text-align: right;">1.92x</td>
 </tr>
 </tbody>
 </table>
+<p>Correction (2026-11-21): the first version of this table had an fp16 baseline of 28 TFLOP/s, measured before the laptop GPU had reached its sustained clocks, which inflated the ratios (2.64x at 512 rows). Re-measured with the GPU pre-heated and the two kernels alternating over three rounds: fp16 37 to 38 TFLOP/s, FP8 72 to 77, i.e. <strong>1.9 to 2.1 times</strong>. The 2048 x 11008 x 4096 row was not re-measured and is dropped. The conclusions below do not change.</p>
 <p>So the FP8 cores are roughly twice as fast: real, and more than the W4A16 kernels reach at prefill sizes (about 0.85 of Marlin, i.e. about fp16 speed).</p>
 <h2 id="the-layer">The layer<a class="headerlink" href="#the-layer" title="Permanent link">#</a></h2>
 <p><code>FP8W8A8Linear</code> (<code>quantize_model(model, "fp8_w8a8")</code>) stores FP8 E4M3 weights with a scale per output channel and quantises the activations on the fly with a scale per token. Two details cost me an hour each:</p>

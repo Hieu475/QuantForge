@@ -13,10 +13,11 @@ The [FP8 post](03-fp8-without-hardware.html) stored the *weights* in FP8 and sti
 
 | M x N x K | fp16 | FP8 | speed-up |
 |---|--:|--:|--:|
-| 512 x 4096 x 4096 | 27.8 TFLOP/s | 73.3 | 2.64x |
-| 2048 x 4096 x 4096 | 29.0 | 56.8 | 1.96x |
-| 4096 x 4096 x 4096 | 28.7 | 52.9 | 1.84x |
-| 2048 x 11008 x 4096 | 28.7 | 55.7 | 1.94x |
+| 512 x 4096 x 4096 | 37.0 TFLOP/s | 77.4 | 2.09x |
+| 2048 x 4096 x 4096 | 38.0 | 72.6 | 1.91x |
+| 4096 x 4096 x 4096 | 37.8 | 72.7 | 1.92x |
+
+Correction (2026-11-21): the first version of this table had an fp16 baseline of 28 TFLOP/s, measured before the laptop GPU had reached its sustained clocks, which inflated the ratios (2.64x at 512 rows). Re-measured with the GPU pre-heated and the two kernels alternating over three rounds: fp16 37 to 38 TFLOP/s, FP8 72 to 77, i.e. **1.9 to 2.1 times**. The 2048 x 11008 x 4096 row was not re-measured and is dropped. The conclusions below do not change.
 
 So the FP8 cores are roughly twice as fast: real, and more than the W4A16 kernels reach at prefill sizes (about 0.85 of Marlin, i.e. about fp16 speed).
 

@@ -13,10 +13,11 @@ summary: Tensor core FP8 của Ada cho một GEMM trần được bao nhiêu, m�
 
 | M x N x K | fp16 | FP8 | tăng tốc |
 |---|--:|--:|--:|
-| 512 x 4096 x 4096 | 27.8 TFLOP/s | 73.3 | 2.64x |
-| 2048 x 4096 x 4096 | 29.0 | 56.8 | 1.96x |
-| 4096 x 4096 x 4096 | 28.7 | 52.9 | 1.84x |
-| 2048 x 11008 x 4096 | 28.7 | 55.7 | 1.94x |
+| 512 x 4096 x 4096 | 37.0 TFLOP/s | 77.4 | 2.09x |
+| 2048 x 4096 x 4096 | 38.0 | 72.6 | 1.91x |
+| 4096 x 4096 x 4096 | 37.8 | 72.7 | 1.92x |
+
+Đính chính (2026-11-21): phiên bản đầu của bảng này có mốc fp16 là 28 TFLOP/s, đo trước khi GPU laptop đạt xung ổn định, làm tỷ lệ bị thổi phồng (2.64x ở 512 hàng). Đo lại khi GPU đã được làm nóng và hai kernel chạy xen kẽ qua ba vòng: fp16 37 đến 38 TFLOP/s, FP8 72 đến 77, tức **1.9 đến 2.1 lần**. Dòng 2048 x 11008 x 4096 chưa được đo lại nên bị bỏ. Các kết luận bên dưới không đổi.
 
 Vậy các core FP8 nhanh gấp khoảng hai lần: có thật, và nhiều hơn những gì kernel W4A16 đạt được ở cỡ prefill (khoảng 0.85 của Marlin, tức khoảng tốc độ fp16).
 
