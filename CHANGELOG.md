@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* INT8 W8A8 and W4A8: `silu(gate) * up` and the per-token INT8 quantisation of the `down_proj` input are one compiled function (`_silu_mul_quantize`, installed on the MLP by `_fuse_int8`; `fuse_activation=False` turns it off): whole-model prefill 8-14 % faster than without it, INT8 1.22x / 1.28x / 1.36x of fp16, W4A8 1.21x / 1.16x / 1.24x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), perplexity unchanged (+0.002..0.012).
+
 * W4A8 kernel: the weight producer reads the packed byte / scale / zero point with `tensor.extract` and unsigned index arithmetic instead of affine `floordiv` maps, so the loads vectorise (`ld.global.u32`): kernel 1.19-1.40x cuBLAS fp16 (was 1.11-1.26x), 50-58 TOPS; whole-model prefill 1.03x / 1.07x / 1.10x of fp16 (was 1.01x / 1.07x / 1.04x).
 
 * GPTQ for W4A8: `quantforge.gptq.gptq_quantize_weight_w4a8`, `quantize_model_gptq(..., fmt="w4a8")`, `quant.w4a8_group_params` (shared by RTN and GPTQ): perplexity 23.7 -> 21.1 / 22.1 -> 19.9 / 14.7 -> 13.7 (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), within 0.6 of INT4 W4A16 GPTQ. `benchmarks/w4a8_gptq.py`.

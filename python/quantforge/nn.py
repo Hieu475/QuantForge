@@ -257,6 +257,16 @@ def _int8_quantize_tokens(x2):
     return (x2.float() / s).round().clamp(-127, 127).to(torch.int8), s
 
 
+@_maybe_compile
+def _silu_mul_quantize(gu, inter: int):
+    """``silu(gate) * up`` of a ``[M, 2 * inter]`` gate / up output and its per-token INT8 quantisation in one compiled kernel pair
+    (the input of ``down_proj``): saves the two element-wise passes over the ``[M, inter]`` activations."""
+    g, u = gu[:, :inter].float(), gu[:, inter:].float()
+    a = g * torch.sigmoid(g) * u
+    s = (a.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
+    return (a / s).round().clamp(-127, 127).to(torch.int8), s
+
+
 class INT8W8A8Linear(nn.Module):
     """INT8 weights (per-output-channel scale) **and** activations (dynamic per-token scale) on the INT8 tensor cores:
     ``y = (quant(x) @ W8^T) * s_x * s_w + bias``. Two backends: ``"quantforge"`` (default; the GEMM and the dequantisation epilogue
@@ -328,18 +338,19 @@ class INT8W8A8Linear(nn.Module):
         return cls(w, sc, bias, layers[0].backend)
 
     def _compiled_forward(self, x2: torch.Tensor, dt) -> torch.Tensor:
-        M, K = x2.shape
-        Mp = self._bucket(M)
-        key = Mp
-        k = self._kernels.get(key)
-        if k is None:
-            k = self._kernels[key] = self._build_kernel(Mp, K)
         xq, s_x = _int8_quantize_tokens(x2)
-        s_x = s_x.reshape(-1)
+        return self._gemm_quantized(xq, s_x.reshape(-1), dt)
+
+    def _gemm_quantized(self, xq: torch.Tensor, s_x: torch.Tensor, dt) -> torch.Tensor:
+        """The compiled GEMM + dequantisation on activations that are already int8 ``[M, K]`` with their per-token scales ``[M]``."""
+        (M, K), Mp = xq.shape, self._bucket(xq.shape[0])
+        k = self._kernels.get(Mp)
+        if k is None:
+            k = self._kernels[Mp] = self._build_kernel(Mp, K)
         if Mp != M:                                                       # zero rows (scale 0) up to the bucket
             xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
             s_x = torch.nn.functional.pad(s_x, (0, Mp - M))
-        y = torch.empty(Mp, self.out_features, device=x2.device, dtype=torch.float16)
+        y = torch.empty(Mp, self.out_features, device=xq.device, dtype=torch.float16)
         self._launch(k, xq, s_x.contiguous(), y)
         y = y[:M] if Mp != M else y
         return y if dt == torch.float16 else y.to(dt)
@@ -544,6 +555,10 @@ class _Int8Shared(nn.Module):
             self._key, self._x, self._taken = key, x, 0      # keep x alive so that its id cannot be reused
         return self._outs
 
+    def full(self, x: torch.Tensor) -> torch.Tensor:
+        """The un-split output ``[..., sum(sizes)]`` (for a consumer that wants all the parts at once)."""
+        return self.inner(x)
+
     def take(self, x: torch.Tensor, index: int) -> torch.Tensor:
         """Part ``index`` of the shared GEMM. The cache (the outputs of the last call, ~80 MB for a gate / up at 4096 rows) is dropped
         as soon as every part was taken: otherwise every layer would hold its last activations until the next forward."""
@@ -555,7 +570,7 @@ class _Int8Shared(nn.Module):
         return out
 
 
-def _fuse_int8(model: nn.Module) -> tuple[int, int]:
+def _fuse_int8(model: nn.Module, fuse_activation: bool = True) -> tuple[int, int]:
     """Share the activation quantisation and the GEMM between q/k/v and between gate/up of INT8 W8A8 blocks; returns (#qkv, #gate-up)."""
     n_qkv = n_mlp = 0
     for module in list(model.modules()):
@@ -572,7 +587,26 @@ def _fuse_int8(model: nn.Module) -> tuple[int, int]:
                 n_qkv += 1
             else:
                 n_mlp += 1
+                down = getattr(module, "down_proj", None)
+                if isinstance(down, type(layers[0])) and _is_silu(module) and all(m.bias is None for m in layers) \
+                        and down.in_features == layers[0].out_features and fuse_activation:
+                    module.forward = _int8_gated_mlp_forward(shared, down, layers[0].out_features, module.forward)
     return n_qkv, n_mlp
+
+
+def _int8_gated_mlp_forward(shared: "_Int8Shared", down, inter: int, fallback):
+    """``down(silu(gate(x)) * up(x))`` of an INT8 / W4A8 block with the activation and the quantisation of ``down``'s input fused
+    (``_silu_mul_quantize``); calls with 16 rows or fewer, or layers the compiled kernel does not take, use the generic path."""
+    def forward(x):
+        rows = x.numel() // x.shape[-1]
+        if rows <= 16 or not (shared.inner.use_compiled and down.use_compiled and x.is_cuda):
+            return fallback(x)
+        dt = torch.float16 if x.dtype == torch.float32 else x.dtype
+        gu = shared.full(x).reshape(rows, 2 * inter)
+        xq, s_x = _silu_mul_quantize(gu, inter)
+        y = down._gemm_quantized(xq, s_x.reshape(-1), dt)
+        return y.reshape(*x.shape[:-1], down.out_features)
+    return forward
 
 
 def _is_silu(module: nn.Module) -> bool:

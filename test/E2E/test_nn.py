@@ -328,7 +328,7 @@ def test_int8_w8a8_shared_input_fusion_gives_the_same_model_output():
         with torch.no_grad():
             outs[fuse] = m(ids).logits.float()
     assert torch.isfinite(outs[True]).all()
-    assert (outs[True] - outs[False]).abs().max() < 1e-2 * outs[False].abs().max()
+    assert (outs[True] - outs[False]).abs().max() < 3e-2 * outs[False].abs().max()      # the fused silu * up rounds once, not twice
 
 
 def _int4_group_rtn(w, group):
@@ -394,4 +394,33 @@ def test_w4a8_shared_input_fusion_gives_the_same_model_output():
         with torch.no_grad():
             outs[fuse] = m(ids).logits.float()
     assert torch.isfinite(outs[True]).all()
-    assert (outs[True] - outs[False]).abs().max() < 1e-2 * outs[False].abs().max()
+    assert (outs[True] - outs[False]).abs().max() < 3e-2 * outs[False].abs().max()      # the fused silu * up rounds once, not twice
+
+
+@pytest.mark.parametrize("fmt", ["int8_w8a8", "w4a8"])
+def test_silu_up_quantisation_fusion_gives_the_same_model_output(fmt):
+    """The gated MLP of an INT8 / W4A8 block computes silu(gate) * up and quantises it for down_proj in one compiled function; the model
+    output stays that of the generic path (activation + quantisation as separate ops), also for 16 rows or fewer."""
+    _require_gpu()
+    transformers = pytest.importorskip("transformers")
+    import quantforge.nn as qnn
+
+    cfg = transformers.LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, vocab_size=512, max_position_embeddings=64)
+    torch.manual_seed(0)
+    m = transformers.LlamaForCausalLM(cfg).half().eval()
+    qnn.quantize_model(m, fmt)
+    mlps = [mod for mod in m.modules() if "forward" in vars(mod) and hasattr(mod, "down_proj")]
+    assert len(mlps) == 2                                              # the fused forward is installed on both blocks
+    for rows in (64, 8):
+        ids = torch.randint(0, 512, (1, rows), device="cuda")
+        with torch.no_grad():
+            fused = m(ids).logits.float()
+            saved = [mod.forward for mod in mlps]
+            for mod in mlps:
+                del mod.forward                                        # back to the class forward: separate ops
+            plain = m(ids).logits.float()
+            for mod, f in zip(mlps, saved):
+                mod.forward = f
+        assert torch.isfinite(fused).all()
+        assert (fused - plain).abs().max() < 3e-2 * plain.abs().max(), rows

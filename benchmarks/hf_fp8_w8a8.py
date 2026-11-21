@@ -54,6 +54,10 @@ def main():
             qnn.quantize_model(m, "int8_w8a8", fuse=True)          # q/k/v and gate/up share one quantisation + one GEMM
         elif v == "w4a8":                 # INT4 weights (progressive quantisation) + per-token INT8 activations, one compiled kernel
             qnn.quantize_model(m, "w4a8", fuse=True)
+        elif v == "int8_w8a8_noact":      # as int8_w8a8 without the fused silu * up + quantisation
+            qnn.quantize_model(m, "int8_w8a8", fuse=False); qnn._fuse_int8(m, fuse_activation=False)
+        elif v == "w4a8_noact":
+            qnn.quantize_model(m, "w4a8", fuse=False); qnn._fuse_int8(m, fuse_activation=False)
         elif v == "int8_w8a8_nofuse":
             qnn.quantize_model(m, "int8_w8a8", fuse=False)
         elif v == "int8_w8a8_cublaslt":   # the same through cuBLASLt (torch._int_mm) with the epilogue as separate torch ops
