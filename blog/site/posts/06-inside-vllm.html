@@ -22,6 +22,7 @@
 <li><a href="#a-measurement-trap">A measurement trap</a></li>
 </ul>
 </li>
+<li><a href="#split-k-in-the-compiler-it-works-and-it-does-not-pay">Split-K in the compiler: it works, and it does not pay</a></li>
 <li><a href="#other-checkpoint-formats">Other checkpoint formats</a></li>
 <li><a href="#limitations-of-the-plugin">Limitations of the plugin</a></li>
 </ul>
@@ -289,6 +290,81 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal bloc
 <p>Folding gained 9 percent (0.5B) and 15 percent (1.5B) for one to four requests when it was introduced (about 4 percent now that the plain schedules are better) and nothing from 16 requests up, where <code>M * S</code> exceeds 16 and the plain kernel runs. The last two columns add, first, the width-aware default schedules (the tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models; autotune picks 32 / 64-column blocks and a look-ahead there, and I turned its winners into rules, <code>benchmarks/sweep_skinny.py</code>), then a second sweep that found 32 and 64-column blocks 11 to 52 % faster than 128-column ones for N &lt;= 2048 at 32 and 64 rows (for wide outputs no candidate of 74 beat the defaults by more than 4 %, <code>benchmarks/sweep_skinny_blocks.py</code>) and a fused epilogue kernel for the folded layers (3 kernels per call instead of 5 to 7: 20 to 35 % faster per layer, but invisible in whole-model time, about 1 to 2 %, because the GPU is busy 97 % of the time anyway). Together: the 0.5B model reaches 0.87 to 0.96 of Marlin at 1 to 64 requests, the 1.5B model 0.74 to 0.87; the absolute speed rose by 4 to 7 % over the previous column. Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.</p>
 <h3 id="a-measurement-trap">A measurement trap<a class="headerlink" href="#a-measurement-trap" title="Permanent link">#</a></h3>
 <p>My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear <code>~/.cache/vllm/torch_compile_cache</code> once.</p>
+<h2 id="split-k-in-the-compiler-it-works-and-it-does-not-pay">Split-K in the compiler: it works, and it does not pay<a class="headerlink" href="#split-k-in-the-compiler-it-works-and-it-does-not-pay" title="Permanent link">#</a></h2>
+<p>The <code>ncu</code> comparison pointed at work balance (Marlin: 20 persistent blocks), and the textbook answer is split-K. I implemented it as a pipeline option (<code>--quantforge-gpu-pipeline='... split-k=S'</code>, off by default), and the implementation turned out to need fewer changes than I feared, because MLIR already has <code>linalg::tileReductionUsingForall</code>:</p>
+<ol>
+<li>the tiling pass cuts the K reduction into S chunks with that helper: a <code>scf.forall (z)</code> whose body is an ordinary smaller-K GEMM, writing into a partial-result tensor, and a <code>linalg.generic</code> that adds the S partial results;</li>
+<li>the existing block tiling runs inside it, producing a forall nested in a forall; a small rewrite merges the two into one <code>scf.forall (m, n, z)</code> so that the existing launch lowering gets a 3-D grid;</li>
+<li>the rest of the pipeline needed three fixes, each found by reading the failing IR: the zero-fill of the partial buffer was vectorised into a host-side <code>vector&lt;16x256x4xf32&gt;</code> (dropped in overwrite mode, where every block writes its whole tile); the partial buffer was laid out <code>[M, N, S]</code>, which makes a block's tile non-contiguous and stops the Tensor Core lowering from recognising it (it is <code>[S, M, N]</code> now); and the reduce had to be excluded from vectorisation so that it becomes its own small kernel.</li>
+</ol>
+<p>It is <strong>correct</strong>: the result matches the unsplit kernel and the dense reference (relative error 2e-4 in every configuration, three test shapes in the suite, 38 of 38 FileCheck tests unchanged). The scale and zero-point indexing survives a K loop that starts at <code>z * Kc</code> because the dequantisation is fused through <code>extract_slice</code> offsets, not through loop counters. <strong>It is not worth turning on</strong>, measured as device time of all its kernels (RTX 4050, the op's default schedule):</p>
+<table>
+<thead>
+<tr>
+<th>shape (rows x K x N)</th>
+<th style="text-align: right;">unsplit</th>
+<th style="text-align: right;">split-K</th>
+<th style="text-align: right;">K-folding (16 rows only)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16 x 8960 x 1536</td>
+<td style="text-align: right;">70.3 us</td>
+<td style="text-align: right;">60.0 (S=5)</td>
+<td style="text-align: right;">46.0</td>
+</tr>
+<tr>
+<td>16 x 4864 x 896</td>
+<td style="text-align: right;">28.3</td>
+<td style="text-align: right;">26.6 (S=2)</td>
+<td style="text-align: right;">18.2</td>
+</tr>
+<tr>
+<td>32 x 8960 x 1536</td>
+<td style="text-align: right;">86.5</td>
+<td style="text-align: right;">66.2 (S=5)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>32 x 4864 x 896</td>
+<td style="text-align: right;">36.9</td>
+<td style="text-align: right;">28.7 (S=2)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 4864 x 896</td>
+<td style="text-align: right;">50.1</td>
+<td style="text-align: right;">43.2 (S=2)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 8960 x 1536</td>
+<td style="text-align: right;">101.5</td>
+<td style="text-align: right;">110.7 (S=5)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 4096 x 4096</td>
+<td style="text-align: right;">94.0</td>
+<td style="text-align: right;">113.8 (S=4)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 11008 x 4096</td>
+<td style="text-align: right;">240.1</td>
+<td style="text-align: right;">260.1 (S=4)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 896 x 9728</td>
+<td style="text-align: right;">51.3</td>
+<td style="text-align: right;">165.6 (S=7)</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>It helps the long-K, narrow-N layers by 14 to 23 percent at 32 rows, loses to K-folding at 16 rows, and makes most layers slower at 64 rows. The reasons are the ones Marlin avoids by reducing inside the kernel: a second kernel for the reduce, S times M x N extra floats written and read back, and a buffer allocated per call, which would also break CUDA-graph capture (the scratch would have to become a function argument). Fixing those (an in-kernel reduction with atomics or a semaphore, scratch passed in) is the real work of a Marlin-style persistent kernel, and the best case is the 14 to 23 percent on the layers that make up a quarter of the GEMM time, so roughly 3 to 5 percent of a decode step. I stopped there: the code stays in the compiler as an experimental, tested, default-off option, and the diagnosis of the gap to Marlin at 64 rows is the useful result.</p>
 <h2 id="other-checkpoint-formats">Other checkpoint formats<a class="headerlink" href="#other-checkpoint-formats" title="Permanent link">#</a></h2>
 <p>The plugin also reads AWQ 4-bit and GPTQ 8-bit checkpoints (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):</p>
 <table>

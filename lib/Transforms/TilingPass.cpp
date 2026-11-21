@@ -43,9 +43,13 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Pass/Pass.h"
 
@@ -53,6 +57,145 @@
 
 using namespace mlir;
 using namespace mlir::quantforge;
+
+
+/// Split-K: tileReductionUsingForall leaves `forall (z) { ... forall (m, n) { ... } }` over a partial-result tensor
+/// P[M, N, S]. The launch lowering maps a single forall to the grid, so fold the two into `forall (m, n, z)`. Two more
+/// things change on the way: (1) P becomes [S, M, N], so that the tile of a block is contiguous like an ordinary C tile
+/// (the Tensor Core path does not recognise a tile with stride S along N), and the reduce is re-indexed accordingly;
+/// (2) `zeroInit` false (the kernel overwrites its output) drops the zero fill, which would otherwise become a huge
+/// host-side vector store. Blocks read / write exactly their own tile P[z, m, n].
+static LogicalResult mergeSplitKForall(RewriterBase &rewriter, scf::ForallOp outer, linalg::GenericOp reduceOp,
+                                       bool zeroInit) {
+  if (outer.getRank() != 1 || outer.getNumResults() != 1)
+    return failure();
+  scf::ForallOp inner;
+  for (scf::ForallOp f : outer.getBody()->getOps<scf::ForallOp>()) {
+    if (inner)
+      return failure();
+    inner = f;
+  }
+  if (!inner || inner.getRank() != 2 || inner.getNumResults() != 1)
+    return failure();
+  auto outerYield = outer.getTerminator();
+  if (std::distance(outerYield.getYieldingOps().begin(), outerYield.getYieldingOps().end()) != 1)
+    return failure();
+  auto outerInsert = dyn_cast<tensor::ParallelInsertSliceOp>(*outerYield.getYieldingOps().begin());
+  auto innerYield = inner.getTerminator();
+  if (!outerInsert || outerInsert.getSource() != inner.getResult(0) ||
+      std::distance(innerYield.getYieldingOps().begin(), innerYield.getYieldingOps().end()) != 1)
+    return failure();
+  auto innerInsert = dyn_cast<tensor::ParallelInsertSliceOp>(*innerYield.getYieldingOps().begin());
+  if (!innerInsert)
+    return failure();
+  for (Operation *user : inner.getResult(0).getUsers())
+    if (user != outerInsert.getOperation())
+      return failure();
+  auto pType = dyn_cast<RankedTensorType>(outer.getOutputs()[0].getType());
+  if (!pType || pType.getRank() != 3 || !pType.hasStaticShape() || reduceOp.getNumDpsInputs() != 1)
+    return failure();
+  const int64_t M = pType.getDimSize(0), N = pType.getDimSize(1), S = pType.getDimSize(2);
+
+  Location loc = outer.getLoc();
+  SmallVector<OpFoldResult> lbs = inner.getMixedLowerBound(), ubs = inner.getMixedUpperBound(),
+                            steps = inner.getMixedStep();
+  lbs.push_back(outer.getMixedLowerBound()[0]);
+  ubs.push_back(outer.getMixedUpperBound()[0]);
+  steps.push_back(outer.getMixedStep()[0]);
+
+  // P' [S, M, N]
+  rewriter.setInsertionPoint(outer);
+  Value pNew = rewriter.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{S, M, N}, pType.getElementType());
+  if (zeroInit) {
+    Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(pType.getElementType()));
+    pNew = rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{pNew}).getResult(0);
+  }
+  auto merged = rewriter.create<scf::ForallOp>(loc, lbs, ubs, steps, ValueRange{pNew}, std::nullopt);
+  Value p = merged.getRegionOutArgs()[0];
+  Value z = merged.getInductionVars()[2];
+
+  IRMapping map;
+  map.map(outer.getInductionVars()[0], z);
+  rewriter.setInsertionPoint(merged.getTerminator());
+  for (Operation &op : outer.getBody()->without_terminator()) {
+    if (&op == inner.getOperation())
+      continue;
+    // the whole-slice view of the old P: the new one is P'[z, :, :]
+    if (auto ex = dyn_cast<tensor::ExtractSliceOp>(&op); ex && ex.getSource() == outer.getRegionOutArgs()[0]) {
+      auto view = rewriter.create<tensor::ExtractSliceOp>(
+          op.getLoc(), ex.getType(), p, ArrayRef<OpFoldResult>{z, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)},
+          ArrayRef<OpFoldResult>{rewriter.getIndexAttr(1), rewriter.getIndexAttr(M), rewriter.getIndexAttr(N)},
+          ArrayRef<OpFoldResult>{rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1)});
+      map.map(ex.getResult(), view.getResult());
+      continue;
+    }
+    rewriter.clone(op, map);
+  }
+  map.map(inner.getInductionVars()[0], merged.getInductionVars()[0]);
+  map.map(inner.getInductionVars()[1], merged.getInductionVars()[1]);
+  map.map(inner.getRegionOutArgs()[0], map.lookup(inner.getOutputs()[0]));
+  for (Operation &op : inner.getBody()->without_terminator())
+    rewriter.clone(op, map);
+
+  // A block reads its accumulator tile through the whole-slice view P'[z]; other blocks write other tiles of that slice in
+  // parallel, so bufferization would copy the full [M, N] slice per block. Read the tile straight from P'.
+  {
+    Value init = map.lookup(inner.getOutputs()[0]);
+    if (auto id = init.getDefiningOp<tensor::ExtractSliceOp>())
+      if (id.getSourceType() == id.getType() && llvm::all_of(id.getMixedOffsets(), [](OpFoldResult o) {
+            return isConstantIntValue(o, 0);
+          })) {
+        init = id.getSource();
+        rewriter.replaceOp(id, init);
+      }
+    if (auto view = init.getDefiningOp<tensor::ExtractSliceOp>(); view && view.getSource() == p) {
+      for (OpOperand &use : llvm::make_early_inc_range(view->getUses())) {
+        auto ex = dyn_cast<tensor::ExtractSliceOp>(use.getOwner());
+        if (!ex || ex.getSource() != view.getResult())
+          continue;
+        rewriter.setInsertionPoint(ex);
+        SmallVector<OpFoldResult> o = {z}, sz = {rewriter.getIndexAttr(1)}, st = {rewriter.getIndexAttr(1)};
+        for (OpFoldResult x : ex.getMixedOffsets()) o.push_back(x);
+        for (OpFoldResult x : ex.getMixedSizes()) sz.push_back(x);
+        for (OpFoldResult x : ex.getMixedStrides()) st.push_back(x);
+        auto direct = rewriter.create<tensor::ExtractSliceOp>(ex.getLoc(), ex.getType(), p, o, sz, st);
+        rewriter.replaceOp(ex, direct.getResult());
+      }
+      if (view->use_empty())
+        rewriter.eraseOp(view);
+    }
+  }
+
+  auto mapOfr = [&](OpFoldResult o) -> OpFoldResult {
+    if (auto v = dyn_cast<Value>(o))
+      return OpFoldResult(map.lookupOrDefault(v));
+    return o;
+  };
+  SmallVector<OpFoldResult> offs = {z}, sizes = {rewriter.getIndexAttr(1)}, strides = {rewriter.getIndexAttr(1)};
+  for (OpFoldResult o : innerInsert.getMixedOffsets())
+    offs.push_back(mapOfr(o));
+  for (OpFoldResult o : innerInsert.getMixedSizes())
+    sizes.push_back(mapOfr(o));
+  for (OpFoldResult o : innerInsert.getMixedStrides())
+    strides.push_back(mapOfr(o));
+  rewriter.setInsertionPointToStart(&merged.getTerminator().getRegion().front());
+  rewriter.create<tensor::ParallelInsertSliceOp>(loc, map.lookupOrDefault(innerInsert.getSource()), p, offs, sizes,
+                                                 strides);
+
+  // The reduce of the partial results reads P'[s, m, n] now: (m, n, s) -> (s, m, n).
+  Operation *oldFill = outer.getOutputs()[0].getDefiningOp();
+  rewriter.modifyOpInPlace(reduceOp, [&] {
+    SmallVector<AffineMap> maps = reduceOp.getIndexingMapsArray();
+    MLIRContext *ctx = rewriter.getContext();
+    maps[0] = AffineMap::get(3, 0, {getAffineDimExpr(2, ctx), getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx)}, ctx);
+    reduceOp.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(maps));
+    reduceOp->setOperand(0, merged.getResult(0));
+  });
+  rewriter.eraseOp(outer);
+  if (oldFill && oldFill->use_empty())
+    rewriter.eraseOp(oldFill);
+  return success();
+}
 
 namespace {
 
@@ -83,6 +226,8 @@ struct TilingPass
     threadTileM.setValue(other.threadTileM.getValue());
     threadTileN.setValue(other.threadTileN.getValue());
     threadTileK.setValue(other.threadTileK.getValue());
+    splitK.setValue(other.splitK.getValue());
+    splitKInit.setValue(other.splitKInit.getValue());
   }
 
   //------------------------------------------------------------------
@@ -125,6 +270,18 @@ struct TilingPass
   Option<int64_t> threadTileN{*this, "thread-tile-n",
                               llvm::cl::desc("Thread tile size N"),
                               llvm::cl::init(8)};
+  Option<int64_t> splitK{*this, "split-k",
+                         llvm::cl::desc("Split the K reduction over this many "
+                                        "scf.forall iterations (partial "
+                                        "results + a final reduce); 1 = off"),
+                         llvm::cl::init(1)};
+
+  Option<bool> splitKInit{*this, "split-k-init",
+                          llvm::cl::desc("split-k: zero-fill the partial results "
+                                         "(needed unless the kernel overwrites "
+                                         "its output)"),
+                          llvm::cl::init(true)};
+
   Option<int64_t> threadTileK{*this, "thread-tile-k",
                               llvm::cl::desc("Tensor Core mma.sync size K"),
                               llvm::cl::init(16)};
@@ -172,6 +329,35 @@ struct TilingPass
 
     for (linalg::LinalgOp linalgOp : worklist) {
       unsigned iterRank = linalgOp.getNumLoops();
+
+      // ── Level 0 (optional): split-K. The reduction is cut into `split-k`
+      // chunks run by a scf.forall; every chunk writes its own partial result
+      // and a linalg reduce adds them up. The tiled op inside the forall is
+      // an ordinary (smaller-K) matmul, tiled by the levels below.
+      scf::ForallOp splitLoop;
+      linalg::GenericOp splitReduce;
+      if (splitK > 1 && iterRank >= 3) {
+        rewriter.setInsertionPoint(linalgOp);
+        auto partial = dyn_cast<PartialReductionOpInterface>(linalgOp.getOperation());
+        if (!partial) {
+          linalgOp.emitWarning("split-k: op does not implement PartialReductionOpInterface");
+        } else {
+          SmallVector<OpFoldResult> numThreads(iterRank, rewriter.getIndexAttr(0));
+          numThreads[2] = rewriter.getIndexAttr(splitK);
+          FailureOr<linalg::ForallReductionTilingResult> split =
+              linalg::tileReductionUsingForall(rewriter, partial, numThreads);
+          if (failed(split)) {
+            linalgOp.emitWarning("split-k: tileReductionUsingForall failed");
+          } else {
+            splitLoop = split->loops;
+            splitReduce = dyn_cast_or_null<linalg::GenericOp>(split->mergeOp);
+            if (splitReduce)
+              splitReduce->setAttr("quantforge.no_vectorize", UnitAttr::get(ctx));
+            linalgOp = cast<linalg::LinalgOp>(split->parallelTiledOp);
+            iterRank = linalgOp.getNumLoops();
+          }
+        }
+      }
 
       rewriter.setInsertionPoint(linalgOp);
       auto tilingIface = cast<TilingInterface>(linalgOp.getOperation());
@@ -257,6 +443,10 @@ struct TilingPass
       if (iterRank >= 3)
         rewriter.replaceOp(l2Op, reductionResult->replacements);
       rewriter.replaceOp(linalgOp, blockResult->replacements);
+      if (splitLoop && !splitReduce)
+        splitLoop.emitWarning("split-k: the reduce of the partial results is not a linalg.generic");
+      else if (splitLoop && failed(mergeSplitKForall(rewriter, splitLoop, splitReduce, splitKInit)))
+        splitLoop.emitWarning("split-k: could not merge the K forall with the block forall");
     }
 
     // Semantic tags for downstream synchronization pass:

@@ -211,6 +211,13 @@ struct GPUPipelineOptions
       llvm::cl::desc("Keep the C accumulator tile in registers across the "
                      "innermost K loop"),
       llvm::cl::init(true)};
+  Option<int> splitK{
+      *this, "split-k",
+      llvm::cl::desc("Cut the K reduction into this many chunks run by "
+                     "separate blocks (partial results + a reduce kernel); "
+                     "1 = off"),
+      llvm::cl::init(1)};
+
   Option<bool> decode{
       *this, "decode",
       llvm::cl::desc("Skinny-M (decode, M <= 16) schedule: 16x64 block tile, "
@@ -250,6 +257,10 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
           std::to_string(bk) + " warp-tile-m=" +
           std::to_string(wm) + " warp-tile-n=" +
           std::to_string(wn) +
+          " split-k=" + std::to_string(opts.splitK.getValue()) +
+          // overwrite mode: every block writes its whole partial tile, no zero fill needed
+          " split-k-init=" +
+          ((!opts.accumulate || opts.epilogue == "swiglu") ? "false" : "true") +
           "},quantforge-gpu-mapping{block-tile-m=" +
           std::to_string(bm) + " block-tile-n=" +
           std::to_string(bn) + " warp-tile-m=" +

@@ -88,6 +88,30 @@ Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến b
 
 A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa `~/.cache/vllm/torch_compile_cache` một lần.
 
+## Split-K trong compiler: chạy đúng, nhưng không đáng
+
+So sánh `ncu` chỉ ra vấn đề chia tải (Marlin: 20 block cố định), và câu trả lời sách giáo khoa là split-K. Tôi cài nó thành một tùy chọn của pipeline (`--quantforge-gpu-pipeline='... split-k=S'`, mặc định tắt), và việc cài đặt hóa ra cần ít thay đổi hơn tôi lo, vì MLIR đã có `linalg::tileReductionUsingForall`:
+
+1. pass tiling cắt phép rút gọn K thành S đoạn bằng hàm đó: một `scf.forall (z)` có thân là một GEMM K nhỏ hơn bình thường, ghi vào một tensor kết quả từng phần, và một `linalg.generic` cộng S kết quả từng phần;
+2. tiling khối hiện có chạy bên trong, tạo ra một forall lồng trong một forall; một phép biến đổi nhỏ gộp hai cái thành một `scf.forall (m, n, z)` để phần hạ xuống launch hiện có nhận được lưới 3 chiều;
+3. phần còn lại của pipeline cần ba sửa, mỗi cái tìm ra bằng cách đọc IR lỗi: việc điền 0 buffer từng phần bị vector hóa thành một `vector<16x256x4xf32>` phía host (bỏ ở chế độ ghi đè, nơi mỗi block ghi đủ tile của nó); buffer từng phần được bố trí `[M, N, S]`, làm tile của một block không liên tục và khiến phần hạ xuống Tensor Core không nhận ra nó (giờ là `[S, M, N]`); và phép reduce phải được loại khỏi vector hóa để trở thành một kernel nhỏ riêng.
+
+Nó **đúng**: kết quả khớp kernel không chia và tham chiếu dense (sai số tương đối 2e-4 ở mọi cấu hình, ba shape test trong bộ test, 38 trên 38 test FileCheck không đổi). Chỉ số scale và zero-point vẫn đúng khi vòng K bắt đầu ở `z * Kc` vì dequantisation được gộp qua offset của `extract_slice`, không qua bộ đếm vòng lặp. **Nó không đáng bật**, đo bằng thời gian thiết bị của tất cả kernel của nó (RTX 4050, schedule mặc định của op):
+
+| shape (hàng x K x N) | không chia | split-K | K-folding (chỉ 16 hàng) |
+|---|--:|--:|--:|
+| 16 x 8960 x 1536 | 70.3 us | 60.0 (S=5) | 46.0 |
+| 16 x 4864 x 896 | 28.3 | 26.6 (S=2) | 18.2 |
+| 32 x 8960 x 1536 | 86.5 | 66.2 (S=5) | |
+| 32 x 4864 x 896 | 36.9 | 28.7 (S=2) | |
+| 64 x 4864 x 896 | 50.1 | 43.2 (S=2) | |
+| 64 x 8960 x 1536 | 101.5 | 110.7 (S=5) | |
+| 64 x 4096 x 4096 | 94.0 | 113.8 (S=4) | |
+| 64 x 11008 x 4096 | 240.1 | 260.1 (S=4) | |
+| 64 x 896 x 9728 | 51.3 | 165.6 (S=7) | |
+
+Nó giúp các layer K dài, N hẹp nhanh hơn 14 đến 23 phần trăm ở 32 hàng, thua K-folding ở 16 hàng, và làm hầu hết layer chậm đi ở 64 hàng. Lý do là những thứ Marlin tránh bằng cách rút gọn ngay trong kernel: một kernel thứ hai cho phép reduce, thêm S lần M x N số thực được ghi rồi đọc lại, và một buffer cấp phát mỗi lần gọi, cũng sẽ phá việc capture CUDA graph (buffer tạm sẽ phải thành tham số của hàm). Sửa những điều đó (rút gọn trong kernel bằng atomic hoặc semaphore, buffer tạm truyền vào) mới là công việc thật của một kernel persistent kiểu Marlin, và trường hợp tốt nhất là 14 đến 23 phần trăm trên các layer chiếm một phần tư thời gian GEMM, tức khoảng 3 đến 5 phần trăm của một bước decode. Tôi dừng ở đó: mã nằm lại trong compiler như một tùy chọn thử nghiệm, có test, mặc định tắt, và chẩn đoán khoảng cách với Marlin ở 64 hàng là kết quả có ích.
+
 ## Các định dạng checkpoint khác
 
 Plugin cũng đọc checkpoint AWQ 4-bit và GPTQ 8-bit (Qwen2.5-0.5B, cùng engine, token/s cộng trên các request, hai lần chạy khớp nhau trong 1 %; mỗi định dạng so với phương pháp Marlin của nó):

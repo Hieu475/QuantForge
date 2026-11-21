@@ -64,6 +64,10 @@ struct VectorizationPass
     IRRewriter rewriter(ctx);
     // Vectorize from innermost ops first to maximize success rate.
     funcOp.walk<WalkOrder::PostOrder>([&](linalg::LinalgOp linalgOp) {
+      // The split-K reduce of the partial results is not a tile of the GEMM: it
+      // stays a linalg.generic and becomes its own (small) GPU kernel.
+      if (linalgOp->hasAttr("quantforge.no_vectorize"))
+        return;
       // Dynamic shapes often need prior tiling/padding; skip to avoid noisy
       // failures.
       if (linalgOp.hasDynamicShape()) {

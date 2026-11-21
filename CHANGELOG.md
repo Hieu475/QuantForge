@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Experimental `split-k=S` pipeline option (`quantforge-tiling{split-k=S}`, `quantforge-gpu-pipeline`): the K reduction cut over a third grid axis with partial results and a reduce kernel. Correct (FileCheck + numerical tests)
+  but off by default: faster only for long-K, narrow-N layers at 32 rows (14-23 %), slower for most shapes at 64 rows, behind K-folding at 16 rows. Results and diagnosis (`ncu`: Marlin uses 20 persistent blocks) in the blog and README.
+
 * 32 / 64-row schedules: 32 / 64-column blocks for N <= 2048 (11-52 % faster at kernel level); `benchmarks/sweep_skinny_blocks.py`. K-fold: the epilogue (sum of the diagonal blocks + bias + f16) is one CUDA kernel
   in the C++ runtime (`kfold_reduce.cu`, op `w4a16_gemm_kfold`), 3 kernels per folded call instead of 5-7. vLLM, QuantForge / Marlin: Qwen2.5-0.5B 0.87-0.96, 1.5B 0.74-0.87 at 1-64 requests.
 * A failed build of the C++ runtime now says why in its warning (it used to be cut to the compiler command).

@@ -196,7 +196,12 @@ struct GPUMappingPass
         gpu::GPUBlockMappingAttr::get(ctx, gpu::MappingId::DimY),
         gpu::GPUBlockMappingAttr::get(ctx, gpu::MappingId::DimX)};
     for (scf::ForallOp blockForall : blockForalls) {
-      blockForall.setMappingAttr(ArrayAttr::get(ctx, blockMapping));
+      SmallVector<Attribute> mapping = blockMapping;
+      if (blockForall.getRank() == 3)          // split-K: (m, n, z) -> (y, x, z)
+        mapping.push_back(gpu::GPUBlockMappingAttr::get(ctx, gpu::MappingId::DimZ));
+      else if (blockForall.getRank() == 1)
+        mapping = {gpu::GPUBlockMappingAttr::get(ctx, gpu::MappingId::DimX)};
+      blockForall.setMappingAttr(ArrayAttr::get(ctx, mapping));
     }
     LLVM_DEBUG(llvm::dbgs()
                << "[GPUMappingPass] annotated " << blockForalls.size()

@@ -22,6 +22,7 @@
 <li><a href="#mot-cai-bay-khi-o">Một cái bẫy khi đo</a></li>
 </ul>
 </li>
+<li><a href="#split-k-trong-compiler-chay-ung-nhung-khong-ang">Split-K trong compiler: chạy đúng, nhưng không đáng</a></li>
 <li><a href="#cac-inh-dang-checkpoint-khac">Các định dạng checkpoint khác</a></li>
 <li><a href="#han-che-cua-plugin">Hạn chế của plugin</a></li>
 </ul>
@@ -289,6 +290,81 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
 <p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request lúc mới đưa vào (khoảng 4 phần trăm bây giờ khi các schedule thường đã tốt hơn) và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Hai cột cuối thêm, trước hết, các schedule mặc định theo độ rộng (các tùy chọn tile của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này; autotune chọn khối 32 / 64 cột và look-ahead ở đó, và tôi biến các kết quả thắng thành quy tắc, <code>benchmarks/sweep_skinny.py</code>), rồi một lượt sweep thứ hai thấy khối 32 và 64 cột nhanh hơn 11 đến 52 % so với khối 128 cột khi N &lt;= 2048 ở 32 và 64 hàng (với đầu ra rộng không ứng viên nào trong 74 cái hơn mặc định quá 4 %, <code>benchmarks/sweep_skinny_blocks.py</code>) và một kernel epilogue gộp cho các layer được fold (3 kernel mỗi lần gọi thay vì 5 đến 7: nhanh hơn 20 đến 35 % mỗi layer, nhưng không thấy trong thời gian cả model, khoảng 1 đến 2 %, vì GPU vốn bận 97 % thời gian). Tổng cộng: model 0.5B đạt 0.87 đến 0.96 Marlin ở 1 đến 64 request, model 1.5B đạt 0.74 đến 0.87; tốc độ tuyệt đối tăng 4 đến 7 % so với cột trước. Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.</p>
 <h3 id="mot-cai-bay-khi-o">Một cái bẫy khi đo<a class="headerlink" href="#mot-cai-bay-khi-o" title="Permanent link">#</a></h3>
 <p>A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa <code>~/.cache/vllm/torch_compile_cache</code> một lần.</p>
+<h2 id="split-k-trong-compiler-chay-ung-nhung-khong-ang">Split-K trong compiler: chạy đúng, nhưng không đáng<a class="headerlink" href="#split-k-trong-compiler-chay-ung-nhung-khong-ang" title="Permanent link">#</a></h2>
+<p>So sánh <code>ncu</code> chỉ ra vấn đề chia tải (Marlin: 20 block cố định), và câu trả lời sách giáo khoa là split-K. Tôi cài nó thành một tùy chọn của pipeline (<code>--quantforge-gpu-pipeline='... split-k=S'</code>, mặc định tắt), và việc cài đặt hóa ra cần ít thay đổi hơn tôi lo, vì MLIR đã có <code>linalg::tileReductionUsingForall</code>:</p>
+<ol>
+<li>pass tiling cắt phép rút gọn K thành S đoạn bằng hàm đó: một <code>scf.forall (z)</code> có thân là một GEMM K nhỏ hơn bình thường, ghi vào một tensor kết quả từng phần, và một <code>linalg.generic</code> cộng S kết quả từng phần;</li>
+<li>tiling khối hiện có chạy bên trong, tạo ra một forall lồng trong một forall; một phép biến đổi nhỏ gộp hai cái thành một <code>scf.forall (m, n, z)</code> để phần hạ xuống launch hiện có nhận được lưới 3 chiều;</li>
+<li>phần còn lại của pipeline cần ba sửa, mỗi cái tìm ra bằng cách đọc IR lỗi: việc điền 0 buffer từng phần bị vector hóa thành một <code>vector&lt;16x256x4xf32&gt;</code> phía host (bỏ ở chế độ ghi đè, nơi mỗi block ghi đủ tile của nó); buffer từng phần được bố trí <code>[M, N, S]</code>, làm tile của một block không liên tục và khiến phần hạ xuống Tensor Core không nhận ra nó (giờ là <code>[S, M, N]</code>); và phép reduce phải được loại khỏi vector hóa để trở thành một kernel nhỏ riêng.</li>
+</ol>
+<p>Nó <strong>đúng</strong>: kết quả khớp kernel không chia và tham chiếu dense (sai số tương đối 2e-4 ở mọi cấu hình, ba shape test trong bộ test, 38 trên 38 test FileCheck không đổi). Chỉ số scale và zero-point vẫn đúng khi vòng K bắt đầu ở <code>z * Kc</code> vì dequantisation được gộp qua offset của <code>extract_slice</code>, không qua bộ đếm vòng lặp. <strong>Nó không đáng bật</strong>, đo bằng thời gian thiết bị của tất cả kernel của nó (RTX 4050, schedule mặc định của op):</p>
+<table>
+<thead>
+<tr>
+<th>shape (hàng x K x N)</th>
+<th style="text-align: right;">không chia</th>
+<th style="text-align: right;">split-K</th>
+<th style="text-align: right;">K-folding (chỉ 16 hàng)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16 x 8960 x 1536</td>
+<td style="text-align: right;">70.3 us</td>
+<td style="text-align: right;">60.0 (S=5)</td>
+<td style="text-align: right;">46.0</td>
+</tr>
+<tr>
+<td>16 x 4864 x 896</td>
+<td style="text-align: right;">28.3</td>
+<td style="text-align: right;">26.6 (S=2)</td>
+<td style="text-align: right;">18.2</td>
+</tr>
+<tr>
+<td>32 x 8960 x 1536</td>
+<td style="text-align: right;">86.5</td>
+<td style="text-align: right;">66.2 (S=5)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>32 x 4864 x 896</td>
+<td style="text-align: right;">36.9</td>
+<td style="text-align: right;">28.7 (S=2)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 4864 x 896</td>
+<td style="text-align: right;">50.1</td>
+<td style="text-align: right;">43.2 (S=2)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 8960 x 1536</td>
+<td style="text-align: right;">101.5</td>
+<td style="text-align: right;">110.7 (S=5)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 4096 x 4096</td>
+<td style="text-align: right;">94.0</td>
+<td style="text-align: right;">113.8 (S=4)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 11008 x 4096</td>
+<td style="text-align: right;">240.1</td>
+<td style="text-align: right;">260.1 (S=4)</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>64 x 896 x 9728</td>
+<td style="text-align: right;">51.3</td>
+<td style="text-align: right;">165.6 (S=7)</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Nó giúp các layer K dài, N hẹp nhanh hơn 14 đến 23 phần trăm ở 32 hàng, thua K-folding ở 16 hàng, và làm hầu hết layer chậm đi ở 64 hàng. Lý do là những thứ Marlin tránh bằng cách rút gọn ngay trong kernel: một kernel thứ hai cho phép reduce, thêm S lần M x N số thực được ghi rồi đọc lại, và một buffer cấp phát mỗi lần gọi, cũng sẽ phá việc capture CUDA graph (buffer tạm sẽ phải thành tham số của hàm). Sửa những điều đó (rút gọn trong kernel bằng atomic hoặc semaphore, buffer tạm truyền vào) mới là công việc thật của một kernel persistent kiểu Marlin, và trường hợp tốt nhất là 14 đến 23 phần trăm trên các layer chiếm một phần tư thời gian GEMM, tức khoảng 3 đến 5 phần trăm của một bước decode. Tôi dừng ở đó: mã nằm lại trong compiler như một tùy chọn thử nghiệm, có test, mặc định tắt, và chẩn đoán khoảng cách với Marlin ở 64 hàng là kết quả có ích.</p>
 <h2 id="cac-inh-dang-checkpoint-khac">Các định dạng checkpoint khác<a class="headerlink" href="#cac-inh-dang-checkpoint-khac" title="Permanent link">#</a></h2>
 <p>Plugin cũng đọc checkpoint AWQ 4-bit và GPTQ 8-bit (Qwen2.5-0.5B, cùng engine, token/s cộng trên các request, hai lần chạy khớp nhau trong 1 %; mỗi định dạng so với phương pháp Marlin của nó):</p>
 <table>

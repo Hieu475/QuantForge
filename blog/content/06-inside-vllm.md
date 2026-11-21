@@ -88,6 +88,30 @@ Folding gained 9 percent (0.5B) and 15 percent (1.5B) for one to four requests w
 
 My first A/B showed no difference at all (241 against 240 tokens per second, four interleaved runs each), and a profile of the same decode with the compile cache switched off showed 4.16 against 3.81 milliseconds per token. The reason: vLLM caches its compiled graphs on disk under a hash of its configuration that knows nothing about a plugin, so a graph compiled earlier, with the plain path, was silently reused, and the fold path never ran. The same mechanism could have produced wrong results (a cached graph with a fold factor baked in as a constant, used with weights folded differently). The plugin now makes every layer call the same op and reads the factor from the tensor shapes at run time, so a stale graph is merely slow, never wrong; after upgrading the plugin, clear `~/.cache/vllm/torch_compile_cache` once.
 
+## Split-K in the compiler: it works, and it does not pay
+
+The `ncu` comparison pointed at work balance (Marlin: 20 persistent blocks), and the textbook answer is split-K. I implemented it as a pipeline option (`--quantforge-gpu-pipeline='... split-k=S'`, off by default), and the implementation turned out to need fewer changes than I feared, because MLIR already has `linalg::tileReductionUsingForall`:
+
+1. the tiling pass cuts the K reduction into S chunks with that helper: a `scf.forall (z)` whose body is an ordinary smaller-K GEMM, writing into a partial-result tensor, and a `linalg.generic` that adds the S partial results;
+2. the existing block tiling runs inside it, producing a forall nested in a forall; a small rewrite merges the two into one `scf.forall (m, n, z)` so that the existing launch lowering gets a 3-D grid;
+3. the rest of the pipeline needed three fixes, each found by reading the failing IR: the zero-fill of the partial buffer was vectorised into a host-side `vector<16x256x4xf32>` (dropped in overwrite mode, where every block writes its whole tile); the partial buffer was laid out `[M, N, S]`, which makes a block's tile non-contiguous and stops the Tensor Core lowering from recognising it (it is `[S, M, N]` now); and the reduce had to be excluded from vectorisation so that it becomes its own small kernel.
+
+It is **correct**: the result matches the unsplit kernel and the dense reference (relative error 2e-4 in every configuration, three test shapes in the suite, 38 of 38 FileCheck tests unchanged). The scale and zero-point indexing survives a K loop that starts at `z * Kc` because the dequantisation is fused through `extract_slice` offsets, not through loop counters. **It is not worth turning on**, measured as device time of all its kernels (RTX 4050, the op's default schedule):
+
+| shape (rows x K x N) | unsplit | split-K | K-folding (16 rows only) |
+|---|--:|--:|--:|
+| 16 x 8960 x 1536 | 70.3 us | 60.0 (S=5) | 46.0 |
+| 16 x 4864 x 896 | 28.3 | 26.6 (S=2) | 18.2 |
+| 32 x 8960 x 1536 | 86.5 | 66.2 (S=5) | |
+| 32 x 4864 x 896 | 36.9 | 28.7 (S=2) | |
+| 64 x 4864 x 896 | 50.1 | 43.2 (S=2) | |
+| 64 x 8960 x 1536 | 101.5 | 110.7 (S=5) | |
+| 64 x 4096 x 4096 | 94.0 | 113.8 (S=4) | |
+| 64 x 11008 x 4096 | 240.1 | 260.1 (S=4) | |
+| 64 x 896 x 9728 | 51.3 | 165.6 (S=7) | |
+
+It helps the long-K, narrow-N layers by 14 to 23 percent at 32 rows, loses to K-folding at 16 rows, and makes most layers slower at 64 rows. The reasons are the ones Marlin avoids by reducing inside the kernel: a second kernel for the reduce, S times M x N extra floats written and read back, and a buffer allocated per call, which would also break CUDA-graph capture (the scratch would have to become a function argument). Fixing those (an in-kernel reduction with atomics or a semaphore, scratch passed in) is the real work of a Marlin-style persistent kernel, and the best case is the 14 to 23 percent on the layers that make up a quarter of the GEMM time, so roughly 3 to 5 percent of a decode step. I stopped there: the code stays in the compiler as an experimental, tested, default-off option, and the diagnosis of the gap to Marlin at 64 rows is the useful result.
+
 ## Other checkpoint formats
 
 The plugin also reads AWQ 4-bit and GPTQ 8-bit checkpoints (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):
