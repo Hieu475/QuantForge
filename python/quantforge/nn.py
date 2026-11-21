@@ -30,9 +30,10 @@ import torch.nn as nn
 from . import quant
 from . import torch_ops as _ops
 
-__all__ = ["QuantLinear", "FP8W8A8Linear", "quantize_model", "load_quantized_checkpoint", "enable_kfold", "FORMATS"]
+__all__ = ["QuantLinear", "FP8W8A8Linear", "INT8W8A8Linear", "quantize_model", "load_quantized_checkpoint", "enable_kfold", "FORMATS"]
 
 FORMATS = ("int4", "int8", "fp8")
+INT8_W8A8_FORMAT = "int8_w8a8"   # INT8 weights *and* activations on the INT8 tensor cores (cuBLASLt), see INT8W8A8Linear
 W8A8_FORMAT = "fp8_w8a8"      # FP8 weights *and* activations on the Ada / Hopper FP8 tensor cores (cuBLASLt), see FP8W8A8Linear
 
 
@@ -249,6 +250,59 @@ class FP8W8A8Linear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, fmt=fp8_w8a8"
 
 
+@_maybe_compile
+def _int8_quantize_tokens(x2):
+    s = (x2.abs().amax(dim=1, keepdim=True).float() / 127.0).clamp(min=1e-8)                 # per-token scale
+    return (x2.float() / s).round().clamp(-127, 127).to(torch.int8), s
+
+
+class INT8W8A8Linear(nn.Module):
+    """INT8 weights (per-output-channel scale) **and** activations (dynamic per-token scale) on the INT8 tensor cores:
+    ``y = (quant(x) @ W8^T) * s_x * s_w + bias``, the product through ``torch._int_mm`` (cuBLASLt, int32 result).
+
+    On an RTX 4050 the INT8 ``mma`` runs at 2.0x the fp16 one (88 against 44 TOPS, ``benchmarks/mma_peak.cu``) and cuBLASLt reaches 80-83
+    TOPS against 37-38 TFLOP/s for fp16 *when B is column-major* (``weight.t()`` of the row-major ``[out, in]`` weight is exactly that;
+    a row-major B falls onto a path at 24 TOPS). ``_int_mm`` needs more than 16 rows, so calls with fewer rows use a dequantised fp16
+    matmul (slow, correct): this is a prefill / large-batch format. Quality: plain per-token / per-channel INT8 without smoothing, see the blog."""
+
+    def __init__(self, w8_nk, w_scale, bias):
+        super().__init__()
+        self.in_features, self.out_features = w8_nk.shape[1], w8_nk.shape[0]
+        self.register_buffer("weight", w8_nk)                      # int8 [out, in]
+        self.register_buffer("w_scale", w_scale)                   # f16 [out]
+        self.register_buffer("bias", bias)
+
+    @classmethod
+    @torch.no_grad()
+    def from_linear(cls, lin: nn.Linear, device="cuda") -> "INT8W8A8Linear":
+        w = lin.weight.data.to(device, torch.float32)
+        scale = (w.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
+        w8 = (w / scale[:, None]).round().clamp(-127, 127).to(torch.int8).contiguous()
+        bias = None if lin.bias is None else lin.bias.data.to(device, torch.float16)
+        if lin.in_features % 8 or lin.out_features % 8:
+            raise ValueError("int8_w8a8 needs in_features and out_features that are multiples of 8")
+        return cls(w8, scale.half(), bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        dt = torch.float16 if x.dtype == torch.float32 else x.dtype
+        if x2.shape[0] <= 16:                                      # _int_mm needs > 16 rows
+            y = x2.to(torch.float16) @ self.dequantized_weight().t()
+            y = y if self.bias is None else y + self.bias
+            return y.to(dt).reshape(*shape[:-1], self.out_features)
+        xq, s_x = _int8_quantize_tokens(x2)
+        y = torch._int_mm(xq, self.weight.t())                     # column-major B: the fast cuBLASLt path
+        y = _fp8_epilogue(y, s_x, self.w_scale, self.bias, dt)
+        return y.reshape(*shape[:-1], self.out_features)
+
+    def dequantized_weight(self) -> torch.Tensor:
+        return (self.weight.float() * self.w_scale.float()[:, None]).half()
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, fmt=int8_w8a8"
+
+
 # --------------------------------------------------------------------------- fusion
 class _QuantQKV(nn.Module):
     """q / k / v projections of one attention block as ONE GEMM. The attention calls ``q_proj(x)``,
@@ -392,8 +446,8 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
 
     Returns ``{"quantized": n, "skipped": [names], "bytes_before": b, "bytes_after": b, "fused_qkv": n,
     "fused_mlp": n}``."""
-    if fmt not in FORMATS + (W8A8_FORMAT,):
-        raise ValueError(f"fmt must be one of {FORMATS + (W8A8_FORMAT,)}")
+    if fmt not in FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT):
+        raise ValueError(f"fmt must be one of {FORMATS + (W8A8_FORMAT, INT8_W8A8_FORMAT)}")
     skip, only = tuple(skip), None if only is None else tuple(only)
     stats = {"quantized": 0, "skipped": [], "bytes_before": 0, "bytes_after": 0}
     targets = []
@@ -409,7 +463,9 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             targets.append((mod, cname, child, full))
     for mod, cname, lin, full in targets:
         try:
-            if fmt == W8A8_FORMAT:
+            if fmt == INT8_W8A8_FORMAT:
+                ql = INT8W8A8Linear.from_linear(lin, device)
+            elif fmt == W8A8_FORMAT:
                 ql = FP8W8A8Linear.from_linear(lin, device, per_token=w8a8_per_token)
             else:
                 ql = QuantLinear.from_linear(lin, fmt, group_size, device)
@@ -419,11 +475,11 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
             continue
         stats["bytes_before"] += lin.weight.numel() * lin.weight.element_size()
         stats["bytes_after"] += sum(b.numel() * b.element_size() for b in (
-            (ql.weight, ql.w_scale) if fmt == W8A8_FORMAT else (ql.packed, ql.scale, ql.zero)))
+            (ql.weight, ql.w_scale) if fmt in (W8A8_FORMAT, INT8_W8A8_FORMAT) else (ql.packed, ql.scale, ql.zero)))
         setattr(mod, cname, ql)
         stats["quantized"] += 1
         if verbose:
-            print(f"  {full}: {tuple(lin.weight.shape)} -> {ql.fmt} g{ql.group_size}")
+            print(f"  {full}: {tuple(lin.weight.shape)} -> {getattr(ql, 'fmt', fmt)}")
         del lin
         if stats["quantized"] % 16 == 0:
             gc.collect()

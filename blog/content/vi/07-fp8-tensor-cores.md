@@ -54,3 +54,24 @@ Không có mức tăng. Theo từng layer bức tranh thất thường: với đ
 ## Cần gì để làm được
 
 Một mức tăng tốc thật cần gộp việc lượng tử hóa activation vào nơi sinh ra activation (hoặc vào phần mở đầu của GEMM) và gộp epilogue scale vào lệnh store của GEMM, đúng loại gộp mà compiler này làm cho dequantisation và hàm kích hoạt. Nó cần lệnh `mma` FP8, mảnh còn thiếu trong toolchain này. Cho đến lúc đó layer này hữu ích vì **bộ nhớ** (một nửa số byte weight của fp16) và chất lượng, và làm baseline cho một đường compiler tương lai, không phải vì tốc độ. Với decode batch 1, kernel INT4 vẫn tốt hơn nhiều: weight FP8 gấp đôi số byte của INT4.
+
+## Cập nhật: tensor core INT8 cho được gì (2026-11-21)
+
+Câu hỏi tự nhiên sau kết quả FP8 là liệu compiler, vốn *có thể* phát lệnh `mma` INT8 (LLVM 18 có lệnh này, chỉ thiếu lệnh FP8), có làm tốt hơn không. Ba phép đo.
+
+**1. Phần cứng.** Một microbenchmark chỉ dùng thanh ghi cho các lệnh `mma.sync` (`benchmarks/mma_peak.cu`, 16 warp mỗi SM, không có lưu lượng bộ nhớ), RTX 4050:
+
+| lệnh | đỉnh | so với fp16 / tích lũy fp32 |
+|---|--:|--:|
+| vào fp16, tích lũy fp32 (`m16n8k16`) | 44.1 TFLOP/s | 1.00x |
+| vào fp16, tích lũy fp16 | 48.1 | 1.09x |
+| **vào int8, tích lũy int32 (`m16n8k32`)** | **88.2 TOPS** | **2.00x** |
+| vào fp8 e4m3, tích lũy fp32 | 96.2 | 2.18x |
+
+cuBLAS fp16 đạt 37 đến 38 trên 44 (85 phần trăm). INT8 là đúng gấp đôi, và là một lệnh mà compiler này đã có thể nhắm tới.
+
+**2. Thư viện.** `torch._int_mm` ban đầu cho 22 đến 24 TOPS, *chậm hơn* fp16, trông như ngõ cụt. Đó là hiệu ứng bố cục: với B theo cột (`weight.t()` của weight `[out, in]` theo hàng đúng là như vậy) cuBLASLt đạt **80 đến 83 TOPS, gấp 2.1 đến 2.2 lần fp16**; với B theo hàng nó âm thầm đi vào đường chậm. Một lời nhắc rằng con số của thư viện là nói về một đường đi, không phải về phần cứng.
+
+**3. Layer và cả model.** `INT8W8A8Linear` (scale theo kênh cho weight, scale động theo token cho activation, cuBLASLt cho phép nhân) cư xử y như layer FP8: 1.44x fp16 với layer 2048 x 4096 x 4096, 0.74 đến 0.96x với các layer nhỏ của model 0.5B, vì lượng tử hóa activation và epilogue scale tốn khoảng 0.4 ms quanh một GEMM 0.86 ms. Prefill cả model 2048 token: Qwen2.5-0.5B 95.8 ms so với 86.3 ms ở fp16 (0.90x), Llama-3.2-1B 166.6 so với 178.5 ms (1.07x). Chất lượng chấp nhận được và ngang FP8: perplexity wikitext-2 19.20 so với 18.79 (+0.41) và 18.23 so với 17.91 (+0.33).
+
+Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư viện, và bị mất ở các bước quanh nó. Đó là lý lẽ cho một kernel INT8 **do compiler sinh** với epilogue (scale hàng, scale cột, bias, lưu f16) gộp vào lệnh store, và lượng tử hóa activation gộp vào nơi sinh ra activation; khi gộp cả hai, phép tính ở trên gợi ý khoảng 1.0 ms thay vì 1.29 ms cho layer rộng 4096, tức 1.8x fp16, và một biến thể W4A8 (weight int4 nới sang int8, scale nhóm áp lên tổng riêng int32) cũng sẽ giảm một nửa công việc dequantisation của kernel W4A16 hiện tại. Chưa cái nào được xây; đó là cách hứa hẹn nhất để thắng cuBLAS ở chế độ bị giới hạn bởi tính toán, với độ chính xác (smoothing / xoay cho W4A8) là rủi ro chính.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* `INT8W8A8Linear` / `quantize_model(fmt="int8_w8a8")` (cuBLASLt `_int_mm`) and `benchmarks/mma_peak.cu`: INT8 `mma` is 2.00x fp16 in hardware (88.2 vs 44.1 TOPS), 80-83 TOPS through cuBLASLt with a column-major B, but 0.90-1.07x of fp16
+  for whole-model prefill; perplexity +0.33..0.41. Corrected the FP8 vs fp16 GEMM ratio to 1.9-2.1x (the fp16 baseline had been measured before the GPU reached its sustained clocks).
+
 * Experimental `split-k=S` pipeline option (`quantforge-tiling{split-k=S}`, `quantforge-gpu-pipeline`): the K reduction cut over a third grid axis with partial results and a reduce kernel. Correct (FileCheck + numerical tests)
   but off by default: faster only for long-K, narrow-N layers at 32 rows (14-23 %), slower for most shapes at 64 rows, behind K-folding at 16 rows. Results and diagnosis (`ncu`: Marlin uses 20 persistent blocks) in the blog and README.
 

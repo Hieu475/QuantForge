@@ -54,3 +54,24 @@ No gain. Per layer the picture is erratic: for a 2048-token input, the FP8 layer
 ## What it would take
 
 A real speed-up needs the activation quantisation fused into the producer of the activations (or into the GEMM prologue) and the scale epilogue fused into the GEMM store, which is exactly the kind of fusion this compiler does for dequantisation and activation functions. It needs the FP8 `mma` instruction, which is the missing piece in this toolchain. Until then the layer is useful for its **memory** (half the weight bytes of fp16) and its quality, and as a baseline for a future compiler path, not for speed. For batch-1 decode the INT4 kernels remain far better: FP8 weights are twice the bytes of INT4.
+
+## Update: what the INT8 tensor cores give (2026-11-21)
+
+The natural question after the FP8 result is whether the compiler, which *can* emit INT8 `mma` (LLVM 18 has the instruction; it lacks only the FP8 one), could do better. Three measurements.
+
+**1. The hardware.** A register-only microbenchmark of the `mma.sync` instructions (`benchmarks/mma_peak.cu`, 16 warps per SM, no memory traffic), RTX 4050:
+
+| instruction | peak | vs fp16 / fp32 accumulate |
+|---|--:|--:|
+| fp16 in, fp32 accumulate (`m16n8k16`) | 44.1 TFLOP/s | 1.00x |
+| fp16 in, fp16 accumulate | 48.1 | 1.09x |
+| **int8 in, int32 accumulate (`m16n8k32`)** | **88.2 TOPS** | **2.00x** |
+| fp8 e4m3 in, fp32 accumulate | 96.2 | 2.18x |
+
+cuBLAS fp16 reaches 37 to 38 of the 44 (85 percent). INT8 is a clean 2x, and it is an instruction this compiler can already target.
+
+**2. The library.** `torch._int_mm` first gave 22 to 24 TOPS, *slower* than fp16, which looked like a dead end. It was a layout effect: with B column-major (`weight.t()` of a row-major `[out, in]` weight is exactly that) cuBLASLt reaches **80 to 83 TOPS, 2.1 to 2.2 times fp16**; with a row-major B it silently takes a slow path. A reminder that a library number is a statement about a path, not about the hardware.
+
+**3. The layer and the model.** `INT8W8A8Linear` (per-channel weight scale, dynamic per-token activation scale, cuBLASLt for the product) behaves exactly like the FP8 layer: 1.44x of fp16 for a 2048 x 4096 x 4096 layer, 0.74 to 0.96x for the small layers of a 0.5B model, because the activation quantisation and the scale epilogue cost about 0.4 ms around a 0.86 ms GEMM. Whole-model prefill of 2048 tokens: Qwen2.5-0.5B 95.8 ms against 86.3 ms in fp16 (0.90x), Llama-3.2-1B 166.6 against 178.5 ms (1.07x). Quality is acceptable and matches FP8: wikitext-2 perplexity 19.20 against 18.79 (+0.41) and 18.23 against 17.91 (+0.33).
+
+So the 2x exists in the instruction and in the library GEMM, and is lost in the passes around it. That is the argument for a **compiler-generated** INT8 kernel with the epilogue (row scale, column scale, bias, f16 store) fused into the store, and the activation quantisation fused into the producer of the activations; with those two fused, the arithmetic above suggests about 1.0 ms instead of 1.29 ms for the 4096-wide layer, 1.8x fp16, and a W4A8 variant (int4 weights widened to int8, group scales applied to the int32 partial sums) would also halve the dequantisation work of the current W4A16 kernels. None of that is built yet; it is the most promising way to beat cuBLAS in the compute-bound regime, with accuracy (smoothing / rotation for W4A8) as its main risk.

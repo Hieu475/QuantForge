@@ -285,3 +285,25 @@ def test_kfold_op_with_bias_matches_the_plain_op_and_uses_the_fused_epilogue():
         x = torch.randn(2, 1536, device="cuda", dtype=torch.float16, generator=g)
         y = kf.linear(x, ql.packed, ql.scale, ql.zero, kf.no_fold(x.device), 128, ql.bias)
         assert (y.float() - ops.w4a16_linear(x, ql.packed, ql.scale, ql.zero, 128, ql.bias).float()).abs().max().item() < 1e-3
+
+
+def test_int8_w8a8_linear_matches_the_quantised_reference_and_handles_few_rows():
+    """INT8 weights + per-token INT8 activations through torch._int_mm (column-major B); fewer than 17 rows use the dequantised path."""
+    _require_gpu()
+    import quantforge.nn as qnn
+
+    g = torch.Generator(device="cuda").manual_seed(7)
+    lin = torch.nn.Linear(512, 384, bias=True).half().cuda()
+    q = qnn.INT8W8A8Linear.from_linear(lin)
+    assert q.weight.dtype == torch.int8 and q.weight.shape == (384, 512)
+    for M in (4, 17, 200):
+        x = torch.randn(M, 512, device="cuda", dtype=torch.float16, generator=g)
+        ref = (x.float() @ q.dequantized_weight().float().t() + lin.bias.float())
+        y = q(x)
+        assert y.dtype == torch.float16 and y.shape == (M, 384)
+        assert (y.float() - ref).norm() / ref.norm() < 0.03, M          # the activation rounding, nothing else
+        dense = lin(x).float()
+        assert (y.float() - dense).norm() / dense.norm() < 0.05, M
+    assert q(torch.randn(2, 3, 512, device="cuda", dtype=torch.float16)).shape == (2, 3, 384)
+    with pytest.raises(ValueError):
+        qnn.INT8W8A8Linear.from_linear(torch.nn.Linear(500, 384).half().cuda())

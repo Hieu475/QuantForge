@@ -20,6 +20,7 @@
 <li><a href="#chat-luong-on">Chất lượng ổn</a></li>
 <li><a href="#toc-o-thi-khong">Tốc độ thì không</a></li>
 <li><a href="#can-gi-e-lam-uoc">Cần gì để làm được</a></li>
+<li><a href="#cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21">Cập nhật: tensor core INT8 cho được gì (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -111,7 +112,45 @@
 <li>Biến thể một scale để cuBLASLt áp scale ngay trong GEMM, bỏ được lượt rescale, nhưng tốc độ của nó phụ thuộc vào shape theo cách tôi không dự đoán được (4864 x 896 chậm gấp ba so với biến thể theo token).</li>
 </ol>
 <h2 id="can-gi-e-lam-uoc">Cần gì để làm được<a class="headerlink" href="#can-gi-e-lam-uoc" title="Permanent link">#</a></h2>
-<p>Một mức tăng tốc thật cần gộp việc lượng tử hóa activation vào nơi sinh ra activation (hoặc vào phần mở đầu của GEMM) và gộp epilogue scale vào lệnh store của GEMM, đúng loại gộp mà compiler này làm cho dequantisation và hàm kích hoạt. Nó cần lệnh <code>mma</code> FP8, mảnh còn thiếu trong toolchain này. Cho đến lúc đó layer này hữu ích vì <strong>bộ nhớ</strong> (một nửa số byte weight của fp16) và chất lượng, và làm baseline cho một đường compiler tương lai, không phải vì tốc độ. Với decode batch 1, kernel INT4 vẫn tốt hơn nhiều: weight FP8 gấp đôi số byte của INT4.</p></article>
+<p>Một mức tăng tốc thật cần gộp việc lượng tử hóa activation vào nơi sinh ra activation (hoặc vào phần mở đầu của GEMM) và gộp epilogue scale vào lệnh store của GEMM, đúng loại gộp mà compiler này làm cho dequantisation và hàm kích hoạt. Nó cần lệnh <code>mma</code> FP8, mảnh còn thiếu trong toolchain này. Cho đến lúc đó layer này hữu ích vì <strong>bộ nhớ</strong> (một nửa số byte weight của fp16) và chất lượng, và làm baseline cho một đường compiler tương lai, không phải vì tốc độ. Với decode batch 1, kernel INT4 vẫn tốt hơn nhiều: weight FP8 gấp đôi số byte của INT4.</p>
+<h2 id="cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21">Cập nhật: tensor core INT8 cho được gì (2026-11-21)<a class="headerlink" href="#cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21" title="Permanent link">#</a></h2>
+<p>Câu hỏi tự nhiên sau kết quả FP8 là liệu compiler, vốn <em>có thể</em> phát lệnh <code>mma</code> INT8 (LLVM 18 có lệnh này, chỉ thiếu lệnh FP8), có làm tốt hơn không. Ba phép đo.</p>
+<p><strong>1. Phần cứng.</strong> Một microbenchmark chỉ dùng thanh ghi cho các lệnh <code>mma.sync</code> (<code>benchmarks/mma_peak.cu</code>, 16 warp mỗi SM, không có lưu lượng bộ nhớ), RTX 4050:</p>
+<table>
+<thead>
+<tr>
+<th>lệnh</th>
+<th style="text-align: right;">đỉnh</th>
+<th style="text-align: right;">so với fp16 / tích lũy fp32</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vào fp16, tích lũy fp32 (<code>m16n8k16</code>)</td>
+<td style="text-align: right;">44.1 TFLOP/s</td>
+<td style="text-align: right;">1.00x</td>
+</tr>
+<tr>
+<td>vào fp16, tích lũy fp16</td>
+<td style="text-align: right;">48.1</td>
+<td style="text-align: right;">1.09x</td>
+</tr>
+<tr>
+<td><strong>vào int8, tích lũy int32 (<code>m16n8k32</code>)</strong></td>
+<td style="text-align: right;"><strong>88.2 TOPS</strong></td>
+<td style="text-align: right;"><strong>2.00x</strong></td>
+</tr>
+<tr>
+<td>vào fp8 e4m3, tích lũy fp32</td>
+<td style="text-align: right;">96.2</td>
+<td style="text-align: right;">2.18x</td>
+</tr>
+</tbody>
+</table>
+<p>cuBLAS fp16 đạt 37 đến 38 trên 44 (85 phần trăm). INT8 là đúng gấp đôi, và là một lệnh mà compiler này đã có thể nhắm tới.</p>
+<p><strong>2. Thư viện.</strong> <code>torch._int_mm</code> ban đầu cho 22 đến 24 TOPS, <em>chậm hơn</em> fp16, trông như ngõ cụt. Đó là hiệu ứng bố cục: với B theo cột (<code>weight.t()</code> của weight <code>[out, in]</code> theo hàng đúng là như vậy) cuBLASLt đạt <strong>80 đến 83 TOPS, gấp 2.1 đến 2.2 lần fp16</strong>; với B theo hàng nó âm thầm đi vào đường chậm. Một lời nhắc rằng con số của thư viện là nói về một đường đi, không phải về phần cứng.</p>
+<p><strong>3. Layer và cả model.</strong> <code>INT8W8A8Linear</code> (scale theo kênh cho weight, scale động theo token cho activation, cuBLASLt cho phép nhân) cư xử y như layer FP8: 1.44x fp16 với layer 2048 x 4096 x 4096, 0.74 đến 0.96x với các layer nhỏ của model 0.5B, vì lượng tử hóa activation và epilogue scale tốn khoảng 0.4 ms quanh một GEMM 0.86 ms. Prefill cả model 2048 token: Qwen2.5-0.5B 95.8 ms so với 86.3 ms ở fp16 (0.90x), Llama-3.2-1B 166.6 so với 178.5 ms (1.07x). Chất lượng chấp nhận được và ngang FP8: perplexity wikitext-2 19.20 so với 18.79 (+0.41) và 18.23 so với 17.91 (+0.33).</p>
+<p>Vậy mức gấp đôi tồn tại trong lệnh và trong GEMM của thư viện, và bị mất ở các bước quanh nó. Đó là lý lẽ cho một kernel INT8 <strong>do compiler sinh</strong> với epilogue (scale hàng, scale cột, bias, lưu f16) gộp vào lệnh store, và lượng tử hóa activation gộp vào nơi sinh ra activation; khi gộp cả hai, phép tính ở trên gợi ý khoảng 1.0 ms thay vì 1.29 ms cho layer rộng 4096, tức 1.8x fp16, và một biến thể W4A8 (weight int4 nới sang int8, scale nhóm áp lên tổng riêng int32) cũng sẽ giảm một nửa công việc dequantisation của kernel W4A16 hiện tại. Chưa cái nào được xây; đó là cách hứa hẹn nhất để thắng cuBLAS ở chế độ bị giới hạn bởi tính toán, với độ chính xác (smoothing / xoay cho W4A8) là rủi ro chính.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>
