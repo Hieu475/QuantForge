@@ -122,7 +122,10 @@ struct FuseEpiloguePass
   /// final stores: every vector<2xi32> accumulator store becomes the dequantised pair, stored to the f16 output; the
   /// elementwise kernel and the int32 buffer disappear. The operands are the function arguments tagged
   /// quantforge.int8_row_scale / int8_col_scale / int8_bias (optional) / int8_out.
-  void runInt8Dequant() {
+  /// f16-store (fMode): the same machinery for a GEMM with an f32 accumulator: y = f16(c + bias[n]) -- the f32 -> f16 conversion (and the bias
+  /// add) of a plain W4A16 GEMM folded into its stores, so that the call is ONE kernel with no f32 buffer. Tags: quantforge.int8_bias
+  /// (f16 or f32, optional) and quantforge.int8_out.
+  void runInt8Dequant(bool fMode = false) {
     func::FuncOp func = getOperation();
     Value sx, sw, bias, out;
     for (unsigned i = 0; i < func.getNumArguments(); ++i) {
@@ -131,8 +134,8 @@ struct FuseEpiloguePass
       if (func.getArgAttr(i, "quantforge.int8_bias")) bias = func.getArgument(i);
       if (func.getArgAttr(i, "quantforge.int8_out")) out = func.getArgument(i);
     }
-    if (!sx || !sw || !out) {
-      func.emitError("epilogue=int8-dequant needs function arguments tagged quantforge.int8_row_scale, "
+    if (!out || (!fMode && (!sx || !sw))) {
+      func.emitError("epilogue=int8-dequant / f16-store needs function arguments tagged quantforge.int8_row_scale, "
                      "quantforge.int8_col_scale and quantforge.int8_out");
       return signalPassFailure();
     }
@@ -140,12 +143,12 @@ struct FuseEpiloguePass
     func.walk([&](gpu::LaunchOp launch) {
       launch.walk([&](vector::StoreOp s) {
         auto vt = dyn_cast<VectorType>(s.getValueToStore().getType());
-        if (!s.getMemRefType().getMemorySpace() && vt && vt.getElementType().isInteger(32))
+        if (!s.getMemRefType().getMemorySpace() && vt && (fMode ? vt.getElementType().isF32() : vt.getElementType().isInteger(32)))
           accStores.push_back(s);
       });
     });
     if (accStores.empty()) {
-      func.emitError("epilogue=int8-dequant found no i32 accumulator stores (needs the Tensor Core path with hoist-acc)");
+      func.emitError("epilogue=int8-dequant / f16-store found no accumulator stores (needs the Tensor Core path with hoist-acc)");
       return signalPassFailure();
     }
     Value cRoot;
@@ -180,16 +183,23 @@ struct FuseEpiloguePass
       cRoot = memref;
       Type f32 = b.getF32Type(), f16 = b.getF16Type();
       Value one = b.create<arith::ConstantIndexOp>(loc, 1);
-      Value rs = b.create<memref::LoadOp>(loc, sx, ValueRange{row});
+      Value rs = fMode ? Value() : b.create<memref::LoadOp>(loc, sx, ValueRange{row});
       Value res = b.create<arith::ConstantOp>(loc, DenseElementsAttr::get(VectorType::get({2}, f16), b.getF16FloatAttr(0.0f)));
       for (int64_t k = 0; k < 2; ++k) {
         Value ck = k ? b.create<arith::AddIOp>(loc, col, one).getResult() : col;
         Value e = b.create<vector::ExtractOp>(loc, st.getValueToStore(), ArrayRef<int64_t>{k});
-        Value f = b.create<arith::SIToFPOp>(loc, f32, e);
-        Value v = b.create<arith::MulFOp>(loc, b.create<arith::MulFOp>(loc, f, rs),
-                                          b.create<memref::LoadOp>(loc, sw, ValueRange{ck}));
-        if (bias)
-          v = b.create<arith::AddFOp>(loc, v, b.create<memref::LoadOp>(loc, bias, ValueRange{ck}));
+        Value v = e;
+        if (!fMode) {
+          Value f = b.create<arith::SIToFPOp>(loc, f32, e);
+          v = b.create<arith::MulFOp>(loc, b.create<arith::MulFOp>(loc, f, rs),
+                                      b.create<memref::LoadOp>(loc, sw, ValueRange{ck}));
+        }
+        if (bias) {
+          Value bv = b.create<memref::LoadOp>(loc, bias, ValueRange{ck});
+          if (!bv.getType().isF32())
+            bv = b.create<arith::ExtFOp>(loc, f32, bv);
+          v = b.create<arith::AddFOp>(loc, v, bv);
+        }
         Value h = b.create<arith::TruncFOp>(loc, f16, v);
         res = b.create<vector::InsertOp>(loc, h, res, ArrayRef<int64_t>{k});
       }
@@ -275,13 +285,15 @@ struct FuseEpiloguePass
   void runOnOperation() override {
     if (kind == "none" || kind.empty())
       return;
-    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu" && kind != "int8-dequant") {
+    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu" && kind != "int8-dequant" && kind != "f16-store") {
       getOperation().emitError("quantforge-fuse-epilogue: unknown kind '")
-          << kind << "' (relu | silu | gelu | swiglu | int8-dequant)";
+          << kind << "' (relu | silu | gelu | swiglu | int8-dequant | f16-store)";
       return signalPassFailure();
     }
     if (kind == "int8-dequant")
       return runInt8Dequant();
+    if (kind == "f16-store")
+      return runInt8Dequant(true);
     SmallVector<Operation *> stores;
     getOperation().walk([&](gpu::LaunchOp launch) {
       launch.walk([&](Operation *op) {

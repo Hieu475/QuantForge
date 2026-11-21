@@ -145,6 +145,15 @@ K-folding không thay đổi gì cho model 3B (71 token/s có và không có): c
 trên card 6 GB (vLLM báo -0.32 GiB cho KV cache): op cấp một accumulator f32 cho toàn bộ số hàng của một lần gọi, và lượt profile của vLLM gửi 8192 token, tức 720 MB cho layer gate/up rộng 22016.
 Op giờ xử lý đầu vào dài theo khối 2048 hàng ghi thẳng vào kết quả f16 (bộ nhớ tạm bị chặn, KV cache +0.1 GiB so với +0.24 của Marlin).
 
+## Cập nhật: khoảng cách decode với Marlin đã trốn ở đâu (2026-11-22)
+
+Khoảng cách decode còn lại (0.85 đến 0.9 của Marlin) không giống một vấn đề của kernel: theo từng lớp, các kernel nằm trong khoảng 0.88 đến 1.03 của Marlin, trừ `down_proj` trước khi K-fold. Bản tóm tắt `nsys` của cùng phép decode 128 token trong vLLM cho thấy điểm khác biệt: **33 313 kernel `float16_copy`** trong lần chạy QuantForge, mỗi cái 4 micro giây, mà Marlin không phát. Đếm kernel mỗi lần gọi op đã chốt vấn đề: một lần gọi decode thường gồm một bản sao đệm activation lên 16 hàng, GEMM vào bộ đệm f32, và một phép chuyển sang f16; có bias (q, k và v của Qwen) thì thêm hai kernel nhỏ để mở rộng nó vào accumulator, tổng cộng năm, so với một của Marlin. Với lớp qkv rộng 1152 ở một hàng, đó là 10.7 micro giây so với 6.4 của Marlin, trong đó GEMM chỉ 5.6.
+
+Hai bước. Thứ nhất, một kernel fused sẵn có (epilogue của K-fold, với S = 1) cộng bias và ghi f16, đưa các lớp có bias từ năm kernel xuống ba. Rồi cách sửa đúng trong compiler: `epilogue=f16-store`, bộ máy của `int8-dequant` ở Cập nhật 3 (viết lại các lệnh lưu accumulator của GEMM thành các lệnh lưu f16 4 byte đã chuyển đổi và cộng bias, rồi xóa kernel elementwise và bộ đệm) áp dụng cho accumulator f32. Khi đó một GEMM thường là hai kernel, bản sao đệm và GEMM: qkv ở một hàng **từ 10.7 xuống 6.5 micro giây**, ngang 6.4 của Marlin; lớp gate / up từ 23.1 xuống 21.0 (Marlin 27.3). Nó cũng bỏ bộ đệm f32 khỏi prefill. Thay đổi đầu tiên làm một test fail có chủ đích: nó đòi hai cách (bắt đầu accumulator từ bias hay cộng bias sau) bằng nhau từng bit, hai thứ tự cộng f32 chỉ khớp tới một ulp f16; tôi nới nó thành dung sai cho trường hợp đó và giữ bằng nhau chính xác cho các activation.
+
+vLLM 0.25.1, cùng checkpoint, token decode mỗi giây ở 1 / 4 / 16 / 64 request (QuantForge so với Marlin, xen kẽ trong một phiên): Qwen2.5-0.5B 286 / 1091 / 3974 / 10191 so với 303 / 1168 / 4333 / 11665, **0.94 / 0.93 / 0.92 / 0.87**; Qwen2.5-1.5B 128 / 461 / 1771 / 4711 so với 140 / 548 / 2070 / 5814, **0.91 / 0.84 / 0.86 / 0.81** (trước là 0.74 đến 0.87). Prefill của plugin tăng từ 20.6k lên 28.0k token mỗi giây ở 0.5B (Marlin 33.7k). Phương thức W4A8 thừa hưởng toàn bộ ở chế độ hai layout: decode 285 / 3988 ở 1 / 16 request trên 0.5B (0.94 / 0.93 của Marlin) với prefill 1.09x Marlin; chế độ một bản sao, dùng kernel decode riêng, cũng dùng epilogue mới (264 / 3952) và ở mức 0.87 / 0.92.
+
+
 ## Hạn chế của plugin
 
 GPTQ 4-bit và 8-bit và AWQ 4-bit có zero point; không có layer MoE; AWQ không có zero point bị từ chối. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.

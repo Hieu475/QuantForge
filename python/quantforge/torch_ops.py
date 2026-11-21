@@ -73,6 +73,7 @@ def set_autotune(enabled: bool = True) -> None:
 def clear_cache() -> None:
     with _lock:
         _kernels.clear()
+        _kernels_f16.clear()
     if _cpp is not None:
         _cpp.clear_kernels()
 
@@ -164,6 +165,41 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
     return k
 
 
+class _NoKernel:
+    """Stands for a shape the f16-store kernel cannot serve (K or N not a multiple of its tile, autotune on): the C++ op then uses the f32 path."""
+
+    _fn = _set_stream = None
+
+    def __init__(self, Mp, Kp, Np):
+        self.Mp, self.Kp, self.Np = Mp, Kp, Np
+
+
+_kernels_f16: dict = {}
+
+
+def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
+    """The W4A16 kernel with the f16-store epilogue for M rows (decode / skinny / prefill buckets), INT4 group-wise weights."""
+    from .e2e import W4A16GemmF16, padded_shape
+
+    Mb = bucket_rows(M)
+    key = (Mb, K, N, group_size, has_bias)
+    k = _kernels_f16.get(key)
+    if k is not None:
+        return k
+    with _lock:
+        k = _kernels_f16.get(key)
+        if k is None:
+            opts = default_opts(Mb, K, N)
+            Mp, Kp, Np = padded_shape(Mb, K, N, group_size, opts)
+            if _autotune or (Kp, Np) != (K, N) or os.environ.get("QUANTFORGE_NO_F16STORE"):
+                k = _NoKernel(Mp, Kp, Np)
+            else:
+                k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts)
+                k.Mp, k.Kp, k.Np = Mp, K, N
+            _kernels_f16[key] = k
+    return k
+
+
 def _python_impl(
     x: torch.Tensor,
     packed: torch.Tensor,
@@ -229,8 +265,11 @@ def _load_cpp_runtime():
                                  extra_include_paths=[f"{cuda}/include"], verbose=False)
 
         def builder(M, K, N, group_size, device_index, activation, overwrite, kind):
+            addr = lambda f: (ctypes.cast(f, ctypes.c_void_p).value or 0) if f is not None else 0  # noqa: E731
+            if activation in ("f16s", "f16sb"):               # the f16-store kernel (W4A16GemmF16)
+                k = _kernel_f16(M, K, N, group_size, activation == "f16sb")
+                return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
             k = _kernel(M, K, N, group_size, device_index, activation, overwrite, kind)
-            addr = lambda f: ctypes.cast(f, ctypes.c_void_p).value  # noqa: E731
             return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
 
         ext.set_python_hooks(builder, _python_impl)

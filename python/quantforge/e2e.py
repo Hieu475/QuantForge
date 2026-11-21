@@ -764,25 +764,55 @@ class W4A8DecodeGemm:
 
     NAME = "w4a8_decode"
 
-    def __init__(self, M: int, K: int, N: int, compiled: Compiled):
-        self.M, self.K, self.N = M, K, N
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled, has_bias: bool = False, f16_out: bool = False):
+        self.M, self.K, self.N, self.has_bias, self.f16_out = M, K, N, has_bias, f16_out
         self.compiled = compiled
         self._lib = ctypes.CDLL(str(compiled.lib_path))
         self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
-        self._fn.argtypes = [ctypes.c_void_p] * 6
+        self._fn.argtypes = [ctypes.c_void_p] * (6 + (1 if has_bias else 0))
         self._fn.restype = None
         self._set_stream = self._lib.mgpuSetStream
         self._set_stream.argtypes = [ctypes.c_void_p]
         self._result = _descriptor_type(2)()
 
     @classmethod
-    def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS) -> "W4A8DecodeGemm":
+    def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS,
+              f16_out: bool = False, bias: bool = False) -> "W4A8DecodeGemm":
+        """`f16_out=True`: the kernel writes f16 itself (``epilogue=f16-store``, with an optional f16 `bias`): one kernel, ``launch(a, bp, zp, sc,
+        bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``."""
         G = W4A8_GROUP
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
+        if f16_out:
+            extra_arg = (f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else "") + f"%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}"
+            ret = f"tensor<{M}x{N}xf16>"
+            b_in, b_ty, b_map, b_blk = (", %bias", f", tensor<{N}xf16>", ", #mn", ", %b: f16") if bias else ("", "", "", "")
+            b_ext = "%bf = arith.extf %b : f16 to f32\n      %v = arith.addf %ci, %bf : f32" if bias else "%v = arith.addf %ci, %ci : f32"
+            if not bias:
+                b_ext = "%v = arith.addf %ci, %zero : f32"
+            tail = f"""  %e = tensor.empty() : tensor<{M}x{N}xf32>
+  %cc = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xf16>, tensor<{N}x{K}xf16>) outs(%e : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  %r = linalg.generic {{indexing_maps = [#mmn{b_map}, #mmn], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      ins(%cc{b_in} : tensor<{M}x{N}xf32>{b_ty}) outs(%y : tensor<{M}x{N}xf16>) {{
+    ^bb0(%ci: f32{b_blk}, %o: f16):
+      %zero = arith.constant 0.0 : f32
+      {b_ext}
+      %h = arith.truncf %v : f32 to f16
+      linalg.yield %h : f16
+  }} -> tensor<{M}x{N}xf16>
+  return %r : tensor<{M}x{N}xf16>
+}}"""
+        else:
+            extra_arg = f"%c: tensor<{M}x{N}xf32>"
+            ret = f"tensor<{M}x{N}xf32>"
+            tail = f"""  %r = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xf16>, tensor<{N}x{K}xf16>) outs(%c : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  return %r : tensor<{M}x{N}xf32>
+}}"""
         ir = f"""#nk = affine_map<(n, k) -> (n, k)>
+#mmn = affine_map<(m, n) -> (m, n)>
+#mn = affine_map<(m, n) -> (n)>
 func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp: tensor<{N}x{K // G}xi8>, %sc: tensor<{N}x{K // G}xf16>,
-                      %c: tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32> {{
+                      {extra_arg}) -> {ret} {{
   %c0 = arith.constant 0 : index
   %i2 = arith.constant 2 : index
   %i4 = arith.constant 4 : index
@@ -818,21 +848,81 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp
       %w = arith.mulf %vf, %s : f16
       linalg.yield %w : f16
   }} -> tensor<{N}x{K}xf16>
-  %r = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xf16>, tensor<{N}x{K}xf16>) outs(%c : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
-  return %r : tensor<{M}x{N}xf32>
+{tail}
+"""
+        import tempfile
+
+        opts = (pipeline_opts + " epilogue=f16-store") if f16_out else pipeline_opts
+        with tempfile.TemporaryDirectory() as tmp:
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=opts), bias, f16_out)
+
+    def launch(self, a, bp, zp, sc, out, bias=None) -> None:
+        """f32 mode: ``out`` f32 ``[M, N]`` is overwritten; f16 mode: ``out`` f16 ``[M, N]`` and `bias` f16 ``[N]`` (when built with one). ``a`` f16 ``[M, K]``."""
+        import torch
+
+        tensors = [a, bp, zp, sc] + ([bias] if self.has_bias else []) + [out]
+        d = [_descriptor(t) for t in tensors]
+        self._set_stream(_current_raw_stream(torch, a.device.index or 0))
+        self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
+
+
+class W4A16GemmF16:
+    """W4A16 GEMM whose result is written as f16 by the kernel itself (``epilogue=f16-store``): ``y[f16] = f16(A @ dequant(W) + bias[n])``
+    in ONE kernel, no f32 buffer and no conversion / bias kernel afterwards. INT4 group-wise weights ``packed [K, N/2]``, ``scale f16 [K/G, N]``,
+    ``zero int8 [K/G, N]``; the activations must have exactly the compiled row count (the caller pads, as for ``W4A16Gemm``)."""
+
+    NAME = "w4a16_gemm_f16"
+
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled, has_bias: bool):
+        self.M, self.K, self.N, self.has_bias = M, K, N, has_bias
+        self.compiled = compiled
+        self._lib = ctypes.CDLL(str(compiled.lib_path))
+        self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
+        self._fn.argtypes = [ctypes.c_void_p] * (1 + (6 if has_bias else 5))
+        self._fn.restype = None
+        self._set_stream = self._lib.mgpuSetStream
+        self._set_stream.argtypes = [ctypes.c_void_p]
+        self._result = _descriptor_type(2)()
+
+    @classmethod
+    def build(cls, M: int, K: int, N: int, group_size: int = 128, bias: bool = False, workdir=None, chip: str = "sm_80",
+              pipeline_opts: str = "") -> "W4A16GemmF16":
+        _check_shape(M, K, N, tile_sizes(pipeline_opts))
+        G = group_size
+        b_arg = f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else ""
+        b_in, b_ty, b_map, b_blk = (", %bias", f", tensor<{N}xf16>", ", #mn", ", %b: f16") if bias else ("", "", "", "")
+        b_add = "%v = arith.addf %ci, %bf : f32" if bias else "%v = arith.addf %ci, %zero : f32"
+        b_ext = "%bf = arith.extf %b : f16 to f32\n      " if bias else "%zero = arith.constant 0.0 : f32\n      "
+        ir = f"""#mmn = affine_map<(m, n) -> (m, n)>
+#mn = affine_map<(m, n) -> (n)>
+func.func @{cls.NAME}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %scale: tensor<{K // G}x{N}xf16>, %zp: tensor<{K // G}x{N}xi8>,
+                      {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
+  %w = qf.unpack %wp : tensor<{K}x{N // 2}xi8> -> tensor<{K}x{N}xi8>
+  %wf = qf.dequant %w, %scale, %zp : tensor<{K}x{N}xi8>, tensor<{K // G}x{N}xf16>, tensor<{K // G}x{N}xi8> -> tensor<{K}x{N}xf16>
+  %e = tensor.empty() : tensor<{M}x{N}xf32>
+  %c = linalg.matmul ins(%act, %wf : tensor<{M}x{K}xf16>, tensor<{K}x{N}xf16>) outs(%e : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  %r = linalg.generic {{indexing_maps = [#mmn{b_map}, #mmn], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      ins(%c{b_in} : tensor<{M}x{N}xf32>{b_ty}) outs(%y : tensor<{M}x{N}xf16>) {{
+    ^bb0(%ci: f32{b_blk}, %o: f16):
+      {b_ext}{b_add}
+      %h = arith.truncf %v : f32 to f16
+      linalg.yield %h : f16
+  }} -> tensor<{M}x{N}xf16>
+  return %r : tensor<{M}x{N}xf16>
 }}
 """
         import tempfile
 
+        opts = f"{pipeline_opts} epilogue=f16-store".strip()
         with tempfile.TemporaryDirectory() as tmp:
-            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=pipeline_opts))
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=opts), bias)
 
-    def launch(self, a, bp, zp, sc, out) -> None:
-        """``out`` f32 ``[M, N]`` is overwritten; ``a`` f16 ``[M, K]``."""
+    def launch(self, act, packed, scale, zero, bias, y) -> None:
         import torch
 
-        d = [_descriptor(t) for t in (a, bp, zp, sc, out)]
-        self._set_stream(_current_raw_stream(torch, a.device.index or 0))
+        tensors = [act, packed, scale, zero] + ([bias] if self.has_bias else []) + [y]
+        d = [_descriptor(t) for t in tensors]
+        self._set_stream(_current_raw_stream(torch, act.device.index or 0))
         self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
 
 

@@ -267,7 +267,7 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
           " split-k=" + std::to_string(opts.splitK.getValue()) +
           // overwrite mode: every block writes its whole partial tile, no zero fill needed
           " split-k-init=" +
-          ((!opts.accumulate || opts.epilogue == "swiglu" || opts.epilogue == "int8-dequant") ? "false" : "true") +
+          ((!opts.accumulate || opts.epilogue == "swiglu" || opts.epilogue == "int8-dequant" || opts.epilogue == "f16-store") ? "false" : "true") +
           "},quantforge-gpu-mapping{block-tile-m=" +
           std::to_string(bm) + " block-tile-n=" +
           std::to_string(bn) + " warp-tile-m=" +
@@ -332,7 +332,7 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
     text += "func.func(quantforge-prefetch-weight-loads{distance=" +
             std::to_string(opts.prefetchDistance.getValue()) +
             "}),canonicalize,cse,";
-  if (!opts.accumulate || opts.epilogue == "swiglu" || opts.epilogue == "int8-dequant") {
+  if (!opts.accumulate || opts.epilogue == "swiglu" || opts.epilogue == "int8-dequant" || opts.epilogue == "f16-store") {
     if (!tensorCore || !opts.hoistAcc)
       llvm::report_fatal_error("quantforge-gpu-pipeline: accumulate=false / "
                                "epilogue=swiglu need the Tensor Core path with "
@@ -342,9 +342,9 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
   if (opts.epilogue != "none") {
     if (opts.epilogue != "relu" && opts.epilogue != "silu" &&
         opts.epilogue != "gelu" && opts.epilogue != "swiglu" &&
-        opts.epilogue != "int8-dequant")
+        opts.epilogue != "int8-dequant" && opts.epilogue != "f16-store")
       llvm::report_fatal_error("quantforge-gpu-pipeline: epilogue must be "
-                               "none | relu | silu | gelu | swiglu | int8-dequant");
+                               "none | relu | silu | gelu | swiglu | int8-dequant | f16-store");
     text += "func.func(quantforge-fuse-epilogue{kind=" +
             opts.epilogue.getValue() + "}),canonicalize,";
   }

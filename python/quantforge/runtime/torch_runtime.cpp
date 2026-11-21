@@ -15,6 +15,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
@@ -29,7 +30,8 @@ at::Tensor kfold_reduce_cuda(const at::Tensor &acc, int64_t M, int64_t S, int64_
 namespace {
 
 struct Kernel {
-  void (*fn)(void *, void *, void *, void *, void *, void *) = nullptr;
+  // result + up to six memref descriptors (a kernel with fewer arguments ignores the extra ones: x86-64 C calling convention)
+  void (*fn)(void *, void *, void *, void *, void *, void *, void *) = nullptr;
   void (*set_stream)(void *) = nullptr;
   int64_t Mp = 0, Kp = 0, Np = 0;
   bool hot = false; // K and N need no padding
@@ -88,11 +90,26 @@ struct Desc2 { // MLIR memref descriptor, rank 2
   int64_t strides[2];
 };
 
+struct Desc1 { // MLIR memref descriptor, rank 1
+  void *allocated;
+  void *aligned;
+  int64_t offset;
+  int64_t size;
+  int64_t stride;
+};
+
+inline Desc1 describe1(const at::Tensor &t) { return {t.data_ptr(), t.data_ptr(), 0, t.size(0), t.stride(0)}; }
+
 inline Desc2 describe(const at::Tensor &t) {
   return {t.data_ptr(), t.data_ptr(), 0, {t.size(0), t.size(1)}, {t.stride(0), t.stride(1)}};
 }
 
 inline bool aligned16(const at::Tensor &t) { return (reinterpret_cast<uintptr_t>(t.data_ptr()) & 15) == 0; }
+
+inline bool cpp_no_f16store() {
+  static const bool off = std::getenv("QUANTFORGE_NO_F16STORE") != nullptr;
+  return off;
+}
 
 Kernel lookup(int64_t M, int64_t K, int64_t N, int64_t group, int device, const std::string &act,
               bool overwrite, int bits) {
@@ -143,7 +160,10 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
   const bool swiglu = activation == "swiglu";
   TORCH_CHECK(!(swiglu && bias.has_value()), "activation='swiglu' does not take a bias");
   TORCH_CHECK(!(swiglu && bits != 4), "activation='swiglu' needs an INT4 weight");
-  const bool overwrite = swiglu || !bias.has_value(); // the kernel need not read C
+  // Plain GEMM (no activation): the kernel overwrites an f32 accumulator and ONE fused kernel (kfold_reduce, S = 1) adds the bias and
+  // writes f16 -- instead of expanding the bias into the accumulator (2 torch kernels) and converting afterwards (1 more).
+  const bool post = activation == "none" && !swiglu;
+  const bool overwrite = swiglu || post || !bias.has_value(); // the kernel need not read C
   const int64_t cols = swiglu ? N / 2 : N;
   Kernel k = lookup(M, K, N, group_size, x.device().index(), activation, overwrite, bits);
 
@@ -153,6 +173,31 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
       !pk.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
     return call_fallback(x, packed, scale, zero, group_size, bias, activation);
 
+  // INT4, group-wise, no activation: the kernel with the f16-store epilogue writes the f16 result (+ bias) itself, one kernel, no f32 buffer.
+  // `lookup` returns hot = false when that kernel cannot be built for the shape (then the f32 path below runs).
+  if (post && bits == 4 && group_size > 0 && !cpp_no_f16store()) {
+    Kernel k16 = lookup(M, K, N, group_size, x.device().index(), bias.has_value() ? "f16sb" : "f16s", true, 4);
+    at::Tensor bh;
+    if (bias.has_value())
+      bh = (bias->scalar_type() == at::kHalf ? *bias : bias->to(at::kHalf)).contiguous();
+    if (k16.hot && k16.fn && (!bias.has_value() || aligned16(bh))) {
+      at::Tensor act16 = (k16.Mp == M) ? x2 : padded_activations(x2, k16.Mp);
+      at::Tensor out16 = at::empty({k16.Mp, N}, x.options());
+      Desc2 e0 = describe(act16), e1 = describe(pk), e2 = describe(scale), e3 = describe(zero), eo = describe(out16), res16{};
+      Desc1 eb{};
+      if (bias.has_value())
+        eb = describe1(bh);
+      k16.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
+      if (bias.has_value())
+        k16.fn(&res16, &e0, &e1, &e2, &e3, &eb, &eo);
+      else
+        k16.fn(&res16, &e0, &e1, &e2, &e3, &eo, nullptr);
+      std::vector<int64_t> shape16(x.sizes().begin(), x.sizes().end());
+      shape16.back() = N;
+      return out16.narrow(0, 0, M).reshape(shape16);
+    }
+  }
+
   at::Tensor act = (k.Mp == M) ? x2 : padded_activations(x2, k.Mp);
   at::Tensor acc = overwrite
                        ? at::empty({k.Mp, N}, x.options().dtype(at::kFloat))
@@ -160,10 +205,16 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
   Desc2 d0 = describe(act), d1 = describe(pk), d2 = describe(scale), d3 = describe(zero),
         d4 = describe(acc), result{};
   k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
-  k.fn(&result, &d0, &d1, &d2, &d3, &d4);
+  k.fn(&result, &d0, &d1, &d2, &d3, &d4, nullptr);
 
   std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
   shape.back() = cols;
+  if (post) {
+    c10::optional<at::Tensor> b16;
+    if (bias.has_value())
+      b16 = bias->scalar_type() == at::kHalf ? *bias : bias->to(at::kHalf);
+    return kfold_reduce_cuda(acc, M, 1, N, b16).reshape(shape);
+  }
   return acc.narrow(0, 0, M).narrow(1, 0, cols).to(x.scalar_type()).reshape(shape);
 }
 
@@ -227,7 +278,7 @@ at::Tensor w4a16_gemm_kfold(const at::Tensor &x, const at::Tensor &packed, const
   Desc2 d0 = describe(act), d1 = describe(packed_f), d2 = describe(scale_f), d3 = describe(zero_f),
         d4 = describe(acc), result{};
   k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
-  k.fn(&result, &d0, &d1, &d2, &d3, &d4);
+  k.fn(&result, &d0, &d1, &d2, &d3, &d4, nullptr);
   return kfold_reduce_cuda(acc, M, S, N, bias).reshape(shape);
 }
 

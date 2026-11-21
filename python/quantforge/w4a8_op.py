@@ -48,14 +48,32 @@ def _kernel(Mp: int, K: int, N: int, has_bias: bool):
     return k
 
 
-def _decode_kernel(K: int, N: int):
-    key = ("dec", K, N)
+def _decode_kernel(K: int, N: int, has_bias: bool):
+    key = ("dec", K, N, has_bias)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8DecodeGemm
 
-        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N)
+        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias)
     return k
+
+
+_PAD16: dict = {}
+
+
+def _padded16(x2: torch.Tensor) -> torch.Tensor:
+    """x2 (M <= 16 rows) in the first rows of a reusable zero-initialised [16, K] buffer: one copy kernel instead of pad's allocate + fill + copy.
+    The rows past M keep an earlier call's values: a GEMM row depends only on its own activation row and the extra output rows are dropped.
+    One buffer per (device, stream, K), as in the C++ runtime."""
+    M, K = x2.shape
+    if M == 16:
+        return x2.contiguous()
+    key = (x2.device.index, torch.cuda.current_stream(x2.device).cuda_stream, K)
+    buf = _PAD16.get(key)
+    if buf is None:
+        buf = _PAD16[key] = torch.zeros(16, K, device=x2.device, dtype=torch.float16)
+    buf[:M].copy_(x2)
+    return buf
 
 
 def _quantize_tokens(x2: torch.Tensor):
@@ -71,11 +89,9 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
     if M <= 16 and packed16.numel() == 0:                             # compact: decode from the W4A8 layout itself (no second copy)
-        xp = torch.nn.functional.pad(x2, (0, 0, 0, 16 - M)) if M < 16 else x2
-        out = torch.empty(16, N, device=x.device, dtype=torch.float32)
-        _decode_kernel(K, N).launch(xp.contiguous(), p8, zp, scale_nk, out)
-        y = out[:M].to(torch.float16)
-        return (y if bias is None else y + bias).reshape(*lead, N)
+        out = torch.empty(16, N, device=x.device, dtype=torch.float16)
+        _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, None if bias is None else bias.contiguous())
+        return out[:M].reshape(*lead, N)
     if M <= 16:                                                       # decode: the W4A16 kernels (memory bound, same bytes)
         y = kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
         return y.reshape(*lead, N)
