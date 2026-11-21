@@ -30,6 +30,7 @@
 <li><a href="#cap-nhat-8-mot-model-khong-vua-o-fp16-2026-11-21">Cập nhật 8: một model không vừa ở fp16 (2026-11-21)</a></li>
 <li><a href="#cap-nhat-9-w4a8-ben-trong-vllm-2026-11-21">Cập nhật 9: W4A8 bên trong vLLM (2026-11-21)</a></li>
 <li><a href="#cap-nhat-10-mot-ban-sao-weight-va-cai-gia-cua-no-2026-11-21">Cập nhật 10: một bản sao weight, và cái giá của nó (2026-11-21)</a></li>
+<li><a href="#cap-nhat-11-qwen25-3b-trong-vllm-tren-mot-card-khong-chua-noi-no-o-fp16-2026-11-21">Cập nhật 11: Qwen2.5-3B trong vLLM trên một card không chứa nổi nó ở fp16 (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -726,7 +727,44 @@
 <p>Cách đọc trung thực: prefill ngang fp16 và Marlin (1.05x ở 1.5B, nơi các GEMM nặng hơn) và gấp 1.6 đến 1.7x plugin W4A16; decode là của các kernel W4A16 nên vẫn 0.80 đến 0.85x Marlin như trước. Trong một engine phục vụ, các GEMM là phần nhỏ hơn của prefill so với model Hugging Face ở các cập nhật trước (vLLM đã gộp sẵn các norm và activation), nên mức 1.2 đến 1.5x ở đó co lại thành ngang bằng ở đây. <strong>Nó không thắng Marlin rõ ràng.</strong> Cái nó đem lại là chỉ cần một checkpoint fp16 và các GEMM prefill dùng tensor core INT8; cái nó tốn là phải giữ cả hai layout của weight (khoảng một byte mỗi weight: bộ nhớ của INT8, không phải của INT4), lượng tử hóa làm tròn gần nhất (0.5B ở perplexity 23.7 so với 20.5 với GPTQ), và tôi chỉ mới kiểm tra trên vLLM 0.25.1. Bỏ bản sao cho decode (một kernel W4A16 đọc nibble theo K) hoặc nạp checkpoint GPTQ vào layout W4A8 sẽ giải quyết hai điểm đầu; cả hai chưa làm.</p>
 <h2 id="cap-nhat-10-mot-ban-sao-weight-va-cai-gia-cua-no-2026-11-21">Cập nhật 10: một bản sao weight, và cái giá của nó (2026-11-21)<a class="headerlink" href="#cap-nhat-10-mot-ban-sao-weight-va-cai-gia-cua-no-2026-11-21" title="Permanent link">#</a></h2>
 <p>Op lai của Cập nhật 9 giữ các nibble hai lần, theo layout W4A8 (đóng gói theo K, cho kernel prefill) và layout W4A16 (đóng gói theo N, cho kernel decode): khoảng một byte mỗi weight. Để chỉ giữ bản đầu, decode phải đọc được nó: một <code>matmul_transpose_b</code> f16 mà tile weight được dựng bởi cùng loại producer <code>linalg.generic</code> (nibble, trừ zero point, nhân scale nhóm <code>gs * sw</code> ở f16), được gộp vào các lần load bởi pass vốn viết cho việc khác. Nó đúng ngay (sai số 0.0046 trên đầu ra cỡ 13.6), nhưng schedule đầu tiên <strong>chậm gấp 3.7 lần</strong> kernel decode W4A16 chuyên dụng (188 so với 51 us ở 16 x 4096 x 4096): kernel đó có phép dequantise <code>f16x2</code> đóng gói (thủ thuật đặt nibble vào mantissa của 1152) còn producer ở đây là mã vô hướng. Một pipeline hai hoặc ba tầng với tile K sâu 128 đưa nó xuống 87 đến 89 us (1.7x); qua các lớp của một model, mức chậm là 1.1x cho shape gate / up với K rộng (896 x 4864) đến 1.7x (11008 x 4096).</p>
-<p>Trong vLLM mức đó nhỏ hơn tỷ lệ kernel gợi ý, vì kernel chỉ là một phần của một bước decode. <code>QUANTFORGE_W4A8_DECODE=compact</code> (mặc định: hai layout) cho, trên vLLM 0.25.1: weight <strong>1.13 GiB thay vì 2.04 GiB</strong> với Qwen2.5-1.5B, prefill không đổi (33.0k và 12.4k token/s cho 0.5B và 1.5B), decode 214 và 3245 token/s cho 0.5B ở 1 và 16 request so với 259 và 3592, và 102 và 1580 cho 1.5B so với 114 và 1607. Tức 10 đến 17 phần trăm ở một request và 2 đến 10 ở mười sáu, đổi lấy nửa bộ nhớ weight. Kernel để thu hẹp phần còn lại là một pattern cho phép dequantise đóng gói của producer này, như <code>quantforge-vectorize-dequant</code> có cho producer W4A16. Và một giới hạn tôi chưa nêu: đây là lượng tử hóa <em>trực tuyến</em>, nên toàn bộ model fp16 phải vừa GPU trong lúc nạp; Qwen2.5-3B (6 GB) không vừa card 5.6 GB này ở cả hai chế độ, dù dạng W4A8 của nó (2 GB) chạy tốt qua đường Hugging Face của Cập nhật 8. Lượng tử hóa từng lớp trong lúc nạp, hoặc nạp từ checkpoint đã lượng tử hóa, sẽ bỏ được giới hạn này.</p></article>
+<p>Trong vLLM mức đó nhỏ hơn tỷ lệ kernel gợi ý, vì kernel chỉ là một phần của một bước decode. <code>QUANTFORGE_W4A8_DECODE=compact</code> (mặc định: hai layout) cho, trên vLLM 0.25.1: weight <strong>1.13 GiB thay vì 2.04 GiB</strong> với Qwen2.5-1.5B, prefill không đổi (33.0k và 12.4k token/s cho 0.5B và 1.5B), decode 214 và 3245 token/s cho 0.5B ở 1 và 16 request so với 259 và 3592, và 102 và 1580 cho 1.5B so với 114 và 1607. Tức 10 đến 17 phần trăm ở một request và 2 đến 10 ở mười sáu, đổi lấy nửa bộ nhớ weight. Kernel để thu hẹp phần còn lại là một pattern cho phép dequantise đóng gói của producer này, như <code>quantforge-vectorize-dequant</code> có cho producer W4A16. Và một giới hạn tôi chưa nêu: đây là lượng tử hóa <em>trực tuyến</em>, nên toàn bộ model fp16 phải vừa GPU trong lúc nạp; Qwen2.5-3B (6 GB) không vừa card 5.6 GB này ở cả hai chế độ, dù dạng W4A8 của nó (2 GB) chạy tốt qua đường Hugging Face của Cập nhật 8. Lượng tử hóa từng lớp trong lúc nạp, hoặc nạp từ checkpoint đã lượng tử hóa, sẽ bỏ được giới hạn này.</p>
+<h2 id="cap-nhat-11-qwen25-3b-trong-vllm-tren-mot-card-khong-chua-noi-no-o-fp16-2026-11-21">Cập nhật 11: Qwen2.5-3B trong vLLM trên một card không chứa nổi nó ở fp16 (2026-11-21)<a class="headerlink" href="#cap-nhat-11-qwen25-3b-trong-vllm-tren-mot-card-khong-chua-noi-no-o-fp16-2026-11-21" title="Permanent link">#</a></h2>
+<p>Giới hạn nêu ở Cập nhật 10 (toàn bộ model fp16 phải vừa GPU trong lúc nạp) biến mất nhờ một thay đổi nhỏ: <code>create_weights</code> cấp phát weight fp16 của mọi lớp sẽ được lượng tử hóa trên CPU, checkpoint được đọc vào đó, và chính <code>device_loading_context</code> của vLLM chuyển từng module lên GPU khi <code>process_weights_after_loading</code> chạy; đó là lúc weight được lượng tử hóa và giải phóng. GPU không bao giờ giữ nhiều hơn một lớp fp16 cộng các lớp đã lượng tử hóa; các lớp giữ nguyên dense vẫn được tạo trên GPU như trước. Qwen2.5-3B-Instruct (6 GB ở fp16, card 5.6 GB) giờ nạp trong 25 giây và chiếm 2.01 GiB ở chế độ compact; cùng các prompt, mỗi phương thức một tiến trình, vLLM 0.25.1:</p>
+<table>
+<thead>
+<tr>
+<th>Qwen2.5-3B</th>
+<th style="text-align: right;">prefill (token/s)</th>
+<th style="text-align: right;">decode 1 request</th>
+<th style="text-align: right;">decode 16 request</th>
+<th style="text-align: right;">weight</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>quantforge_w4a8</strong> (compact, online từ checkpoint fp16)</td>
+<td style="text-align: right;"><strong>6308</strong></td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">935</td>
+<td style="text-align: right;">2.01 GiB</td>
+</tr>
+<tr>
+<td>GPTQ-Int4, <code>gptq_marlin</code></td>
+<td style="text-align: right;">5782</td>
+<td style="text-align: right;">81</td>
+<td style="text-align: right;">1201</td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td>GPTQ-Int4, <code>quantforge</code> (W4A16)</td>
+<td style="text-align: right;">3923</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">1063</td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>Prefill cao hơn Marlin 9 phần trăm và gấp 1.6x plugin W4A16; decode bằng 0.75 và 0.78x của Marlin, cái giá của kernel decode compact (chế độ hai layout cần khoảng 3.9 GiB và không vừa). Vậy trên card này W4A8 online biến một model không nạp nổi thành một model phục vụ prefill nhanh hơn checkpoint GPTQ với kernel tốt nhất hiện có, với throughput decode thấp hơn 25 phần trăm; chất lượng là của làm tròn gần nhất (Cập nhật 8).</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

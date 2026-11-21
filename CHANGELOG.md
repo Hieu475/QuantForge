@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* vLLM W4A8: the fp16 weights of the layers to quantise are created on the CPU and moved to the GPU one module at a time by vLLM's `device_loading_context` while they are quantised, so a model larger than the GPU in fp16 loads: Qwen2.5-3B on the 5.6 GB card, compact mode, 2.01 GiB, prefill 6308 tokens/s (Marlin 5782), decode 61 / 935 at 1 / 16 requests (Marlin 81 / 1201). `QUANTFORGE_W4A8_LOAD_ON_CPU=0` turns it off.
+
 * vLLM W4A8: `QUANTFORGE_W4A8_DECODE=compact` keeps one copy of the nibbles (`e2e.W4A8DecodeGemm`: the decode reads the W4A8 layout through a fused producer, 1.1-1.7x slower than the W4A16 decode kernel): weights 1.13 GiB instead of 2.04 GiB (Qwen2.5-1.5B), decode 10-17 % lower at 1 request, 2-10 % at 16, prefill unchanged. `w4a8_hybrid` got a `scale_nk` argument. `benchmarks/w4a8_decode_layout.py`.
 
 * vLLM: `quantization="quantforge_w4a8"` (`QuantForgeW4A8Config` / `QuantForgeW4A8Method`, `quantforge.w4a8_op`, op `quantforge::w4a8_hybrid`): an ordinary fp16 checkpoint is quantised to W4A8 online; above 16 rows the W4A8 kernel, below it the W4A16 decode kernels, from the same weight (weights kept in both layouts). vLLM 0.25.1, Qwen2.5-0.5B: prefill 33.3k tokens/s (fp16 31.8k, Marlin 32.9k, quantforge W4A16 20.6k), decode 257 / 3583 at 1 / 16 requests (Marlin 297 / 4230); 1.5B prefill 12.0k vs 11.5k Marlin. `benchmarks/vllm_prefill.py`, `test/E2E/test_w4a8_op.py`.

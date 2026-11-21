@@ -211,6 +211,17 @@ if HAVE_VLLM:
         calls ``torch.ops.quantforge.w4a8_hybrid``: the compiled W4A8 kernel (INT8 tensor cores) above 16 rows, the W4A16 decode kernels below,
         both from the same weight. Memory: about one byte per weight (the two layouts), a quarter of fp16 would need dropping the decode copy."""
 
+        def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
+                           **extra_weight_attrs):
+            super().create_weights(layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
+                                   **extra_weight_attrs)
+            # the fp16 weight of a layer that will be quantised is held on the CPU while the checkpoint is read: vLLM moves each module to the
+            # GPU only while it processes it (``device_loading_context``), so the GPU never holds the whole fp16 model (QUANTFORGE_W4A8_LOAD_ON_CPU=0
+            # keeps the old behaviour). Layers that stay dense (sizes not multiples of 128) must remain on the GPU.
+            if (os.environ.get("QUANTFORGE_W4A8_LOAD_ON_CPU", "1") != "0" and input_size_per_partition % 128 == 0
+                    and sum(output_partition_sizes) % 128 == 0 and params_dtype in (torch.float16, torch.bfloat16)):
+                layer.weight.data = layer.weight.data.cpu()
+
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
             from . import kfold, quant, w4a8_op
 
