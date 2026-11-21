@@ -443,6 +443,24 @@ N <= 2048). Kernel level, M = 1 (us, whole op in a CUDA graph): 4864 x 896 37.7 
 
 Fold helps for 1-4 requests (+9 % / +15 %) and does nothing from 16 requests up (more than `16 // S` rows: the plain kernel runs). The last column adds the width-aware default schedules: the fixed tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models (autotune picks 32 / 64-column blocks and a look-ahead there; I turned its winners into rules, `benchmarks/sweep_skinny.py`). Together with the fold, 1 to 16 requests reach 0.80 to 0.88 of Marlin and 64 requests 0.73 to 0.80 (+16 % and +10 % over the fold alone). Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.
 
+**Pitfall found on the way:** vLLM caches its compiled graphs (`~/.cache/vllm/torch_compile_cache`) by a hash that does not see the plugin, so a graph compiled before a plugin change is
+silently reused (my first A/B measured nothing for that reason). The plugin therefore makes every layer call the same op and derives the fold factor from tensor shapes at run time; after
+upgrading the plugin, clear that cache once.
+
+Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points (`quantization="quantforge"` picks the reader from the checkpoint). Limitations: no MoE
+layers, no AWQ without zero points. Other checkpoint formats (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):
+
+| format | requests | Marlin | QuantForge | QuantForge / Marlin | output vs Marlin |
+|---|--:|--:|--:|--:|---|
+| AWQ 4-bit (`awq_marlin`) | 1 | 307 | 270 | 0.88 | 287 of 320 greedy tokens identical, mean abs. log-prob diff 0.0020 |
+| | 4 | 1168 | 1040 | 0.89 | |
+| | 16 | 4357 | 3811 | 0.87 | |
+| | 64 | 11715 | 9509 | 0.81 | |
+| GPTQ 8-bit (`gptq_marlin`) | 1 | 239 | 222 | 0.93 | 320 of 320 identical, mean diff 0.0018 |
+| | 4 | 919 | 856 | 0.93 | |
+| | 16 | 3482 | 3235 | 0.93 | |
+| | 64 | 10157 | 8600 | 0.85 | |
+
 ### FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)
 
 `quantize_model(model, "fp8_w8a8")` replaces the Linears with `FP8W8A8Linear`: FP8 E4M3 weights *and* activations (per-output-channel weight scale, dynamic per-token
