@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 (2026-11-21)
+
 * The op processes inputs of more than 2048 rows in chunks (bounded f32 temporary: Qwen2.5-3B could not start under vLLM on a 6 GB card because of the 8192-token profiling pass). `QUANTFORGE_KFOLD_BUDGET_MB` caps the extra memory of K-folding.
   Checked in vLLM: TinyLlama-1.1B act-order GPTQ (0.76-0.91 of Marlin), Qwen2.5-3B (0.87-0.88).
 
