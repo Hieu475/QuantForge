@@ -45,3 +45,22 @@ def test_int8_gemm_is_exact_for_block_n_different_from_block_m(bm, bn, bk, wm, w
     Int8Gemm.build(M, K, N, pipeline_opts=opts).launch(a, bt, c)
     torch.cuda.synchronize()
     assert torch.equal(c, torch._int_mm(a, bt.t()))
+
+
+@pytest.mark.parametrize("M,K,N,bias", [(256, 512, 256, True), (512, 1024, 384, False), (256, 512, 512, True)])
+def test_int8_gemm_with_the_dequantisation_fused_into_the_store(M, K, N, bias):
+    """y[f16] = (A @ Bt^T) * sx[m] * sw[n] + bias[n] in ONE kernel: equal to the reference computed in f32 and rounded once."""
+    _require_gpu()
+    from quantforge.e2e import Int8GemmDq
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    a = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8, generator=g)
+    bt = torch.randint(-127, 127, (N, K), device="cuda", dtype=torch.int8, generator=g)
+    sx = torch.rand(M, device="cuda", generator=g) * 0.02 + 0.001
+    sw = torch.rand(N, device="cuda", generator=g) * 0.02 + 0.001
+    b = torch.randn(N, device="cuda", generator=g)
+    ref = (torch._int_mm(a, bt.t()).float() * sx[:, None] * sw[None, :] + (b[None, :] if bias else 0)).half()
+    y = torch.full((M, N), 9.0, device="cuda", dtype=torch.float16)            # overwritten everywhere
+    Int8GemmDq.build(M, K, N, bias=bias).launch(a, bt, sx, sw, b, y)
+    torch.cuda.synchronize()
+    assert torch.equal(y, ref)

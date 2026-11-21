@@ -38,7 +38,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--text", required=True)
-    ap.add_argument("--variants", default="fp16,int4,fp8_w8a8,int8_w8a8")
+    ap.add_argument("--variants", default="fp16,int4,fp8_w8a8,int8_w8a8_cublaslt,int8_w8a8")
     ns = ap.parse_args()
     import pandas as pd
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -50,8 +50,10 @@ def main():
             m = m.cuda()
         elif v == "int4":
             qnn.quantize_model(m, "int4", 128); qnn.quantize_model(m, "int8", only=("lm_head",), fuse=False)
-        elif v == "int8_w8a8":            # INT8 weights + per-token INT8 activations through cuBLASLt (torch._int_mm)
+        elif v == "int8_w8a8":            # INT8 weights + per-token INT8 activations, GEMM + dequant epilogue compiled by QuantForge
             qnn.quantize_model(m, "int8_w8a8", fuse=False)
+        elif v == "int8_w8a8_cublaslt":   # the same through cuBLASLt (torch._int_mm) with the epilogue as separate torch ops
+            qnn.quantize_model(m, "int8_w8a8", fuse=False, int8_backend="cublaslt")
         elif v == "fp8_w8a8_tensor":       # one scale per tensor on both sides
             qnn.quantize_model(m, "fp8_w8a8", fuse=False, w8a8_per_token=False)
         else:                              # fp8_w8a8: per-token activation scale + per-channel weight scale (the default)

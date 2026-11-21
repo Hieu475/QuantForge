@@ -22,6 +22,7 @@
 <li><a href="#can-gi-e-lam-uoc">Cần gì để làm được</a></li>
 <li><a href="#cap-nhat-tensor-core-int8-cho-uoc-gi-2026-11-21">Cập nhật: tensor core INT8 cho được gì (2026-11-21)</a></li>
 <li><a href="#cap-nhat-2-kernel-int8-cua-chinh-compiler-2026-11-21">Cập nhật 2: kernel INT8 của chính compiler (2026-11-21)</a></li>
+<li><a href="#cap-nhat-3-gop-dequantisation-va-ca-model-2026-11-21">Cập nhật 3: gộp dequantisation, và cả model (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -233,7 +234,110 @@
 </tbody>
 </table>
 <p>Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chọn từ sweep 129 tổ hợp đều đúng tuyệt đối, nó đạt 59 đến 65 TOPS ở các shape lớn (ba phần tư đỉnh 88 TOPS của lệnh, 77 đến 88 phần trăm cuBLASLt, và vượt nó ở một shape) và <strong>nhanh hơn cuBLAS fp16 từ 1.1 đến 1.7 lần ở mọi shape đã thử</strong>. Weight lớn hơn L2 cần <code>block-swizzle=16</code> (2048 x 4096 x 11008: từ 21.7 lên 59.6 TOPS), một lời nhắc rằng thứ tự block quan trọng ngang tile.</p>
-<p>Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Hai lưu ý: các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; và chỉ có một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.</p></article>
+<p>Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Hai lưu ý: các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; và chỉ có một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.</p>
+<h2 id="cap-nhat-3-gop-dequantisation-va-ca-model-2026-11-21">Cập nhật 3: gộp dequantisation, và cả model (2026-11-21)<a class="headerlink" href="#cap-nhat-3-gop-dequantisation-va-ca-model-2026-11-21" title="Permanent link">#</a></h2>
+<p>Một GEMM int32 thô chưa phải một layer: đầu ra phải thành f16 với scale hàng (của activation), scale cột (của weight) và bias. Là một kernel riêng thì nó tốn vòng đi về của int32: với layer 2048 x 4096 x 4096 là 33 MB ghi rồi đọc lại, tốn thời gian bằng khoảng một phần tư GEMM. Compiler đã gộp một activation (relu, silu, swiglu) vào lệnh store cuối cùng của các accumulator; một loại epilogue mới, <code>int8-dequant</code>, làm điều tương tự cho <code>y = f16(c * sx[m] * sw[n] + bias[n])</code>. Chương trình vẫn bình thường về mặt ngữ nghĩa, một <code>matmul</code> rồi một <code>linalg.generic</code> theo phần tử; pass viết lại mọi lệnh store accumulator <code>vector&lt;2xi32&gt;</code> thành cặp đã chuyển đổi, ghi bằng một lệnh store 4 byte, và xóa kernel theo phần tử cùng buffer int32. Khớp từng bit với tham chiếu f32, có và không có bias, và là một kernel trong test FileCheck.</p>
+<p><strong>Một bài học về đo lường.</strong> Benchmark đầu tiên nói kernel hợp nhất <em>chậm hơn</em> GEMM thô (1.93 ms so với 1.13 ms cho 2048 x 4096 x 4096). <code>ncu</code> nói không phải vậy (1.21 so với 1.25 ms, và DRAM ghi giảm một nửa). Thời gian thiết bị của profiler (1.09 ms) so với thời gian wall mỗi lần gọi (2.05 ms) chỉ ra mili giây còn thiếu nằm ở phía host: phần cấp phát của buffer int32 vẫn còn sau phép viết lại vì các <code>subview</code> chết còn trỏ vào nó, nên mỗi lần gọi đều <code>cudaMalloc</code> rồi <code>cudaFree</code> 33 MB. Xóa các subview chết là hết. Chỉ việc so thời gian thiết bị với thời gian wall mới cho thấy kernel chưa bao giờ là vấn đề.</p>
+<p>GEMM cộng dequantisation, một lần launch, ra f16 (RTX 4050, GPU được làm nóng; cột fp16 là GEMM thường không có scale):</p>
+<table>
+<thead>
+<tr>
+<th>shape (M x K x N)</th>
+<th style="text-align: right;">cuBLAS fp16</th>
+<th style="text-align: right;">chỉ GEMM int32</th>
+<th style="text-align: right;">GEMM + dequant hợp nhất</th>
+<th style="text-align: right;">so với fp16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2048 x 4096 x 4096</td>
+<td style="text-align: right;">1.76 ms</td>
+<td style="text-align: right;">1.11</td>
+<td style="text-align: right;">1.03</td>
+<td style="text-align: right;"><strong>1.71x</strong></td>
+</tr>
+<tr>
+<td>4096 x 4096 x 4096</td>
+<td style="text-align: right;">3.51</td>
+<td style="text-align: right;">2.12</td>
+<td style="text-align: right;">2.12</td>
+<td style="text-align: right;">1.66x</td>
+</tr>
+<tr>
+<td>2048 x 4096 x 11008</td>
+<td style="text-align: right;">5.06</td>
+<td style="text-align: right;">3.09</td>
+<td style="text-align: right;">2.96</td>
+<td style="text-align: right;">1.71x</td>
+</tr>
+<tr>
+<td>2048 x 4864 x 896</td>
+<td style="text-align: right;">0.48</td>
+<td style="text-align: right;">0.33</td>
+<td style="text-align: right;">0.30</td>
+<td style="text-align: right;">1.61x</td>
+</tr>
+<tr>
+<td>2048 x 1536 x 8960</td>
+<td style="text-align: right;">1.50</td>
+<td style="text-align: right;">1.09</td>
+<td style="text-align: right;">0.93</td>
+<td style="text-align: right;">1.61x</td>
+</tr>
+<tr>
+<td>2048 x 896 x 4864</td>
+<td style="text-align: right;">0.48</td>
+<td style="text-align: right;">0.46</td>
+<td style="text-align: right;">0.37</td>
+<td style="text-align: right;">1.31x</td>
+</tr>
+<tr>
+<td>512 x 4096 x 4096</td>
+<td style="text-align: right;">0.46</td>
+<td style="text-align: right;">0.35</td>
+<td style="text-align: right;">0.32</td>
+<td style="text-align: right;">1.44x</td>
+</tr>
+</tbody>
+</table>
+<p>Kernel hợp nhất còn nhanh hơn GEMM int32 thô, vì nó ghi một nửa số byte, và các shape K nhỏ vốn yếu nhất khi là GEMM thô giờ được lợi nhiều nhất từ epilogue.</p>
+<p><strong>Cả model.</strong> <code>quantize_model(model, "int8_w8a8")</code> giờ dùng kernel này: activation được lượng tử hóa theo token (một lượt elementwise đã biên dịch), weight theo kênh đầu ra, GEMM và dequantisation là kernel đã biên dịch; các layer có N hoặc K không khớp tile của nó quay về cuBLASLt. Prefill 2048 token, cùng một lần chạy, fp16 so với INT8 đã biên dịch (và so với đường cuBLASLt trước đó):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">INT8, đường cuBLASLt</th>
+<th style="text-align: right;">INT8, kernel hợp nhất đã biên dịch</th>
+<th style="text-align: right;">perplexity (fp16 -&gt; INT8)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">93.1 ms</td>
+<td style="text-align: right;">103.7 (0.90x)</td>
+<td style="text-align: right;">86.7 (<strong>1.07x</strong>)</td>
+<td style="text-align: right;">18.79 -&gt; 19.20</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">186.9</td>
+<td style="text-align: right;">177.4 (1.05x)</td>
+<td style="text-align: right;">159.4 (<strong>1.17x</strong>)</td>
+<td style="text-align: right;">17.91 -&gt; 18.23</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">238.1</td>
+<td style="text-align: right;">226.6 (1.05x)</td>
+<td style="text-align: right;">204.4 (<strong>1.16x</strong>)</td>
+<td style="text-align: right;">12.66 -&gt; 13.06</td>
+</tr>
+</tbody>
+</table>
+<p>Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 7 đến 17 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

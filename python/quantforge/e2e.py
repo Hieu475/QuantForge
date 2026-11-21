@@ -633,3 +633,69 @@ class Int8Gemm:
         d = [_descriptor(t) for t in (a, bt, c)]
         self._set_stream(_current_raw_stream(torch, a.device.index or 0))
         self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
+
+
+class Int8GemmDq:
+    """INT8 GEMM with the dequantisation fused into the store: ``y[f16] = (A @ Bt^T)[i32] * sx[m] * sw[n] + bias[n]`` (``epilogue=int8-dequant``).
+
+    ``a`` int8 ``[M, K]`` (activations, quantised per token with scale ``sx`` f32 ``[M]``), ``bt`` int8 ``[N, K]`` (weights, per output channel
+    scale ``sw`` f32 ``[N]``), ``bias`` f32 ``[N]`` or ``None``, ``y`` f16 ``[M, N]``. One kernel: no int32 intermediate. Experimental."""
+
+    NAME = "i8_gemm_dq"
+
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled, has_bias: bool):
+        self.M, self.K, self.N, self.has_bias = M, K, N, has_bias
+        self.compiled = compiled
+        self._lib = ctypes.CDLL(str(compiled.lib_path))
+        self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
+        self._nargs = 1 + (6 if has_bias else 5)
+        self._fn.argtypes = [ctypes.c_void_p] * self._nargs
+        self._fn.restype = None
+        self._set_stream = self._lib.mgpuSetStream
+        self._set_stream.argtypes = [ctypes.c_void_p]
+        self._result = _descriptor_type(2)()
+
+    @classmethod
+    def build(cls, M: int, K: int, N: int, bias: bool = True, workdir=None, chip: str = "sm_80",
+              pipeline_opts: str = INT8_GEMM_OPTS) -> "Int8GemmDq":
+        b_arg = f"%bias: tensor<{N}xf32> {{quantforge.int8_bias}}, " if bias else ""
+        b_in = ", %bias" if bias else ""
+        b_ty = f", tensor<{N}xf32>" if bias else ""
+        b_map = ", #mn" if bias else ""
+        b_blk = ", %b: f32" if bias else ""
+        b_add = ("%v = arith.addf %u, %b : f32" if bias else "%v = arith.addf %u, %u : f32")  # replaced below when there is no bias
+        body_v = "%v = arith.addf %u, %b : f32" if bias else "%v = arith.mulf %u, %one : f32"
+        one = "" if bias else "%one = arith.constant 1.0 : f32\n      "
+        ir = f"""#mmn = affine_map<(m, n) -> (m, n)>
+#mm = affine_map<(m, n) -> (m)>
+#mn = affine_map<(m, n) -> (n)>
+func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bt: tensor<{N}x{K}xi8>, %sx: tensor<{M}xf32> {{quantforge.int8_row_scale}},
+                      %sw: tensor<{N}xf32> {{quantforge.int8_col_scale}}, {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
+  %e = tensor.empty() : tensor<{M}x{N}xi32>
+  %c = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xi8>, tensor<{N}x{K}xi8>) outs(%e : tensor<{M}x{N}xi32>) -> tensor<{M}x{N}xi32>
+  %r = linalg.generic {{indexing_maps = [#mmn, #mm, #mn{b_map}, #mmn], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      ins(%c, %sx, %sw{b_in} : tensor<{M}x{N}xi32>, tensor<{M}xf32>, tensor<{N}xf32>{b_ty}) outs(%y : tensor<{M}x{N}xf16>) {{
+    ^bb0(%ci: i32, %s: f32, %w: f32{b_blk}, %o: f16):
+      {one}%f = arith.sitofp %ci : i32 to f32
+      %t = arith.mulf %f, %s : f32
+      %u = arith.mulf %t, %w : f32
+      {body_v}
+      %h = arith.truncf %v : f32 to f16
+      linalg.yield %h : f16
+  }} -> tensor<{M}x{N}xf16>
+  return %r : tensor<{M}x{N}xf16>
+}}
+"""
+        import tempfile
+
+        opts = f"{pipeline_opts} epilogue=int8-dequant"
+        with tempfile.TemporaryDirectory() as tmp:
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=opts), bias)
+
+    def launch(self, a, bt, sx, sw, bias, y) -> None:
+        import torch
+
+        tensors = [a, bt, sx, sw] + ([bias] if self.has_bias else []) + [y]
+        d = [_descriptor(t) for t in tensors]
+        self._set_stream(_current_raw_stream(torch, a.device.index or 0))
+        self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))

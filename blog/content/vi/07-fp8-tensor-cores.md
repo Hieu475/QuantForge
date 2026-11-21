@@ -101,3 +101,33 @@ Kết quả, mọi đầu ra **khớp từng bit** với cuBLASLt (RTX 4050, GPU
 Biên dịch từ cùng bộ máy với kernel W4A16, với schedule chọn từ sweep 129 tổ hợp đều đúng tuyệt đối, nó đạt 59 đến 65 TOPS ở các shape lớn (ba phần tư đỉnh 88 TOPS của lệnh, 77 đến 88 phần trăm cuBLASLt, và vượt nó ở một shape) và **nhanh hơn cuBLAS fp16 từ 1.1 đến 1.7 lần ở mọi shape đã thử**. Weight lớn hơn L2 cần `block-swizzle=16` (2048 x 4096 x 11008: từ 21.7 lên 59.6 TOPS), một lời nhắc rằng thứ tự block quan trọng ngang tile.
 
 Cái nó không phải là: một GEMM int32 thô, không có scale, không có epilogue và không có lượng tử hóa activation, nên chưa phải một layer và chưa phải mức tăng tốc nào người dùng thấy được. Hai lưu ý: các shape K nhỏ bị kìm bởi đầu ra int32 (4 byte mỗi phần tử), thứ mà một epilogue lưu f16 gộp sẽ giảm một nửa; và chỉ có một GPU, sm_89. Các bước tiếp theo là những bước phép tính đã nêu: gộp scale hàng / cột và bias vào lệnh store, và lượng tử hóa activation trong kernel sinh ra nó; rồi W4A8.
+
+## Cập nhật 3: gộp dequantisation, và cả model (2026-11-21)
+
+Một GEMM int32 thô chưa phải một layer: đầu ra phải thành f16 với scale hàng (của activation), scale cột (của weight) và bias. Là một kernel riêng thì nó tốn vòng đi về của int32: với layer 2048 x 4096 x 4096 là 33 MB ghi rồi đọc lại, tốn thời gian bằng khoảng một phần tư GEMM. Compiler đã gộp một activation (relu, silu, swiglu) vào lệnh store cuối cùng của các accumulator; một loại epilogue mới, `int8-dequant`, làm điều tương tự cho `y = f16(c * sx[m] * sw[n] + bias[n])`. Chương trình vẫn bình thường về mặt ngữ nghĩa, một `matmul` rồi một `linalg.generic` theo phần tử; pass viết lại mọi lệnh store accumulator `vector<2xi32>` thành cặp đã chuyển đổi, ghi bằng một lệnh store 4 byte, và xóa kernel theo phần tử cùng buffer int32. Khớp từng bit với tham chiếu f32, có và không có bias, và là một kernel trong test FileCheck.
+
+**Một bài học về đo lường.** Benchmark đầu tiên nói kernel hợp nhất *chậm hơn* GEMM thô (1.93 ms so với 1.13 ms cho 2048 x 4096 x 4096). `ncu` nói không phải vậy (1.21 so với 1.25 ms, và DRAM ghi giảm một nửa). Thời gian thiết bị của profiler (1.09 ms) so với thời gian wall mỗi lần gọi (2.05 ms) chỉ ra mili giây còn thiếu nằm ở phía host: phần cấp phát của buffer int32 vẫn còn sau phép viết lại vì các `subview` chết còn trỏ vào nó, nên mỗi lần gọi đều `cudaMalloc` rồi `cudaFree` 33 MB. Xóa các subview chết là hết. Chỉ việc so thời gian thiết bị với thời gian wall mới cho thấy kernel chưa bao giờ là vấn đề.
+
+GEMM cộng dequantisation, một lần launch, ra f16 (RTX 4050, GPU được làm nóng; cột fp16 là GEMM thường không có scale):
+
+| shape (M x K x N) | cuBLAS fp16 | chỉ GEMM int32 | GEMM + dequant hợp nhất | so với fp16 |
+|---|--:|--:|--:|--:|
+| 2048 x 4096 x 4096 | 1.76 ms | 1.11 | 1.03 | **1.71x** |
+| 4096 x 4096 x 4096 | 3.51 | 2.12 | 2.12 | 1.66x |
+| 2048 x 4096 x 11008 | 5.06 | 3.09 | 2.96 | 1.71x |
+| 2048 x 4864 x 896 | 0.48 | 0.33 | 0.30 | 1.61x |
+| 2048 x 1536 x 8960 | 1.50 | 1.09 | 0.93 | 1.61x |
+| 2048 x 896 x 4864 | 0.48 | 0.46 | 0.37 | 1.31x |
+| 512 x 4096 x 4096 | 0.46 | 0.35 | 0.32 | 1.44x |
+
+Kernel hợp nhất còn nhanh hơn GEMM int32 thô, vì nó ghi một nửa số byte, và các shape K nhỏ vốn yếu nhất khi là GEMM thô giờ được lợi nhiều nhất từ epilogue.
+
+**Cả model.** `quantize_model(model, "int8_w8a8")` giờ dùng kernel này: activation được lượng tử hóa theo token (một lượt elementwise đã biên dịch), weight theo kênh đầu ra, GEMM và dequantisation là kernel đã biên dịch; các layer có N hoặc K không khớp tile của nó quay về cuBLASLt. Prefill 2048 token, cùng một lần chạy, fp16 so với INT8 đã biên dịch (và so với đường cuBLASLt trước đó):
+
+| model | fp16 | INT8, đường cuBLASLt | INT8, kernel hợp nhất đã biên dịch | perplexity (fp16 -> INT8) |
+|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 93.1 ms | 103.7 (0.90x) | 86.7 (**1.07x**) | 18.79 -> 19.20 |
+| Llama-3.2-1B | 186.9 | 177.4 (1.05x) | 159.4 (**1.17x**) | 17.91 -> 18.23 |
+| Qwen2.5-1.5B | 238.1 | 226.6 (1.05x) | 204.4 (**1.16x**) | 12.66 -> 13.06 |
+
+Vậy cùng phép tính mà cuBLASLt không biến được thành mức tăng cả model lại là mức tăng tốc prefill 7 đến 17 phần trăm khi epilogue được gộp trong compiler. Nó thấp xa hơn mức 1.5 đến 1.7x của GEMM, và phép tính nói vì sao: attention, các norm, head (giữ ở fp16: với model 0.5B nó khoảng một phần sáu thời gian fp16), lượt lượng tử hóa activation và overhead host của một layer Python đều không được đụng tới. Các bước tiếp theo hiển nhiên là gộp lượng tử hóa activation vào nơi sinh ra activation, lượng tử hóa luôn head, và một biến thể W4A8 giảm một nửa số byte weight; cái giá về chất lượng (0.3 đến 0.4 điểm perplexity cho INT8 thuần theo token / theo kênh) là thứ cần theo dõi.

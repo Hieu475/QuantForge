@@ -116,6 +116,156 @@ struct FuseEpiloguePass
     return b.create<arith::MulFOp>(loc, x, sigmoid(b, loc, z));
   }
 
+
+  /// int8-dequant: the kernel computes C[i32] = A[i8] @ Bt[i8]^T; the program then converts it to f16 with a row scale,
+  /// a column scale and a bias in an elementwise kernel (`y = f16(c * sx[m] * sw[n] + bias[n])`). Fold that into the GEMM's
+  /// final stores: every vector<2xi32> accumulator store becomes the dequantised pair, stored to the f16 output; the
+  /// elementwise kernel and the int32 buffer disappear. The operands are the function arguments tagged
+  /// quantforge.int8_row_scale / int8_col_scale / int8_bias (optional) / int8_out.
+  void runInt8Dequant() {
+    func::FuncOp func = getOperation();
+    Value sx, sw, bias, out;
+    for (unsigned i = 0; i < func.getNumArguments(); ++i) {
+      if (func.getArgAttr(i, "quantforge.int8_row_scale")) sx = func.getArgument(i);
+      if (func.getArgAttr(i, "quantforge.int8_col_scale")) sw = func.getArgument(i);
+      if (func.getArgAttr(i, "quantforge.int8_bias")) bias = func.getArgument(i);
+      if (func.getArgAttr(i, "quantforge.int8_out")) out = func.getArgument(i);
+    }
+    if (!sx || !sw || !out) {
+      func.emitError("epilogue=int8-dequant needs function arguments tagged quantforge.int8_row_scale, "
+                     "quantforge.int8_col_scale and quantforge.int8_out");
+      return signalPassFailure();
+    }
+    SmallVector<vector::StoreOp> accStores;
+    func.walk([&](gpu::LaunchOp launch) {
+      launch.walk([&](vector::StoreOp s) {
+        auto vt = dyn_cast<VectorType>(s.getValueToStore().getType());
+        if (!s.getMemRefType().getMemorySpace() && vt && vt.getElementType().isInteger(32))
+          accStores.push_back(s);
+      });
+    });
+    if (accStores.empty()) {
+      func.emitError("epilogue=int8-dequant found no i32 accumulator stores (needs the Tensor Core path with hoist-acc)");
+      return signalPassFailure();
+    }
+    Value cRoot;
+    llvm::SmallPtrSet<Operation *, 4> gemmLaunches; // the kernel(s) whose stores are rewritten: they must survive
+    for (vector::StoreOp st : accStores)
+      gemmLaunches.insert(st->getParentOfType<gpu::LaunchOp>().getOperation());
+    for (vector::StoreOp st : accStores) {
+      auto vt = cast<VectorType>(st.getValueToStore().getType());
+      if (vt.getNumElements() != 2 || vt.getRank() != 1) {
+        st.emitError("epilogue=int8-dequant needs vector<2xi32> accumulator stores");
+        return signalPassFailure();
+      }
+      OpBuilder b(st);
+      Location loc = st.getLoc();
+      Value memref = st.getBase();
+      Value row = st.getIndices()[0], col = st.getIndices()[1];
+      while (auto sv = memref.getDefiningOp<memref::SubViewOp>()) {
+        auto offs = sv.getMixedOffsets();
+        for (OpFoldResult stride : sv.getMixedStrides())
+          if (getConstantIntValue(stride) != 1) {
+            sv.emitError("int8-dequant epilogue needs unit strides");
+            return signalPassFailure();
+          }
+        row = b.create<arith::AddIOp>(loc, row, getValueOrCreateConstantIndexOp(b, loc, offs[0]));
+        col = b.create<arith::AddIOp>(loc, col, getValueOrCreateConstantIndexOp(b, loc, offs[1]));
+        memref = sv.getSource();
+      }
+      if (cRoot && cRoot != memref) {
+        st.emitError("int8-dequant epilogue: stores to more than one output buffer");
+        return signalPassFailure();
+      }
+      cRoot = memref;
+      Type f32 = b.getF32Type(), f16 = b.getF16Type();
+      Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+      Value rs = b.create<memref::LoadOp>(loc, sx, ValueRange{row});
+      Value res = b.create<arith::ConstantOp>(loc, DenseElementsAttr::get(VectorType::get({2}, f16), b.getF16FloatAttr(0.0f)));
+      for (int64_t k = 0; k < 2; ++k) {
+        Value ck = k ? b.create<arith::AddIOp>(loc, col, one).getResult() : col;
+        Value e = b.create<vector::ExtractOp>(loc, st.getValueToStore(), ArrayRef<int64_t>{k});
+        Value f = b.create<arith::SIToFPOp>(loc, f32, e);
+        Value v = b.create<arith::MulFOp>(loc, b.create<arith::MulFOp>(loc, f, rs),
+                                          b.create<memref::LoadOp>(loc, sw, ValueRange{ck}));
+        if (bias)
+          v = b.create<arith::AddFOp>(loc, v, b.create<memref::LoadOp>(loc, bias, ValueRange{ck}));
+        Value h = b.create<arith::TruncFOp>(loc, f16, v);
+        res = b.create<vector::InsertOp>(loc, h, res, ArrayRef<int64_t>{k});
+      }
+      // One 4-byte store for the pair of f16 (col is even): the generic lowering of vector<2xf16> stores gives two 2-byte stores
+      // (the memref alignment is that of the element), which writes every 32-byte sector a quarter at a time.
+      auto outTy = cast<MemRefType>(out.getType());
+      Type i32 = b.getI32Type(), i64 = b.getI64Type();
+      Value packed = b.create<vector::ExtractOp>(
+          loc, b.create<vector::BitCastOp>(loc, VectorType::get({1}, i32), res), ArrayRef<int64_t>{0});
+      Value baseIdx = b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, out);
+      Value stride = b.create<arith::ConstantIndexOp>(loc, outTy.getDimSize(1));
+      Value two = b.create<arith::ConstantIndexOp>(loc, 2);
+      Value off = b.create<arith::MulIOp>(loc, b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, row, stride), col), two);
+      Value addr = b.create<arith::IndexCastOp>(loc, i64, b.create<arith::AddIOp>(loc, baseIdx, off));
+      b.create<LLVM::InlineAsmOp>(loc, /*resultTypes=*/TypeRange{}, /*operands=*/ValueRange{addr, packed},
+                                  "st.global.b32 [$0], $1;", "l,r", /*has_side_effects=*/true, /*is_align_stack=*/false,
+                                  LLVM::AsmDialectAttr::get(b.getContext(), LLVM::AsmDialect::AD_ATT),
+                                  /*operand_attrs=*/ArrayAttr());
+      st->erase();
+    }
+    // The elementwise consumer kernel(s) of the int32 buffer and the buffer itself are dead now.
+    SmallVector<gpu::LaunchOp> dead;
+    func.walk([&](gpu::LaunchOp launch) {
+      if (gemmLaunches.contains(launch.getOperation()))
+        return;
+      bool usesC = false;
+      launch.walk([&](Operation *op) {
+        for (Value v : op->getOperands()) {
+          Value r = v;
+          while (auto sv = r.getDefiningOp<memref::SubViewOp>())
+            r = sv.getSource();
+          if (r == cRoot)
+            usesC = true;
+        }
+      });
+      if (usesC)
+        dead.push_back(launch);
+    });
+    for (gpu::LaunchOp l : dead)
+      l->erase();
+    // Subviews of the buffer that nothing reads any more (the address computations of the rewritten stores).
+    for (bool changed = true; changed;) {
+      changed = false;
+      SmallVector<Operation *> users(cRoot.getUsers().begin(), cRoot.getUsers().end());
+      for (Operation *u : users) {
+        auto sv = dyn_cast<memref::SubViewOp>(u);
+        if (!sv)
+          continue;
+        // erase a chain of dead subviews bottom-up
+        SmallVector<Operation *> chain{sv};
+        for (size_t i = 0; i < chain.size(); ++i)
+          for (Operation *user : chain[i]->getResult(0).getUsers())
+            if (isa<memref::SubViewOp>(user))
+              chain.push_back(user);
+        bool dead = llvm::all_of(chain, [&](Operation *c) {
+          return llvm::all_of(c->getResult(0).getUsers(), [&](Operation *x) { return isa<memref::SubViewOp>(x); });
+        });
+        if (!dead)
+          continue;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+          (*it)->erase();
+        changed = true;
+        break;
+      }
+    }
+    if (Operation *alloc = cRoot.getDefiningOp()) {
+      SmallVector<Operation *> users(cRoot.getUsers().begin(), cRoot.getUsers().end());
+      bool onlyDealloc = llvm::all_of(users, [](Operation *u) { return isa<gpu::DeallocOp, memref::DeallocOp>(u); });
+      if (onlyDealloc && isa<gpu::AllocOp, memref::AllocOp>(alloc)) {
+        for (Operation *u : users)
+          u->erase();
+        alloc->erase();
+      }
+    }
+  }
+
   static bool isF32OrVecF32(Type t) {
     if (auto vt = dyn_cast<VectorType>(t))
       t = vt.getElementType();
@@ -125,11 +275,13 @@ struct FuseEpiloguePass
   void runOnOperation() override {
     if (kind == "none" || kind.empty())
       return;
-    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu") {
+    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu" && kind != "int8-dequant") {
       getOperation().emitError("quantforge-fuse-epilogue: unknown kind '")
-          << kind << "' (relu | silu | gelu | swiglu)";
+          << kind << "' (relu | silu | gelu | swiglu | int8-dequant)";
       return signalPassFailure();
     }
+    if (kind == "int8-dequant")
+      return runInt8Dequant();
     SmallVector<Operation *> stores;
     getOperation().walk([&](gpu::LaunchOp launch) {
       launch.walk([&](Operation *op) {

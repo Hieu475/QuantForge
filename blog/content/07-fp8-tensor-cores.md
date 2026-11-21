@@ -101,3 +101,33 @@ Result, every output **bit-exact** against cuBLASLt (RTX 4050, GPU pre-heated, o
 Compiled from the same machinery as the W4A16 kernels, with a schedule chosen from a sweep of 129 exact combinations, it reaches 59 to 65 TOPS on the large shapes (three quarters of the 88 TOPS instruction peak, 77 to 88 percent of cuBLASLt, and above it on one shape) and is **1.1 to 1.7 times faster than cuBLAS fp16 on every shape tried**. Weights larger than the L2 want `block-swizzle=16` (2048 x 4096 x 11008: 21.7 to 59.6 TOPS), a reminder that block order matters as much as the tile.
 
 What this is not: a raw int32 GEMM, with no scales, no epilogue and no activation quantisation, so it is not yet a layer and not yet a speed-up of anything the user sees. Two caveats: the small-K shapes are held back by the int32 output (4 bytes per element), which a fused f16-store epilogue would halve; and it is one GPU, sm_89. The next steps are the ones the arithmetic named: fuse the row / column scales and the bias into the store, and quantise the activations in the kernel that produces them; then W4A8.
+
+## Update 3: fusing the dequantisation, and the model (2026-11-21)
+
+A raw int32 GEMM is not a layer: the output has to become f16 with a row scale (the activation's), a column scale (the weight's) and a bias. As a separate kernel that costs the int32 round trip: for a 2048 x 4096 x 4096 layer 33 MB written and read back, about as much time as a quarter of the GEMM. The compiler already folds an activation (relu, silu, swiglu) into the final store of the accumulators; a new epilogue kind, `int8-dequant`, does the same for `y = f16(c * sx[m] * sw[n] + bias[n])`. The program stays semantically ordinary, a `matmul` followed by an elementwise `linalg.generic`; the pass rewrites every `vector<2xi32>` accumulator store into the converted pair, written with one 4-byte store, and erases the elementwise kernel and the int32 buffer. Bit-exact against the f32 reference, with and without bias, and one kernel in the FileCheck test.
+
+**A measurement lesson.** The first benchmark said the fused kernel was *slower* than the raw GEMM (1.93 ms against 1.13 ms for 2048 x 4096 x 4096). `ncu` said it was not (1.21 against 1.25 ms, and half the DRAM writes). The profiler's device time (1.09 ms) against the wall time per launch (2.05 ms) located the missing millisecond on the host: the int32 buffer's allocation had survived the rewrite because dead `subview`s still pointed at it, so every call did a `cudaMalloc` and a `cudaFree` of 33 MB. Erasing the dead subviews removed it. Only comparing device time with wall time showed that the kernel was never the problem.
+
+GEMM plus dequantisation, one launch, f16 out (RTX 4050, GPU pre-heated; the fp16 column is a plain GEMM without any scale):
+
+| shape (M x K x N) | cuBLAS fp16 | int32 GEMM only | fused GEMM + dequant | vs fp16 |
+|---|--:|--:|--:|--:|
+| 2048 x 4096 x 4096 | 1.76 ms | 1.11 | 1.03 | **1.71x** |
+| 4096 x 4096 x 4096 | 3.51 | 2.12 | 2.12 | 1.66x |
+| 2048 x 4096 x 11008 | 5.06 | 3.09 | 2.96 | 1.71x |
+| 2048 x 4864 x 896 | 0.48 | 0.33 | 0.30 | 1.61x |
+| 2048 x 1536 x 8960 | 1.50 | 1.09 | 0.93 | 1.61x |
+| 2048 x 896 x 4864 | 0.48 | 0.46 | 0.37 | 1.31x |
+| 512 x 4096 x 4096 | 0.46 | 0.35 | 0.32 | 1.44x |
+
+The fused kernel is even faster than the raw int32 GEMM, because it writes half the bytes, and the small-K shapes that were the weakest as raw GEMMs now gain the most from the epilogue.
+
+**The model.** `quantize_model(model, "int8_w8a8")` now uses this kernel: activations are quantised per token (one compiled elementwise pass), the weight is per output channel, the GEMM and the dequantisation are the compiled kernel; layers whose N or K do not fit its tile fall back to cuBLASLt. Prefill of 2048 tokens, same run, fp16 against the compiled INT8 (and against the earlier cuBLASLt route):
+
+| model | fp16 | INT8, cuBLASLt route | INT8, compiled fused kernel | perplexity (fp16 -> INT8) |
+|---|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 93.1 ms | 103.7 (0.90x) | 86.7 (**1.07x**) | 18.79 -> 19.20 |
+| Llama-3.2-1B | 186.9 | 177.4 (1.05x) | 159.4 (**1.17x**) | 17.91 -> 18.23 |
+| Qwen2.5-1.5B | 238.1 | 226.6 (1.05x) | 204.4 (**1.16x**) | 12.66 -> 13.06 |
+
+So the same arithmetic that cuBLASLt could not turn into a whole-model gain is a 7 to 17 percent prefill speed-up when the epilogue is fused in the compiler. It is far less than the 1.5 to 1.7x of the GEMM, and the arithmetic says why: attention, the norms, the head (kept in fp16: for the 0.5B model it is about a sixth of the fp16 time), the activation quantisation pass and the host overhead of a Python layer are not touched. The obvious next steps are fusing the activation quantisation into the producer of the activations, quantising the head, and a W4A8 variant that halves the weight bytes as well; the quality cost (0.3 to 0.4 perplexity points for plain per-token / per-channel INT8) is the price to watch.

@@ -311,3 +311,11 @@ would break CUDA-graph capture). A useful version would reduce inside the kernel
 Schedule: `quantforge.e2e.INT8_GEMM_OPTS` (best of 129 exact combinations). `SharedMemoryPromotionPass::isTileSizedSubview` recognises operand tiles by shape (`[M-tile x K]`, `[K x N-tile]`); a transposed B is
 `[N-tile x K]` and used to be found only when block N happened to equal block M / warp M, otherwise the *warp* tile was promoted into a buffer shared by all warps (wrong results for 48 of 180 combinations);
 `[N-tile x K]` is accepted now, and `test/E2E/test_int8_gemm.py` covers the combinations that failed.
+
+### `epilogue=int8-dequant`
+
+The program is `matmul_transpose_b (i8 -> i32)` followed by a `linalg.generic` (`quantforge.no_tile`, `quantforge.no_vectorize`) computing `y = f16(c * sx[m] * sw[n] + bias[n])`; the function arguments are tagged
+`quantforge.int8_row_scale / int8_col_scale / int8_bias / int8_out`. `quantforge-fuse-epilogue{kind=int8-dequant}` (after the overwrite pass) rewrites every `vector<2xi32>` accumulator store of the GEMM kernel: the pair is converted
+(`sitofp`, two multiplies, bias, `truncf`) and stored to the f16 output at absolute coordinates with ONE 4-byte `st.global.b32` (inline asm; the generic lowering of a `vector<2xf16>` store gave two 2-byte stores). The elementwise
+kernel (every other `gpu.launch` that touches the int32 buffer), the dead subviews and the buffer's `gpu.alloc` / `gpu.dealloc` are erased: **the device allocation matters**, a first version left it and every call did a `cudaMalloc` of
+`M x N x 4` bytes (device time 1.1 ms, wall time 2.1 ms; ncu said the kernel was fine, the profiler's device time versus the wall time per launch said where the second millisecond was).

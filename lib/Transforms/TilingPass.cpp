@@ -315,6 +315,10 @@ struct TilingPass
     // ── Collect ops to tile ────────────────────────────────────────
     SmallVector<linalg::LinalgOp> worklist;
     funcOp.walk([&](linalg::LinalgOp op) {
+      // The fused-epilogue elementwise op (int8-dequant) is folded into the GEMM store by
+      // quantforge-fuse-epilogue; it is not tiled.
+      if (op->hasAttr("quantforge.no_tile"))
+        return;
       // Only tile ops that implement TilingInterface
       if (isa<TilingInterface>(op.getOperation()))
         worklist.push_back(op);
