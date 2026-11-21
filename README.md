@@ -522,6 +522,27 @@ K-folding changes nothing for the 3B model (71 tokens/s with and without it): it
 on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
 22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).
 
+### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
+
+An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, `quant.w4a8_quantize`) while vLLM loads it: `LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")`.
+Every linear layer whose sizes are multiples of 128 calls `torch.ops.quantforge.w4a8_hybrid` (`w4a8_op.py`): above 16 rows the compiled W4A8 kernel on the INT8 tensor cores (the per-token activation quantisation is the compiled
+`_int8_quantize_tokens`; with an eager one the prefill was half as fast), up to 16 rows the W4A16 decode kernels (with K-folding), both from the same weight; the branch is inside the op, so `torch.compile` and CUDA graphs see none.
+Measured on vLLM 0.25.1 (RTX 4050; `benchmarks/vllm_prefill.py`: prefill of 16 prompts of 975 tokens, decode of 1 / 16 requests; tokens/s, best of 3):
+
+| model, method | prefill | decode 1 | decode 16 |
+|---|--:|--:|--:|
+| Qwen2.5-0.5B fp16 | 31786 | 152 | 2297 |
+| 0.5B **quantforge_w4a8** (online) | **33320** | 257 | 3583 |
+| 0.5B GPTQ-Int4, `gptq_marlin` | 32880 | 297 | 4230 |
+| 0.5B GPTQ-Int4, `quantforge` (W4A16) | 20622 | 251 | 3524 |
+| Qwen2.5-1.5B **quantforge_w4a8** | **12045** | 114 | 1603 |
+| 1.5B GPTQ-Int4, `gptq_marlin` | 11517 | 135 | 1998 |
+| 1.5B GPTQ-Int4, `quantforge` (W4A16) | 7034 | 117 | 1638 |
+
+So the prefill is at the level of fp16 / Marlin (1.05x on the 1.5B) and 1.6-1.7x the W4A16 plugin, the decode is the W4A16 kernels' (0.80-0.85x of Marlin). It is not a clear win over Marlin: its advantages are that it quantises a plain checkpoint and
+that the prefill GEMMs run on the INT8 tensor cores; its costs are that the weights are kept in both layouts (about one byte per weight, the memory of INT8 rather than of INT4), the quantisation is round-to-nearest (no GPTQ; perplexity of the 0.5B
+23.7 against 20.5 with GPTQ), and it was tested on vLLM 0.25.1 only. Tests: `test/E2E/test_w4a8_op.py` (both paths against the dequantised reference, `torch.compile(fullgraph=True)`, generation under vLLM with `QUANTFORGE_SLOW_TESTS=1`).
+
 ### FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)
 
 `quantize_model(model, "fp8_w8a8")` replaces the Linears with `FP8W8A8Linear`: FP8 E4M3 weights *and* activations (per-output-channel weight scale, dynamic per-token

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* vLLM: `quantization="quantforge_w4a8"` (`QuantForgeW4A8Config` / `QuantForgeW4A8Method`, `quantforge.w4a8_op`, op `quantforge::w4a8_hybrid`): an ordinary fp16 checkpoint is quantised to W4A8 online; above 16 rows the W4A8 kernel, below it the W4A16 decode kernels, from the same weight (weights kept in both layouts). vLLM 0.25.1, Qwen2.5-0.5B: prefill 33.3k tokens/s (fp16 31.8k, Marlin 32.9k, quantforge W4A16 20.6k), decode 257 / 3583 at 1 / 16 requests (Marlin 297 / 4230); 1.5B prefill 12.0k vs 11.5k Marlin. `benchmarks/vllm_prefill.py`, `test/E2E/test_w4a8_op.py`.
+
 * Measured on Qwen2.5-3B (fp16 does not fit the 5.6 GB card): W4A8 prefill 356 ms / 2.07 GB, INT4 W4A16 498 ms / 2.25 GB, INT8 W8A8 310 ms / 3.42 GB; perplexity RTN / GPTQ W4A8 13.47 / 12.54, W4A16 13.13 / 12.06, INT8 12.15. `benchmarks/hf_fp8_w8a8.py` variant `int4_fphead`.
 
 * INT8 W8A8 and W4A8: the RMSNorm in front of the shared q/k/v and gate/up layers quantises its own output (`_rmsnorm_quantize`, installed by `_fuse_int8(fuse_norm=True)`, matched on the identity of the tensor the norm returned): 5-10 % faster whole-model prefill. Against fp16 with compiled RMSNorms: INT8 1.28x / 1.34x / 1.43x, W4A8 1.16x / 1.22x / 1.28x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B); against eager fp16 1.37x / 1.46x / 1.49x and 1.24x / 1.33x / 1.34x. Perplexity unchanged.

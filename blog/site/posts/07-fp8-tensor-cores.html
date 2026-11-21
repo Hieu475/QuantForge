@@ -28,6 +28,7 @@
 <li><a href="#update-6-fusing-silu-up-into-the-quantisation-2026-11-21">Update 6: fusing silu * up into the quantisation (2026-11-21)</a></li>
 <li><a href="#update-7-the-norm-quantises-its-own-output-and-a-fairer-baseline-2026-11-21">Update 7: the norm quantises its own output, and a fairer baseline (2026-11-21)</a></li>
 <li><a href="#update-8-a-model-that-does-not-fit-in-fp16-2026-11-21">Update 8: a model that does not fit in fp16 (2026-11-21)</a></li>
+<li><a href="#update-9-w4a8-inside-vllm-2026-11-21">Update 9: W4A8 inside vLLM (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p>The <a href="03-fp8-without-hardware.html">FP8 post</a> stored the <em>weights</em> in FP8 and still multiplied in fp16. The GeForce RTX 40 series has tensor cores that multiply FP8 operands directly, so a natural next step is <strong>W8A8</strong>: quantise the activations to FP8 too and run the GEMM on those cores. This post is the feasibility study and its (negative) result.</p>
@@ -663,7 +664,65 @@
 </tr>
 </tbody>
 </table>
-<p>W4A8 is 1.40x faster than INT4 W4A16 at prefill, and uses less memory, for 0.3 to 0.5 more perplexity points; INT8 is 15 percent faster still and the closest to fp16, but needs 1.65x the memory. (There is no fp16 row: the perplexity of the dense model would need a card with more memory. The decode of all three formats is unchanged by this post: W4A8 is a prefill format.) The picture of the 0.5B to 1.5B models holds one size up: the compiled INT8 kernels turn the prefill from a loss (INT4 W4A16 at 0.8x of fp16) into a gain, and the integer-scale W4A8 keeps the 4-bit memory.</p></article>
+<p>W4A8 is 1.40x faster than INT4 W4A16 at prefill, and uses less memory, for 0.3 to 0.5 more perplexity points; INT8 is 15 percent faster still and the closest to fp16, but needs 1.65x the memory. (There is no fp16 row: the perplexity of the dense model would need a card with more memory. The decode of all three formats is unchanged by this post: W4A8 is a prefill format.) The picture of the 0.5B to 1.5B models holds one size up: the compiled INT8 kernels turn the prefill from a loss (INT4 W4A16 at 0.8x of fp16) into a gain, and the integer-scale W4A8 keeps the 4-bit memory.</p>
+<h2 id="update-9-w4a8-inside-vllm-2026-11-21">Update 9: W4A8 inside vLLM (2026-11-21)<a class="headerlink" href="#update-9-w4a8-inside-vllm-2026-11-21" title="Permanent link">#</a></h2>
+<p><code>quantization="quantforge_w4a8"</code> quantises an ordinary fp16 checkpoint to W4A8 while vLLM loads it (no GPTQ checkpoint needed; vLLM builds a quantisation config with no arguments when the method names no config file, so nothing in the model directory has to say anything). The linear layers call one custom op, <code>quantforge::w4a8_hybrid</code>: above 16 rows it quantises the activations per token and runs the compiled W4A8 kernel; up to 16 rows it runs the W4A16 decode kernels (K-folding included) on the same weight, written in the other layout (<code>from_w4a8</code>: the nibbles repacked along N, the scale <code>gs * sw</code> in f16, the zero point unchanged, so the dequantised weights are the same). The branch on the row count is inside the op, which is why <code>torch.compile</code> and the CUDA graphs vLLM captures see no Python branch on a dynamic dimension; a test traces the op with <code>fullgraph=True</code>.</p>
+<p>It ran at the first attempt, and the first measurement was bad: <strong>prefill at half the speed of fp16</strong> (16.6k tokens/s against 31.8k). The cause was the activation quantisation, which I had written eagerly inside the op (about six passes over a float32 copy of the activations, as expensive as the GEMM itself for these sizes); calling the compiled <code>_int8_quantize_tokens</code> instead (its first call is vLLM's profiling run, before any graph is captured) made it <strong>33.3k</strong>. vLLM 0.25.1, RTX 4050, 16 prompts of 975 tokens for the prefill, short prompts for the decode, tokens per second, best of three:</p>
+<table>
+<thead>
+<tr>
+<th>model, method</th>
+<th style="text-align: right;">prefill</th>
+<th style="text-align: right;">decode 1 request</th>
+<th style="text-align: right;">decode 16 requests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B fp16</td>
+<td style="text-align: right;">31786</td>
+<td style="text-align: right;">152</td>
+<td style="text-align: right;">2297</td>
+</tr>
+<tr>
+<td>0.5B <strong>quantforge_w4a8</strong> (online)</td>
+<td style="text-align: right;"><strong>33320</strong></td>
+<td style="text-align: right;">257</td>
+<td style="text-align: right;">3583</td>
+</tr>
+<tr>
+<td>0.5B GPTQ-Int4, <code>gptq_marlin</code></td>
+<td style="text-align: right;">32880</td>
+<td style="text-align: right;">297</td>
+<td style="text-align: right;">4230</td>
+</tr>
+<tr>
+<td>0.5B GPTQ-Int4, <code>quantforge</code> (W4A16)</td>
+<td style="text-align: right;">20622</td>
+<td style="text-align: right;">251</td>
+<td style="text-align: right;">3524</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B <strong>quantforge_w4a8</strong></td>
+<td style="text-align: right;"><strong>12045</strong></td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">1603</td>
+</tr>
+<tr>
+<td>1.5B GPTQ-Int4, <code>gptq_marlin</code></td>
+<td style="text-align: right;">11517</td>
+<td style="text-align: right;">135</td>
+<td style="text-align: right;">1998</td>
+</tr>
+<tr>
+<td>1.5B GPTQ-Int4, <code>quantforge</code> (W4A16)</td>
+<td style="text-align: right;">7034</td>
+<td style="text-align: right;">117</td>
+<td style="text-align: right;">1638</td>
+</tr>
+</tbody>
+</table>
+<p>The honest reading: the prefill is at the level of fp16 and of Marlin (1.05x on the 1.5B, where the GEMMs weigh more) and 1.6 to 1.7x the W4A16 plugin; the decode is the W4A16 kernels' and so 0.80 to 0.85x of Marlin as before. In a serving engine the GEMMs are a smaller part of the prefill than in the Hugging Face model of the earlier updates (vLLM already fuses the norms and the activation), so the 1.2 to 1.5x there shrinks to parity here. <strong>It is not a clear win over Marlin.</strong> What it offers is that a plain fp16 checkpoint is enough and that the prefill GEMMs use the INT8 tensor cores; what it costs is that both layouts of the weight are kept (about one byte per weight: the memory of INT8, not of INT4), round-to-nearest quantisation (the 0.5B at 23.7 perplexity against 20.5 with GPTQ), and that I have tested it on vLLM 0.25.1 only. Dropping the decode copy (a W4A16 kernel that reads the nibbles along K) or loading GPTQ checkpoints into the W4A8 layout would address the first two; neither is done.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

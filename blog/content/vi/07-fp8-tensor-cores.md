@@ -237,3 +237,21 @@ Qwen2.5-3B-Instruct nặng khoảng 6 GB ở fp16 mà card chỉ có 5.6 GB, nê
 | INT4 W4A16 | 498 ms | 2.25 GB | 13.13 | 12.06 |
 
 W4A8 nhanh hơn INT4 W4A16 1.40x ở prefill và dùng ít bộ nhớ hơn, đổi lại perplexity cao hơn 0.3 đến 0.5 điểm; INT8 còn nhanh hơn 15 phần trăm và gần fp16 nhất, nhưng cần gấp 1.65 lần bộ nhớ. (Không có hàng fp16: perplexity của model dense cần một card nhiều bộ nhớ hơn. Decode của cả ba định dạng không đổi trong bài này: W4A8 là định dạng cho prefill.) Bức tranh của các model 0.5B đến 1.5B giữ nguyên khi lên một cỡ: các kernel INT8 đã biên dịch biến prefill từ thua (INT4 W4A16 ở 0.8x của fp16) thành lời, và W4A8 với scale nguyên giữ được bộ nhớ 4-bit.
+
+## Cập nhật 9: W4A8 bên trong vLLM (2026-11-21)
+
+`quantization="quantforge_w4a8"` lượng tử hóa một checkpoint fp16 bình thường sang W4A8 ngay khi vLLM nạp nó (không cần checkpoint GPTQ; vLLM dựng cấu hình lượng tử hóa không tham số khi phương thức không nêu tệp cấu hình, nên không cần gì trong thư mục model). Các lớp tuyến tính gọi một custom op, `quantforge::w4a8_hybrid`: trên 16 hàng nó lượng tử hóa activation theo token và chạy kernel W4A8 đã biên dịch; từ 16 hàng trở xuống nó chạy kernel decode W4A16 (gồm K-folding) trên cùng weight, ghi theo layout kia (`from_w4a8`: các nibble đóng gói lại theo N, scale `gs * sw` ở f16, zero point giữ nguyên, nên weight dequantise là như nhau). Phép rẽ nhánh theo số hàng nằm trong op, nên `torch.compile` và các CUDA graph mà vLLM ghi lại không thấy nhánh Python nào trên một chiều động; một test trace op với `fullgraph=True`.
+
+Nó chạy ngay lần thử đầu, và phép đo đầu tiên thì tệ: **prefill chỉ bằng một nửa tốc độ fp16** (16.6k token/s so với 31.8k). Nguyên nhân là phép lượng tử hóa activation, tôi đã viết eager trong op (khoảng sáu lượt trên bản sao float32 của activation, tốn ngang chính GEMM ở các kích thước này); gọi `_int8_quantize_tokens` đã biên dịch thay vào đó (lần gọi đầu là lượt profiling của vLLM, trước khi bất kỳ graph nào được ghi) đưa nó lên **33.3k**. vLLM 0.25.1, RTX 4050, 16 prompt 975 token cho prefill, prompt ngắn cho decode, token mỗi giây, tốt nhất trong ba lần:
+
+| model, phương thức | prefill | decode 1 request | decode 16 request |
+|---|--:|--:|--:|
+| Qwen2.5-0.5B fp16 | 31786 | 152 | 2297 |
+| 0.5B **quantforge_w4a8** (online) | **33320** | 257 | 3583 |
+| 0.5B GPTQ-Int4, `gptq_marlin` | 32880 | 297 | 4230 |
+| 0.5B GPTQ-Int4, `quantforge` (W4A16) | 20622 | 251 | 3524 |
+| Qwen2.5-1.5B **quantforge_w4a8** | **12045** | 114 | 1603 |
+| 1.5B GPTQ-Int4, `gptq_marlin` | 11517 | 135 | 1998 |
+| 1.5B GPTQ-Int4, `quantforge` (W4A16) | 7034 | 117 | 1638 |
+
+Cách đọc trung thực: prefill ngang fp16 và Marlin (1.05x ở 1.5B, nơi các GEMM nặng hơn) và gấp 1.6 đến 1.7x plugin W4A16; decode là của các kernel W4A16 nên vẫn 0.80 đến 0.85x Marlin như trước. Trong một engine phục vụ, các GEMM là phần nhỏ hơn của prefill so với model Hugging Face ở các cập nhật trước (vLLM đã gộp sẵn các norm và activation), nên mức 1.2 đến 1.5x ở đó co lại thành ngang bằng ở đây. **Nó không thắng Marlin rõ ràng.** Cái nó đem lại là chỉ cần một checkpoint fp16 và các GEMM prefill dùng tensor core INT8; cái nó tốn là phải giữ cả hai layout của weight (khoảng một byte mỗi weight: bộ nhớ của INT8, không phải của INT4), lượng tử hóa làm tròn gần nhất (0.5B ở perplexity 23.7 so với 20.5 với GPTQ), và tôi chỉ mới kiểm tra trên vLLM 0.25.1. Bỏ bản sao cho decode (một kernel W4A16 đọc nibble theo K) hoặc nạp checkpoint GPTQ vào layout W4A8 sẽ giải quyết hai điểm đầu; cả hai chưa làm.
