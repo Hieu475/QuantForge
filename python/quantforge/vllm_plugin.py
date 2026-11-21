@@ -212,7 +212,7 @@ if HAVE_VLLM:
         both from the same weight. Memory: about one byte per weight (the two layouts), a quarter of fp16 would need dropping the decode copy."""
 
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            from . import quant, w4a8_op
+            from . import kfold, quant, w4a8_op
 
             w = layer.weight.data
             N, K = w.shape
@@ -221,9 +221,19 @@ if HAVE_VLLM:
                 return super().process_weights_after_loading(layer)
             parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
             packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
-            p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw)
-            _install(layer, p16, s16, z16, None, 128, ("weight",))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
+            if os.environ.get("QUANTFORGE_W4A8_DECODE", "w4a16") == "compact":
+                # one copy of the nibbles: the decode reads the W4A8 layout itself (slower, a quarter of fp16's memory)
+                e = kfold.no_fold(w.device)
+                del layer.weight
+                layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), param(e[1]), param(e[2])
+                layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = param(e[0]), param(e[1]), param(e[2])
+                layer.qf_group = 128
+                layer.qf8_scale_nk = param((gs.float() * sw[:, None]).half())
+            else:
+                p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw)
+                _install(layer, p16, s16, z16, None, 128, ("weight",))
+                layer.qf8_scale_nk = param(torch.empty(0, device=w.device, dtype=torch.float16))
             layer.qf8_packed, layer.qf8_gs, layer.qf8_zp, layer.qf8_sw = param(packed), param(gs), param(zp), param(sw)
 
         def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -232,7 +242,8 @@ if HAVE_VLLM:
             xh = x if x.dtype == torch.float16 else x.half()
             y = torch.ops.quantforge.w4a8_hybrid(
                 xh, layer.qf8_packed, layer.qf8_gs, layer.qf8_zp, layer.qf8_sw, None if bias is None else bias.half(),
-                layer.qf_packed, layer.qf_scale, layer.qf_zero, layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f, layer.qf_group)
+                layer.qf_packed, layer.qf_scale, layer.qf_zero, layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f, layer.qf_group,
+                layer.qf8_scale_nk)
             return y if x.dtype == torch.float16 else y.to(x.dtype)
 
     @register_quantization_config("quantforge_w4a8")

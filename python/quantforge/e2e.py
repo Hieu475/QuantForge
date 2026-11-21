@@ -744,6 +744,80 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs:
         self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
 
 
+W4A8_DECODE_OPTS = "decode=true block-tile-n=64 warp-tile-n=16 block-tile-k=128 smem-stages=3 accumulate=false"
+
+
+class W4A8DecodeGemm:
+    """``C[f32, M <= 16 rows] = A[f16] @ dequant(Bp)^T`` reading the W4A8 layout (nibbles along K, ``zp`` int8 and ``sc`` f16 ``[N, K/128]``;
+    ``sc = gs * sw``): the weight tile is built by a ``linalg.generic`` producer fused into the loads, so the decode and the W4A8 prefill kernel
+    share the same nibbles (a quarter of the memory of fp16 instead of the two layouts of the hybrid op). 1.1-1.7x slower than the
+    dedicated W4A16 decode kernel (``benchmarks/w4a8_decode_layout.py``). Experimental."""
+
+    NAME = "w4a8_decode"
+
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled):
+        self.M, self.K, self.N = M, K, N
+        self.compiled = compiled
+        self._lib = ctypes.CDLL(str(compiled.lib_path))
+        self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
+        self._fn.argtypes = [ctypes.c_void_p] * 6
+        self._fn.restype = None
+        self._set_stream = self._lib.mgpuSetStream
+        self._set_stream.argtypes = [ctypes.c_void_p]
+        self._result = _descriptor_type(2)()
+
+    @classmethod
+    def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS) -> "W4A8DecodeGemm":
+        G = W4A8_GROUP
+        if K % G:
+            raise ValueError(f"K={K} must be a multiple of {G}")
+        ir = f"""#nk = affine_map<(n, k) -> (n, k)>
+func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp: tensor<{N}x{K // G}xi8>, %sc: tensor<{N}x{K // G}xf16>,
+                      %c: tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32> {{
+  %c0 = arith.constant 0 : index
+  %c2 = arith.constant 2 : index
+  %cg = arith.constant {G} : index
+  %m15 = arith.constant 15 : i8
+  %c4 = arith.constant 4 : i8
+  %eb = tensor.empty() : tensor<{N}x{K}xf16>
+  %bt = linalg.generic {{indexing_maps = [#nk], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      outs(%eb : tensor<{N}x{K}xf16>) {{
+    ^bb0(%o: f16):
+      %n = linalg.index 0 : index
+      %k = linalg.index 1 : index
+      %kb = arith.divui %k, %c2 : index
+      %kg = arith.divui %k, %cg : index
+      %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
+      %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
+      %s = tensor.extract %sc[%n, %kg] : tensor<{N}x{K // G}xf16>
+      %par = arith.remui %k, %c2 : index
+      %odd = arith.cmpi ne, %par, %c0 : index
+      %lo = arith.andi %p, %m15 : i8
+      %hi0 = arith.shrui %p, %c4 : i8
+      %nib = arith.select %odd, %hi0, %lo : i8
+      %v = arith.subi %nib, %z : i8
+      %vf = arith.sitofp %v : i8 to f16
+      %w = arith.mulf %vf, %s : f16
+      linalg.yield %w : f16
+  }} -> tensor<{N}x{K}xf16>
+  %r = linalg.matmul_transpose_b ins(%a, %bt : tensor<{M}x{K}xf16>, tensor<{N}x{K}xf16>) outs(%c : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  return %r : tensor<{M}x{N}xf32>
+}}
+"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=pipeline_opts))
+
+    def launch(self, a, bp, zp, sc, out) -> None:
+        """``out`` f32 ``[M, N]`` is overwritten; ``a`` f16 ``[M, K]``."""
+        import torch
+
+        d = [_descriptor(t) for t in (a, bp, zp, sc, out)]
+        self._set_stream(_current_raw_stream(torch, a.device.index or 0))
+        self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
+
+
 class Int8GemmDq:
     """INT8 GEMM with the dequantisation fused into the store: ``y[f16] = (A @ Bt^T)[i32] * sx[m] * sw[n] + bias[n]`` (``epilogue=int8-dequant``).
 

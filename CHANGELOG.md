@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* vLLM W4A8: `QUANTFORGE_W4A8_DECODE=compact` keeps one copy of the nibbles (`e2e.W4A8DecodeGemm`: the decode reads the W4A8 layout through a fused producer, 1.1-1.7x slower than the W4A16 decode kernel): weights 1.13 GiB instead of 2.04 GiB (Qwen2.5-1.5B), decode 10-17 % lower at 1 request, 2-10 % at 16, prefill unchanged. `w4a8_hybrid` got a `scale_nk` argument. `benchmarks/w4a8_decode_layout.py`.
+
 * vLLM: `quantization="quantforge_w4a8"` (`QuantForgeW4A8Config` / `QuantForgeW4A8Method`, `quantforge.w4a8_op`, op `quantforge::w4a8_hybrid`): an ordinary fp16 checkpoint is quantised to W4A8 online; above 16 rows the W4A8 kernel, below it the W4A16 decode kernels, from the same weight (weights kept in both layouts). vLLM 0.25.1, Qwen2.5-0.5B: prefill 33.3k tokens/s (fp16 31.8k, Marlin 32.9k, quantforge W4A16 20.6k), decode 257 / 3583 at 1 / 16 requests (Marlin 297 / 4230); 1.5B prefill 12.0k vs 11.5k Marlin. `benchmarks/vllm_prefill.py`, `test/E2E/test_w4a8_op.py`.
 
 * Measured on Qwen2.5-3B (fp16 does not fit the 5.6 GB card): W4A8 prefill 356 ms / 2.07 GB, INT4 W4A16 498 ms / 2.25 GB, INT8 W8A8 310 ms / 3.42 GB; perplexity RTN / GPTQ W4A8 13.47 / 12.54, W4A16 13.13 / 12.06, INT8 12.15. `benchmarks/hf_fp8_w8a8.py` variant `int4_fphead`.

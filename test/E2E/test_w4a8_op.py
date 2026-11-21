@@ -35,37 +35,50 @@ def test_the_w4a16_layout_dequantises_to_the_same_weight():
     assert (deq16 - ref).abs().max() <= 1e-3 * ref.abs().max()                        # only gs * sw is rounded to f16
 
 
+def _args(compact):
+    """(w, W4A8 tensors, the decode tensors the op takes, generator): compact = no W4A16 copy, the decode reads the W4A8 layout."""
+    w, (packed, gs, zp, sw), (p16, s16, z16), (pf, sf, zf), g = _layer()
+    if compact:
+        p16, s16, z16 = pf, sf, zf                                                      # empty placeholders
+        snk = (gs.float() * sw[:, None]).half()
+    else:
+        snk = torch.empty(0, device="cuda", dtype=torch.float16)
+    return (packed, gs, zp, sw), (p16, s16, z16, pf, sf, zf), snk, g
+
+
+@pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 40, 200])
 @pytest.mark.parametrize("bias", [False, True])
-def test_hybrid_op_matches_the_dequantised_reference_on_both_paths(rows, bias):
+def test_hybrid_op_matches_the_dequantised_reference_on_both_paths(rows, bias, compact):
     _require_gpu()
     from quantforge import quant
 
-    w, (packed, gs, zp, sw), (p16, s16, z16), (pf, sf, zf), g = _layer()
+    (packed, gs, zp, sw), dec, snk, g = _args(compact)
     b = torch.randn(256, device="cuda", dtype=torch.float16, generator=g) if bias else None
     x = torch.randn(rows, 512, device="cuda", dtype=torch.float16, generator=g)
-    y = torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, b, p16, s16, z16, pf, sf, zf, 128)
+    y = torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, b, *dec, 128, snk)
     assert y.shape == (rows, 256) and y.dtype == torch.float16
     ref = x.float() @ quant.w4a8_dequantize(packed, gs, zp, sw).t()
     if bias:
         ref = ref + b.float()
     tol = 0.03 if rows > 16 else 0.01                                                  # the activation rounding only exists above 16 rows
     assert (y.float() - ref).norm() / ref.norm() < tol, rows
-    y3 = torch.ops.quantforge.w4a8_hybrid(x.reshape(1, rows, 512), packed, gs, zp, sw, b, p16, s16, z16, pf, sf, zf, 128)
+    y3 = torch.ops.quantforge.w4a8_hybrid(x.reshape(1, rows, 512), packed, gs, zp, sw, b, *dec, 128, snk)
     assert y3.shape == (1, rows, 256)
 
 
-def test_hybrid_op_traces_under_torch_compile():
+@pytest.mark.parametrize("compact", [False, True])
+def test_hybrid_op_traces_under_torch_compile(compact):
     _require_gpu()
-    w, (packed, gs, zp, sw), (p16, s16, z16), (pf, sf, zf), g = _layer()
+    (packed, gs, zp, sw), dec, snk, g = _args(compact)
 
     @torch.compile(fullgraph=True, dynamic=True)
     def f(x):
-        return torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, None, p16, s16, z16, pf, sf, zf, 128) + 1
+        return torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, None, *dec, 128, snk) + 1
 
     for rows in (4, 64):
         x = torch.randn(rows, 512, device="cuda", dtype=torch.float16, generator=g)
-        eager = torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, None, p16, s16, z16, pf, sf, zf, 128) + 1
+        eager = torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw, None, *dec, 128, snk) + 1
         assert (f(x).float() - eager.float()).abs().max() < 2e-2
 
 
@@ -81,7 +94,8 @@ def test_vllm_w4a8_method_is_registered():
 
 
 @pytest.mark.skipif(os.environ.get("QUANTFORGE_SLOW_TESTS") != "1", reason="slow test: set QUANTFORGE_SLOW_TESTS=1")
-def test_vllm_generates_sensible_text_with_online_w4a8():
+@pytest.mark.parametrize("mode", ["w4a16", "compact"])
+def test_vllm_generates_sensible_text_with_online_w4a8(mode):
     pytest.importorskip("vllm")
     import subprocess
 
@@ -91,6 +105,6 @@ def test_vllm_generates_sensible_text_with_online_w4a8():
         "ps = ['What is the capital of France?'] + ['Count: ' + ' '.join(str(i) for i in range(60))] * 20\n"      # one short and 20 long prompts: both paths
         "out = llm.generate(ps, SamplingParams(temperature=0.0, max_tokens=24))\n"
         "print('TEXT:' + out[0].outputs[0].text.replace(chr(10), ' '))\n")
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, "QUANTFORGE_W4A8_DECODE": mode})
     assert "TEXT:" in r.stdout, r.stderr[-1500:]
     assert "Paris" in r.stdout.split("TEXT:")[1]
