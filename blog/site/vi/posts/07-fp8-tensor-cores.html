@@ -26,6 +26,7 @@
 <li><a href="#cap-nhat-4-dung-chung-luong-tu-hoa-mot-ban-profile-va-hai-cai-bay-o-luong-2026-11-21">Cập nhật 4: dùng chung lượng tử hóa, một bản profile, và hai cái bẫy đo lường (2026-11-21)</a></li>
 <li><a href="#cap-nhat-5-w4a8-va-ly-do-toi-ua-ra-e-khong-lam-no-la-sai-2026-11-21">Cập nhật 5: W4A8, và lý do tôi đưa ra để không làm nó là sai (2026-11-21)</a></li>
 <li><a href="#cap-nhat-6-gop-silu-up-vao-buoc-luong-tu-hoa-2026-11-21">Cập nhật 6: gộp silu * up vào bước lượng tử hóa (2026-11-21)</a></li>
+<li><a href="#cap-nhat-7-norm-tu-luong-tu-hoa-au-ra-cua-no-va-mot-baseline-cong-bang-hon-2026-11-21">Cập nhật 7: norm tự lượng tử hóa đầu ra của nó, và một baseline công bằng hơn (2026-11-21)</a></li>
 </ul>
 </div>
 </details><p><a href="03-fp8-without-hardware.html">Bài về FP8</a> lưu <em>weight</em> ở FP8 và vẫn nhân bằng fp16. Dòng GeForce RTX 40 có tensor core nhân trực tiếp các toán hạng FP8, nên bước tự nhiên tiếp theo là <strong>W8A8</strong>: lượng tử hóa cả activation sang FP8 và chạy GEMM trên các core đó. Bài này là nghiên cứu khả thi và kết quả (âm) của nó.</p>
@@ -578,7 +579,53 @@
 </tr>
 </tbody>
 </table>
-<p>(Tỷ lệ so với fp16 của phiên đó.) Vậy "28 phần trăm prefill là các phép elementwise" ở Cập nhật 4 không phải một bức tường: phần nằm giữa hai lớp đã lượng tử hóa gộp được, và riêng nó đáng 8 đến 14 phần trăm. Nó cũng đổi phép so sánh giữa các định dạng: W4A8, vốn ở tốc độ fp16, giờ đạt 1.16 đến 1.24x với một phần tư bộ nhớ weight. Phần còn lại của 28 phần trăm là các norm, rotary embedding và phép cộng residual; cùng thủ thuật này (gộp bước lượng tử hóa đầu vào của lớp kế tiếp vào norm sinh ra nó) áp dụng được cho q/k/v và gate/up, vốn có đầu vào là đầu ra của RMSNorm.</p></article>
+<p>(Tỷ lệ so với fp16 của phiên đó.) Vậy "28 phần trăm prefill là các phép elementwise" ở Cập nhật 4 không phải một bức tường: phần nằm giữa hai lớp đã lượng tử hóa gộp được, và riêng nó đáng 8 đến 14 phần trăm. Nó cũng đổi phép so sánh giữa các định dạng: W4A8, vốn ở tốc độ fp16, giờ đạt 1.16 đến 1.24x với một phần tư bộ nhớ weight. Phần còn lại của 28 phần trăm là các norm, rotary embedding và phép cộng residual; cùng thủ thuật này (gộp bước lượng tử hóa đầu vào của lớp kế tiếp vào norm sinh ra nó) áp dụng được cho q/k/v và gate/up, vốn có đầu vào là đầu ra của RMSNorm.</p>
+<h2 id="cap-nhat-7-norm-tu-luong-tu-hoa-au-ra-cua-no-va-mot-baseline-cong-bang-hon-2026-11-21">Cập nhật 7: norm tự lượng tử hóa đầu ra của nó, và một baseline công bằng hơn (2026-11-21)<a class="headerlink" href="#cap-nhat-7-norm-tu-luong-tu-hoa-au-ra-cua-no-va-mot-baseline-cong-bang-hon-2026-11-21" title="Permanent link">#</a></h2>
+<p>q/k/v và gate/up đọc đầu ra của một RMSNorm, và đầu ra đó được lượng tử hóa ngay sau đó: norm ghi kết quả fp16, bộ lượng tử hóa đọc nó để lấy max theo hàng, rồi đọc lần nữa để chia và làm tròn. <code>_rmsnorm_quantize</code> tính norm cùng các giá trị int8 và scale trong một hàm đã biên dịch (đầu ra fp16 vẫn được trả về, như hợp đồng của module); <code>_install_norm_quantisation</code> làm cho <code>input_layernorm</code> và <code>post_attention_layernorm</code> của một khối gọi nó, và lớp dùng chung tìm kết quả qua danh tính của tensor mà norm trả về (một bộ đếm, <code>pre_hits</code>, cho phép test kiểm tra đường này thật sự được dùng: 4 lần khớp mỗi forward ở trên 16 hàng, không lần nào ở dưới). Chỉ dạng RMSNorm của Llama / Qwen / Mistral được gộp (không phải <code>1 + weight</code> của Gemma).</p>
+<p><strong>Một baseline công bằng hơn.</strong> Biên dịch norm giúp <em>mọi</em> model, không riêng model đã lượng tử hóa, nên tôi cũng đo fp16 với mọi RMSNorm đã biên dịch. Prefill cả model, 2048 token, mỗi biến thể một tiến trình, fp16 đo ở đầu và ở cuối mỗi model (xung nhịp trôi tới 5 phần trăm trong phiên này, nên chỉ so sánh trong bảng):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16 eager</th>
+<th style="text-align: right;">fp16, norm đã biên dịch</th>
+<th style="text-align: right;">INT8, không gộp norm</th>
+<th style="text-align: right;"><strong>INT8</strong></th>
+<th style="text-align: right;">W4A8, không gộp norm</th>
+<th style="text-align: right;"><strong>W4A8</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">87.6 / 92.3 ms</td>
+<td style="text-align: right;">84.3</td>
+<td style="text-align: right;">70.6</td>
+<td style="text-align: right;"><strong>65.8</strong></td>
+<td style="text-align: right;">76.1</td>
+<td style="text-align: right;"><strong>72.7</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">187.9 / 181.3</td>
+<td style="text-align: right;">169.6</td>
+<td style="text-align: right;">139.5</td>
+<td style="text-align: right;"><strong>126.8</strong></td>
+<td style="text-align: right;">157.4</td>
+<td style="text-align: right;"><strong>139.2</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">239.3 / 240.0</td>
+<td style="text-align: right;">229.1</td>
+<td style="text-align: right;">177.2</td>
+<td style="text-align: right;"><strong>160.7</strong></td>
+<td style="text-align: right;">195.1</td>
+<td style="text-align: right;"><strong>179.2</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Phép gộp đáng 7 đến 10 phần trăm cho INT8 và 5 đến 13 phần trăm cho W4A8 trên nền Cập nhật 6, perplexity không đổi (19.207 so với 19.201, 18.238 so với 18.235, 13.074 cả hai; W4A8 23.703 so với 23.714, 22.069 so với 22.057, 14.693 cả hai). So với trung bình hai lần chạy fp16 eager, INT8 là <strong>1.37x, 1.46x và 1.49x</strong> và W4A8 1.24x, 1.33x và 1.34x; so với fp16 có norm đã biên dịch, phép so sánh tôi sẽ trích dẫn vì một engine sẽ không chạy norm eager, INT8 là <strong>1.28x, 1.34x và 1.43x</strong> và W4A8 1.16x, 1.22x và 1.28x. (Các batch 8 x 512 còn được lợi nhiều hơn, ví dụ INT8 Llama 301.9 xuống 246.9 ms.) Mọi bước từ Cập nhật 3 đều là gộp một thứ nằm ngoài GEMM; phần còn lại của 28 phần trăm ban đầu là rotary embedding, phép cộng residual và chính attention.</p></article>
 </main>
 <footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
 </body>

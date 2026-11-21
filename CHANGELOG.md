@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* INT8 W8A8 and W4A8: the RMSNorm in front of the shared q/k/v and gate/up layers quantises its own output (`_rmsnorm_quantize`, installed by `_fuse_int8(fuse_norm=True)`, matched on the identity of the tensor the norm returned): 5-10 % faster whole-model prefill. Against fp16 with compiled RMSNorms: INT8 1.28x / 1.34x / 1.43x, W4A8 1.16x / 1.22x / 1.28x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B); against eager fp16 1.37x / 1.46x / 1.49x and 1.24x / 1.33x / 1.34x. Perplexity unchanged.
+
 * INT8 W8A8 and W4A8: `silu(gate) * up` and the per-token INT8 quantisation of the `down_proj` input are one compiled function (`_silu_mul_quantize`, installed on the MLP by `_fuse_int8`; `fuse_activation=False` turns it off): whole-model prefill 8-14 % faster than without it, INT8 1.22x / 1.28x / 1.36x of fp16, W4A8 1.21x / 1.16x / 1.24x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), perplexity unchanged (+0.002..0.012).
 
 * W4A8 kernel: the weight producer reads the packed byte / scale / zero point with `tensor.extract` and unsigned index arithmetic instead of affine `floordiv` maps, so the loads vectorise (`ld.global.u32`): kernel 1.19-1.40x cuBLAS fp16 (was 1.11-1.26x), 50-58 TOPS; whole-model prefill 1.03x / 1.07x / 1.10x of fp16 (was 1.01x / 1.07x / 1.04x).

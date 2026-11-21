@@ -211,3 +211,17 @@ Mức tăng đo được gấp đôi ước tính của tôi. Prefill 2048 token
 | Qwen2.5-1.5B | 199.8 (1.20x) | **177.5 (1.36x)** | 218.4 (1.10x) | **193.8 (1.24x)** | 13.062 -> 13.074 / 14.703 -> 14.693 |
 
 (Tỷ lệ so với fp16 của phiên đó.) Vậy "28 phần trăm prefill là các phép elementwise" ở Cập nhật 4 không phải một bức tường: phần nằm giữa hai lớp đã lượng tử hóa gộp được, và riêng nó đáng 8 đến 14 phần trăm. Nó cũng đổi phép so sánh giữa các định dạng: W4A8, vốn ở tốc độ fp16, giờ đạt 1.16 đến 1.24x với một phần tư bộ nhớ weight. Phần còn lại của 28 phần trăm là các norm, rotary embedding và phép cộng residual; cùng thủ thuật này (gộp bước lượng tử hóa đầu vào của lớp kế tiếp vào norm sinh ra nó) áp dụng được cho q/k/v và gate/up, vốn có đầu vào là đầu ra của RMSNorm.
+
+## Cập nhật 7: norm tự lượng tử hóa đầu ra của nó, và một baseline công bằng hơn (2026-11-21)
+
+q/k/v và gate/up đọc đầu ra của một RMSNorm, và đầu ra đó được lượng tử hóa ngay sau đó: norm ghi kết quả fp16, bộ lượng tử hóa đọc nó để lấy max theo hàng, rồi đọc lần nữa để chia và làm tròn. `_rmsnorm_quantize` tính norm cùng các giá trị int8 và scale trong một hàm đã biên dịch (đầu ra fp16 vẫn được trả về, như hợp đồng của module); `_install_norm_quantisation` làm cho `input_layernorm` và `post_attention_layernorm` của một khối gọi nó, và lớp dùng chung tìm kết quả qua danh tính của tensor mà norm trả về (một bộ đếm, `pre_hits`, cho phép test kiểm tra đường này thật sự được dùng: 4 lần khớp mỗi forward ở trên 16 hàng, không lần nào ở dưới). Chỉ dạng RMSNorm của Llama / Qwen / Mistral được gộp (không phải `1 + weight` của Gemma).
+
+**Một baseline công bằng hơn.** Biên dịch norm giúp *mọi* model, không riêng model đã lượng tử hóa, nên tôi cũng đo fp16 với mọi RMSNorm đã biên dịch. Prefill cả model, 2048 token, mỗi biến thể một tiến trình, fp16 đo ở đầu và ở cuối mỗi model (xung nhịp trôi tới 5 phần trăm trong phiên này, nên chỉ so sánh trong bảng):
+
+| model | fp16 eager | fp16, norm đã biên dịch | INT8, không gộp norm | **INT8** | W4A8, không gộp norm | **W4A8** |
+|---|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 87.6 / 92.3 ms | 84.3 | 70.6 | **65.8** | 76.1 | **72.7** |
+| Llama-3.2-1B | 187.9 / 181.3 | 169.6 | 139.5 | **126.8** | 157.4 | **139.2** |
+| Qwen2.5-1.5B | 239.3 / 240.0 | 229.1 | 177.2 | **160.7** | 195.1 | **179.2** |
+
+Phép gộp đáng 7 đến 10 phần trăm cho INT8 và 5 đến 13 phần trăm cho W4A8 trên nền Cập nhật 6, perplexity không đổi (19.207 so với 19.201, 18.238 so với 18.235, 13.074 cả hai; W4A8 23.703 so với 23.714, 22.069 so với 22.057, 14.693 cả hai). So với trung bình hai lần chạy fp16 eager, INT8 là **1.37x, 1.46x và 1.49x** và W4A8 1.24x, 1.33x và 1.34x; so với fp16 có norm đã biên dịch, phép so sánh tôi sẽ trích dẫn vì một engine sẽ không chạy norm eager, INT8 là **1.28x, 1.34x và 1.43x** và W4A8 1.16x, 1.22x và 1.28x. (Các batch 8 x 512 còn được lợi nhiều hơn, ví dụ INT8 Llama 301.9 xuống 246.9 ms.) Mọi bước từ Cập nhật 3 đều là gộp một thứ nằm ngoài GEMM; phần còn lại của 28 phần trăm ban đầu là rotary embedding, phép cộng residual và chính attention.

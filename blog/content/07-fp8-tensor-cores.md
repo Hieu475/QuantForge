@@ -211,3 +211,17 @@ The measured gain is twice my estimate. Whole-model prefill of 2048 tokens, each
 | Qwen2.5-1.5B | 199.8 (1.20x) | **177.5 (1.36x)** | 218.4 (1.10x) | **193.8 (1.24x)** | 13.062 -> 13.074 / 14.703 -> 14.693 |
 
 (Ratios against that session's fp16.) So the "28 percent of the prefill is element-wise ops" of Update 4 was not a wall: the part that sits between two quantised layers can be fused, and it was worth 8 to 14 percent on its own. It also changes the comparison of the formats: W4A8, which was at fp16 speed, is now 1.16 to 1.24x of it at a quarter of the weight memory. What is left of the 28 percent are the norms, the rotary embedding and the residual adds; the same trick (fold the quantisation of the next layer's input into the norm that produces it) applies to q/k/v and gate/up, whose input is an RMSNorm output.
+
+## Update 7: the norm quantises its own output, and a fairer baseline (2026-11-21)
+
+q/k/v and gate/up read the output of an RMSNorm, and that output is quantised right after: the norm writes the fp16 result, the quantiser reads it for the row maximum, then again to divide and round. `_rmsnorm_quantize` computes the norm and the int8 values and scales in one compiled function (the fp16 output is still returned, as the module's contract says); `_install_norm_quantisation` makes the `input_layernorm` and `post_attention_layernorm` of a block call it, and the shared layer finds the result through the identity of the tensor the norm returned (a counter, `pre_hits`, lets the test check that the path is really taken: 4 hits per forward above 16 rows, none below). Only the Llama / Qwen / Mistral form of RMSNorm is fused (not Gemma's `1 + weight`).
+
+**A fairer baseline.** Compiling the norm helps *any* model, not only a quantised one, so I measured fp16 with every RMSNorm compiled as well. Whole-model prefill, 2048 tokens, one process per variant, fp16 measured at the start and at the end of each model (the clocks drifted by up to 5 percent inside this session, so only compare within the table):
+
+| model | fp16 eager | fp16, norms compiled | INT8, no norm fusion | **INT8** | W4A8, no norm fusion | **W4A8** |
+|---|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 87.6 / 92.3 ms | 84.3 | 70.6 | **65.8** | 76.1 | **72.7** |
+| Llama-3.2-1B | 187.9 / 181.3 | 169.6 | 139.5 | **126.8** | 157.4 | **139.2** |
+| Qwen2.5-1.5B | 239.3 / 240.0 | 229.1 | 177.2 | **160.7** | 195.1 | **179.2** |
+
+The fusion is worth 7 to 10 percent for INT8 and 5 to 13 percent for W4A8 on top of Update 6, perplexity unchanged (19.207 against 19.201, 18.238 against 18.235, 13.074 both; W4A8 23.703 against 23.714, 22.069 against 22.057, 14.693 both). Against the mean of the two eager fp16 runs, INT8 is **1.37x, 1.46x and 1.49x** and W4A8 1.24x, 1.33x and 1.34x; against fp16 with compiled norms, which is the comparison I would quote because an engine would not run eager norms, INT8 is **1.28x, 1.34x and 1.43x** and W4A8 1.16x, 1.22x and 1.28x. (The 8 x 512 batches gain even more, for example INT8 Llama 301.9 to 246.9 ms.) Every step since Update 3 was a fusion of something outside the GEMM; what is left of the original 28 percent is the rotary embedding, the residual adds and the attention itself.

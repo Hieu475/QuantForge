@@ -267,6 +267,18 @@ def _silu_mul_quantize(gu, inter: int):
     return (a / s).round().clamp(-127, 127).to(torch.int8), s
 
 
+@_maybe_compile
+def _rmsnorm_quantize(x2, weight, eps: float):
+    """RMSNorm of ``[M, K]`` (the Llama / Qwen / Mistral form: ``weight * (x * rsqrt(mean(x^2) + eps)).to(x.dtype)``) and the per-token INT8
+    quantisation of its output in one compiled function: returns the fp16 output (other consumers need it), the int8 values and the scales."""
+    h = x2.float()
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)
+    y = weight * h.to(x2.dtype)
+    yf = y.float()
+    s = (yf.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
+    return y, (yf / s).round().clamp(-127, 127).to(torch.int8), s
+
+
 class INT8W8A8Linear(nn.Module):
     """INT8 weights (per-output-channel scale) **and** activations (dynamic per-token scale) on the INT8 tensor cores:
     ``y = (quant(x) @ W8^T) * s_x * s_w + bias``. Two backends: ``"quantforge"`` (default; the GEMM and the dequantisation epilogue
@@ -543,6 +555,15 @@ class _Int8Shared(nn.Module):
         self.inner = type(layers[0]).concat(layers)
         self.sizes = sizes
         self._key, self._outs, self._taken = None, None, 0
+        self.pre_hits = 0           # how many calls used the quantisation done by the norm
+        self._pre = None            # (x, int8 x, scales) left by a norm that already quantised its output (see _install_norm_quantisation)
+
+    def _run(self, x: torch.Tensor) -> torch.Tensor:
+        pre, self._pre = self._pre, None
+        if pre is not None and pre[0] is x and x.dtype == torch.float16 and self.inner.use_compiled:
+            self.pre_hits += 1
+            return self.inner._gemm_quantized(pre[1], pre[2], torch.float16).reshape(*x.shape[:-1], -1)
+        return self.inner(x)
 
     def parts(self, x: torch.Tensor):
         try:
@@ -551,13 +572,13 @@ class _Int8Shared(nn.Module):
             version = None
         key = (id(x), version)
         if self._key != key or self._outs is None:
-            self._outs = tuple(self.inner(x).split(self.sizes, -1))
+            self._outs = tuple(self._run(x).split(self.sizes, -1))
             self._key, self._x, self._taken = key, x, 0      # keep x alive so that its id cannot be reused
         return self._outs
 
     def full(self, x: torch.Tensor) -> torch.Tensor:
         """The un-split output ``[..., sum(sizes)]`` (for a consumer that wants all the parts at once)."""
-        return self.inner(x)
+        return self._run(x)
 
     def take(self, x: torch.Tensor, index: int) -> torch.Tensor:
         """Part ``index`` of the shared GEMM. The cache (the outputs of the last call, ~80 MB for a gate / up at 4096 rows) is dropped
@@ -570,7 +591,7 @@ class _Int8Shared(nn.Module):
         return out
 
 
-def _fuse_int8(model: nn.Module, fuse_activation: bool = True) -> tuple[int, int]:
+def _fuse_int8(model: nn.Module, fuse_activation: bool = True, fuse_norm: bool = True) -> tuple[int, int]:
     """Share the activation quantisation and the GEMM between q/k/v and between gate/up of INT8 W8A8 blocks; returns (#qkv, #gate-up)."""
     n_qkv = n_mlp = 0
     for module in list(model.modules()):
@@ -591,7 +612,34 @@ def _fuse_int8(model: nn.Module, fuse_activation: bool = True) -> tuple[int, int
                 if isinstance(down, type(layers[0])) and _is_silu(module) and all(m.bias is None for m in layers) \
                         and down.in_features == layers[0].out_features and fuse_activation:
                     module.forward = _int8_gated_mlp_forward(shared, down, layers[0].out_features, module.forward)
+    if fuse_norm:
+        for module in list(model.modules()):
+            for norm_name, owner, proj in (("input_layernorm", "self_attn", "q_proj"), ("post_attention_layernorm", "mlp", "gate_proj")):
+                norm, target = getattr(module, norm_name, None), getattr(getattr(module, owner, None), proj, None)
+                if isinstance(target, _QKVPart) and isinstance(target.fused, _Int8Shared):
+                    _install_norm_quantisation(norm, target.fused)
     return n_qkv, n_mlp
+
+
+def _install_norm_quantisation(norm: nn.Module, shared: "_Int8Shared") -> bool:
+    """Make the RMSNorm that feeds a shared INT8 / W4A8 layer quantise its own output: one compiled function computes the norm and the int8
+    values + scales, the shared layer finds them (matched on the identity of the tensor the norm returned) and skips its own quantisation.
+    Only the Llama / Qwen / Mistral form of RMSNorm; fp16, more than 16 rows (as the layer itself)."""
+    name = type(norm).__name__.lower()
+    if not name.endswith("rmsnorm") or "gemma" in name or not hasattr(norm, "variance_epsilon") or not hasattr(norm, "weight"):
+        return False
+    original = norm.forward
+
+    def forward(x):
+        rows = x.numel() // x.shape[-1]
+        if x.dtype != torch.float16 or norm.weight.dtype != torch.float16 or rows <= 16 or not (x.is_cuda and shared.inner.use_compiled):
+            return original(x)
+        y, xq, s = _rmsnorm_quantize(x.reshape(rows, -1), norm.weight, float(norm.variance_epsilon))
+        y = y.reshape(x.shape)
+        shared._pre = (y, xq, s.reshape(-1))
+        return y
+    norm.forward = forward
+    return True
 
 
 def _int8_gated_mlp_forward(shared: "_Int8Shared", down, inter: int, fallback):

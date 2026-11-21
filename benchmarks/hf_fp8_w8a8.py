@@ -54,6 +54,13 @@ def main():
             qnn.quantize_model(m, "int8_w8a8", fuse=True)          # q/k/v and gate/up share one quantisation + one GEMM
         elif v == "w4a8":                 # INT4 weights (progressive quantisation) + per-token INT8 activations, one compiled kernel
             qnn.quantize_model(m, "w4a8", fuse=True)
+        elif v in ("int8_w8a8_nonorm", "w4a8_nonorm"):    # the fused MLP activation, but the norms do not quantise their output
+            qnn.quantize_model(m, v.split("_nonorm")[0], fuse=False); qnn._fuse_int8(m, fuse_norm=False)
+        elif v == "fp16_cnorm":           # fp16 with every RMSNorm compiled (what the norm fusion gives without any quantisation)
+            m = m.cuda()
+            for mod in m.modules():
+                if type(mod).__name__.lower().endswith("rmsnorm") and hasattr(mod, "variance_epsilon"):
+                    mod.forward = torch.compile(mod.forward, dynamic=True)
         elif v == "int8_w8a8_noact":      # as int8_w8a8 without the fused silu * up + quantisation
             qnn.quantize_model(m, "int8_w8a8", fuse=False); qnn._fuse_int8(m, fuse_activation=False)
         elif v == "w4a8_noact":

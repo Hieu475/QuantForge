@@ -424,3 +424,36 @@ def test_silu_up_quantisation_fusion_gives_the_same_model_output(fmt):
                 mod.forward = f
         assert torch.isfinite(fused).all()
         assert (fused - plain).abs().max() < 3e-2 * plain.abs().max(), rows
+
+
+@pytest.mark.parametrize("fmt", ["int8_w8a8", "w4a8"])
+def test_norm_quantisation_fusion_gives_the_same_model_output(fmt):
+    """The RMSNorm in front of q/k/v and gate/up quantises its own output (one compiled function); the model output stays that of the
+    layers quantising it themselves, at 64 and at 8 rows (where the layers use the generic path)."""
+    _require_gpu()
+    transformers = pytest.importorskip("transformers")
+    import quantforge.nn as qnn
+
+    cfg = transformers.LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, vocab_size=512, max_position_embeddings=64)
+    torch.manual_seed(0)
+    m = transformers.LlamaForCausalLM(cfg).half().eval()
+    qnn.quantize_model(m, fmt)
+    norms = [mod for mod in m.modules() if type(mod).__name__.endswith("RMSNorm") and "forward" in vars(mod)]
+    assert len(norms) == 4                                             # input_layernorm and post_attention_layernorm of both blocks
+    shared = [mod for mod in m.modules() if isinstance(mod, qnn._Int8Shared)]
+    assert len(shared) == 4
+    for rows in (64, 8):
+        ids = torch.randint(0, 512, (1, rows), device="cuda")
+        before = sum(sh.pre_hits for sh in shared)
+        with torch.no_grad():
+            fused = m(ids).logits.float()
+            assert sum(sh.pre_hits for sh in shared) - before == (4 if rows == 64 else 0), rows     # used, and only above 16 rows
+            saved = [n.forward for n in norms]
+            for n in norms:
+                del n.forward
+            plain = m(ids).logits.float()
+            for n, f in zip(norms, saved):
+                n.forward = f
+        assert torch.isfinite(fused).all()
+        assert (fused - plain).abs().max() < 3e-2 * plain.abs().max(), rows
