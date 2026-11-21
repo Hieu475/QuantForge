@@ -543,7 +543,7 @@ Measured on vLLM 0.25.1 (RTX 4050; `benchmarks/vllm_prefill.py`: prefill of 16 p
 
 So the prefill is at the level of fp16 / Marlin (1.05x on the 1.5B) and 1.6-1.7x the W4A16 plugin, the decode is the W4A16 kernels' (0.80-0.85x of Marlin). It is not a clear win over Marlin: its advantages are that it quantises a plain checkpoint and
 that the prefill GEMMs run on the INT8 tensor cores; its costs are that the weights are kept in both layouts (about one byte per weight, the memory of INT8 rather than of INT4), the quantisation is round-to-nearest (no GPTQ; perplexity of the 0.5B
-23.7 against 20.5 with GPTQ), and it was tested on vLLM 0.25.1 only. Tests: `test/E2E/test_w4a8_op.py` (both paths against the dequantised reference, `torch.compile(fullgraph=True)`, generation under vLLM with `QUANTFORGE_SLOW_TESTS=1`).
+23.7 against 20.5 with GPTQ), and it was tested on vLLM 0.25.1 and 0.34.0 (torch 2.14; same text, the same speed: 0.5B prefill 37370 tokens/s against 33998 for Marlin, decode 252 / 3911 against 300 / 4481; all the W4A8, checkpoint and plugin tests pass, slow ones included). Tests: `test/E2E/test_w4a8_op.py` (both paths against the dequantised reference, `torch.compile(fullgraph=True)`, generation under vLLM with `QUANTFORGE_SLOW_TESTS=1`).
 
 ### W4A8 checkpoints for vLLM (GPTQ quality, loads in seconds)
 

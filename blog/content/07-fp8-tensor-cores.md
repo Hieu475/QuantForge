@@ -305,3 +305,5 @@ Checking it was worth doing properly. The first generation from the 0.5B checkpo
 | GPTQ-Int4, `gptq_marlin` | | | 5782 | 81 / 1201 | |
 
 The checkpoint costs nothing in speed and recovers 0.9 perplexity points. What it is not: a format other tools read (the layout is mine, `format_version` 1), nor does it handle layers whose sizes are not multiples of 128 (the saver refuses them).
+
+A check on another vLLM: the same plugin, unchanged, on **vLLM 0.34.0 with torch 2.14** (a separate virtual environment): online and checkpoint modes both generate the same text as on 0.25.1, the 41 tests of the W4A8 op, the checkpoints and the older GPTQ / AWQ plugin (slow ones included) pass, and Qwen2.5-0.5B in compact mode gives prefill 37370 tokens/s against 33998 for `gptq_marlin` (1.10x) and decode 252 / 3911 against 300 / 4481 (0.84x / 0.87x), the same picture as 0.25.1.

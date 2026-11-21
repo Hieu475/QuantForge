@@ -12,7 +12,7 @@ QuantForge layout; every linear layer then calls ``torch.ops.quantforge.w4a16_ge
 on disk, so the first start of a model takes a while (about 0.3 s per kernel) and later starts do not.
 
 ``quantization="quantforge_w4a8"`` quantises an ordinary fp16 / bf16 checkpoint to W4A8 while it loads, or loads a W4A8 checkpoint written by
-``w4a8_checkpoint.save_w4a8`` (GPTQ quality, no fp16 round trip) (``QuantForgeW4A8Config``, ``w4a8_op.py``; tested on vLLM 0.25.1).
+``w4a8_checkpoint.save_w4a8`` (GPTQ quality, no fp16 round trip) (``QuantForgeW4A8Config``, ``w4a8_op.py``; tested on vLLM 0.25.1 and 0.34.0).
 
 K-folding (``kfold.py``) keeps a second copy of the narrow-output layers: ``QUANTFORGE_KFOLD=0`` disables it,
 ``QUANTFORGE_KFOLD_BUDGET_MB`` (default 256) caps the extra memory.

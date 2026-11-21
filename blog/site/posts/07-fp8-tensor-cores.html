@@ -852,7 +852,8 @@
 </tr>
 </tbody>
 </table>
-<p>The checkpoint costs nothing in speed and recovers 0.9 perplexity points. What it is not: a format other tools read (the layout is mine, <code>format_version</code> 1), nor does it handle layers whose sizes are not multiples of 128 (the saver refuses them).</p></article>
+<p>The checkpoint costs nothing in speed and recovers 0.9 perplexity points. What it is not: a format other tools read (the layout is mine, <code>format_version</code> 1), nor does it handle layers whose sizes are not multiples of 128 (the saver refuses them).</p>
+<p>A check on another vLLM: the same plugin, unchanged, on <strong>vLLM 0.34.0 with torch 2.14</strong> (a separate virtual environment): online and checkpoint modes both generate the same text as on 0.25.1, the 41 tests of the W4A8 op, the checkpoints and the older GPTQ / AWQ plugin (slow ones included) pass, and Qwen2.5-0.5B in compact mode gives prefill 37370 tokens/s against 33998 for <code>gptq_marlin</code> (1.10x) and decode 252 / 3911 against 300 / 4481 (0.84x / 0.87x), the same picture as 0.25.1.</p></article>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

@@ -305,3 +305,5 @@ Việc kiểm tra đáng làm cho cẩn thận. Lần sinh văn bản đầu ti�
 | GPTQ-Int4, `gptq_marlin` | | | 5782 | 81 / 1201 | |
 
 Checkpoint không tốn gì về tốc độ và lấy lại 0.9 điểm perplexity. Nó không phải: một định dạng mà công cụ khác đọc được (layout là của tôi, `format_version` 1), cũng không xử lý các lớp có kích thước không chia hết cho 128 (bộ lưu từ chối chúng).
+
+Kiểm tra trên một vLLM khác: cùng plugin, không đổi, trên **vLLM 0.34.0 với torch 2.14** (một môi trường ảo riêng): cả chế độ trực tuyến và checkpoint đều sinh cùng văn bản như trên 0.25.1, 41 test của op W4A8, các checkpoint và plugin GPTQ / AWQ cũ (kể cả test chậm) đều đạt, và Qwen2.5-0.5B ở chế độ compact cho prefill 37370 token/s so với 33998 của `gptq_marlin` (1.10x) và decode 252 / 3911 so với 300 / 4481 (0.84x / 0.87x), cùng bức tranh như 0.25.1.
