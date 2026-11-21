@@ -2,7 +2,7 @@
 title: QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went
 date: 2026-11-20
 order: 6
-summary: A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and a per-layer diagnosis that points at one kernel weakness (long K, narrow N).
+summary: A vLLM quantization plugin that runs the generated kernels in a real serving engine, the throughput against Marlin at 1 to 64 concurrent requests, and how a per-layer diagnosis led to K-folding and shape-aware default schedules (70-80 percent of Marlin to 73-88 percent).
 ---
 
 The kernel benchmarks of the [overview](01-overview.html) compare GEMMs in isolation, and the end-to-end numbers compare a Hugging Face model with a different one. Neither answers the practical question: **if I swap Marlin for the generated kernels in the same engine, with the same checkpoint, how much throughput do I lose or gain?** A vLLM plugin makes that experiment possible.
@@ -35,7 +35,7 @@ Throughput is the number of generated tokens per second summed over the concurre
 | | 16 | 2012 | 1542 | 0.77 |
 | | 64 | 4929 | 3528 | 0.72 |
 
-The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.017). So **the plugin is correct, and inside a real serving engine QuantForge reaches 70 to 80 percent of Marlin's throughput**, not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.
+The outputs agree: on five prompts, four generate the same 64 greedy tokens with both kernels and the fifth agrees for 34 tokens before a near-tie flips (fp16 rounding differs); the mean absolute difference of the log-probability of the generated tokens is 0.002 (maximum 0.017). So **the plugin is correct, and inside a real serving engine the first version of the plugin reaches 70 to 80 percent of Marlin's throughput** (below: what closed part of the gap), not the 100 percent that the batch-1 kernel table for 4096 x 4096 layers might suggest.
 
 ## Where the missing 20 to 30 percent goes
 
@@ -69,18 +69,18 @@ The kernel computes every (slice, slice) pair, S times more arithmetic than need
 
 Kernel level, one row, whole op inside a CUDA graph (microseconds): 4864 x 896 37.7 to 23.3, 8960 x 1536 68.5 to 43.0, 1536 x 1536 14.4 to 12.6. In vLLM, same checkpoint, interleaved runs that agreed to 1 percent:
 
-| model | requests | Marlin | QuantForge, no fold | QuantForge, fold | fold / Marlin |
-|---|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 1 | 283 | 222 | 242 | 0.85 |
-| | 4 | 1089 | 856 | 940 | 0.86 |
-| | 16 | 3968 | 3300 | 3330 | 0.84 |
-| | 64 | 11141 | 7770 | 7850 | 0.70 |
-| Qwen2.5-1.5B | 1 | 132 | 97 | 112 | 0.85 |
-| | 4 | 518 | 382 | 385 | 0.74 |
-| | 16 | 1945 | 1572 | 1560 | 0.80 |
-| | 64 | 5464 | 3742 | 3725 | 0.68 |
+| model | requests | Marlin (tok/s) | QuantForge (tok/s) | ratio: first version | + K-fold | + schedules (now) |
+|---|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 295 | 258 | 0.78 | 0.85 | 0.87 |
+|  | 4 | 1129 | 995 | 0.77 | 0.86 | 0.88 |
+|  | 16 | 4221 | 3650 | 0.81 | 0.84 | 0.86 |
+|  | 64 | 11306 | 9100 | 0.74 | 0.70 | 0.80 |
+| Qwen2.5-1.5B | 1 | 137 | 115 | 0.72 | 0.85 | 0.84 |
+|  | 4 | 531 | 427 | n/a | 0.74 | 0.80 |
+|  | 16 | 2008 | 1646 | 0.77 | 0.80 | 0.82 |
+|  | 64 | 5614 | 4090 | 0.72 | 0.68 | 0.73 |
 
-Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where `M * S` exceeds 16 and the plain kernel runs. At 64 requests the gap to Marlin (0.68 to 0.70) is a different problem, with larger row tiles, that I have not analysed yet.
+Folding gains 9 percent (0.5B) and 15 percent (1.5B) for one to four requests and nothing from 16 requests up, where `M * S` exceeds 16 and the plain kernel runs. The last column adds the width-aware default schedules: the fixed tile options of the 17 to 64-row kernels and of the narrow-output decode kernels were tuned on 4096 x 4096 and were 1.5 to 3 times too slow for the small shapes of these models (autotune picks 32 / 64-column blocks and a look-ahead there; I turned its winners into rules, `benchmarks/sweep_skinny.py`). Together with the fold, 1 to 16 requests reach 0.80 to 0.88 of Marlin and 64 requests 0.73 to 0.80 (+16 % and +10 % over the fold alone). Ratios come from one run of Marlin and QuantForge back to back; Marlin itself moves by about 4 % between runs with the laptop's clocks.
 
 ### A measurement trap
 

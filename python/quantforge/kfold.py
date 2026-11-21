@@ -27,7 +27,7 @@ from . import torch_ops  # noqa: F401  (registers quantforge::w4a16_gemm)
 
 MAX_N = 2048          # wider outputs already have enough blocks (measured: no gain from N = 4096)
 MIN_GAIN = 0.85       # fold only if the folded GEMM takes <= 85 % of the plain one
-_KEY_VERSION = 1
+_KEY_VERSION = 2
 
 
 def fold_k(packed: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, S: int):

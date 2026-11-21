@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu - QuantForge Notes</title>
-<meta name="description" content="Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và một chẩn đoán theo từng layer chỉ ra một điểm yếu của kernel (K dài, N hẹp).">
+<meta name="description" content="Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và cách một chẩn đoán theo từng layer dẫn tới K-folding và các schedule mặc định theo shape (từ 70-80 phần trăm Marlin lên 73-88 phần trăm).">
 <link rel="stylesheet" href="../../assets/style.css">
 </head>
 <body>
@@ -13,7 +13,7 @@
   <nav><a href="../index.html">Bài viết</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/06-inside-vllm.html" hreflang="en">English</a></nav>
 </div></header>
 <main class="wrap">
-<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu</h1><p class="lede">Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và một chẩn đoán theo từng layer chỉ ra một điểm yếu của kernel (K dài, N hẹp).</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<article class="post"><p class="meta">2026-11-20 &middot; Hieu475</p><h1>QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu</h1><p class="lede">Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và cách một chẩn đoán theo từng layer dẫn tới K-folding và các schedule mặc định theo shape (từ 70-80 phần trăm Marlin lên 73-88 phần trăm).</p><details class="toc"><summary>Mục lục</summary><div class="toc">
 <ul>
 <li><a href="#plugin">Plugin</a></li>
 <li><a href="#cung-checkpoint-cung-engine-ket-qua">Cùng checkpoint, cùng engine: kết quả</a></li>
@@ -101,7 +101,7 @@ llm = LLM(&quot;Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4&quot;, quantization=&quot;q
 </tr>
 </tbody>
 </table>
-<p>Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy <strong>plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin</strong>, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.</p>
+<p>Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy <strong>plugin chạy đúng, và bên trong một engine phục vụ thật bản đầu của plugin đạt 70 đến 80 phần trăm throughput của Marlin</strong> (bên dưới: những gì thu hẹp một phần khoảng cách), không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.</p>
 <h2 id="20-en-30-phan-tram-con-thieu-i-au">20 đến 30 phần trăm còn thiếu đi đâu<a class="headerlink" href="#20-en-30-phan-tram-con-thieu-i-au" title="Permanent link">#</a></h2>
 <p>Phỏng đoán đầu của tôi là chi phí phụ: op phát ba kernel mỗi GEMM (copy activation vào buffer đệm 16 hàng, GEMM, đổi kết quả f32 sang f16), Marlin một. Profile một lần gọi M = 1 xác nhận các kernel phụ (khoảng 2 micro giây thời gian thiết bị) nhưng cũng cho thấy chúng không thể là nguyên nhân chính, vì khoảng cách không thu hẹp ở model lớn hơn. So sánh kernel theo từng layer thì có (M = 1, micro giây, cùng phương pháp như các bảng kernel):</p>
 <table>
@@ -174,80 +174,89 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S khối chéo)
 <tr>
 <th>model</th>
 <th style="text-align: right;">request</th>
-<th style="text-align: right;">Marlin</th>
-<th style="text-align: right;">QuantForge, không fold</th>
-<th style="text-align: right;">QuantForge, fold</th>
-<th style="text-align: right;">fold / Marlin</th>
+<th style="text-align: right;">Marlin (tok/s)</th>
+<th style="text-align: right;">QuantForge (tok/s)</th>
+<th style="text-align: right;">tỷ lệ: bản đầu</th>
+<th style="text-align: right;">+ K-fold</th>
+<th style="text-align: right;">+ schedule (hiện tại)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Qwen2.5-0.5B</td>
 <td style="text-align: right;">1</td>
-<td style="text-align: right;">283</td>
-<td style="text-align: right;">222</td>
-<td style="text-align: right;">242</td>
+<td style="text-align: right;">295</td>
+<td style="text-align: right;">258</td>
+<td style="text-align: right;">0.78</td>
 <td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.87</td>
 </tr>
 <tr>
 <td></td>
 <td style="text-align: right;">4</td>
-<td style="text-align: right;">1089</td>
-<td style="text-align: right;">856</td>
-<td style="text-align: right;">940</td>
+<td style="text-align: right;">1129</td>
+<td style="text-align: right;">995</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.88</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4221</td>
+<td style="text-align: right;">3650</td>
+<td style="text-align: right;">0.81</td>
+<td style="text-align: right;">0.84</td>
 <td style="text-align: right;">0.86</td>
 </tr>
 <tr>
 <td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">3968</td>
-<td style="text-align: right;">3300</td>
-<td style="text-align: right;">3330</td>
-<td style="text-align: right;">0.84</td>
-</tr>
-<tr>
-<td></td>
 <td style="text-align: right;">64</td>
-<td style="text-align: right;">11141</td>
-<td style="text-align: right;">7770</td>
-<td style="text-align: right;">7850</td>
+<td style="text-align: right;">11306</td>
+<td style="text-align: right;">9100</td>
+<td style="text-align: right;">0.74</td>
 <td style="text-align: right;">0.70</td>
+<td style="text-align: right;">0.80</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B</td>
 <td style="text-align: right;">1</td>
-<td style="text-align: right;">132</td>
-<td style="text-align: right;">97</td>
-<td style="text-align: right;">112</td>
+<td style="text-align: right;">137</td>
+<td style="text-align: right;">115</td>
+<td style="text-align: right;">0.72</td>
 <td style="text-align: right;">0.85</td>
+<td style="text-align: right;">0.84</td>
 </tr>
 <tr>
 <td></td>
 <td style="text-align: right;">4</td>
-<td style="text-align: right;">518</td>
-<td style="text-align: right;">382</td>
-<td style="text-align: right;">385</td>
+<td style="text-align: right;">531</td>
+<td style="text-align: right;">427</td>
+<td style="text-align: right;">n/a</td>
 <td style="text-align: right;">0.74</td>
-</tr>
-<tr>
-<td></td>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">1945</td>
-<td style="text-align: right;">1572</td>
-<td style="text-align: right;">1560</td>
 <td style="text-align: right;">0.80</td>
 </tr>
 <tr>
 <td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2008</td>
+<td style="text-align: right;">1646</td>
+<td style="text-align: right;">0.77</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.82</td>
+</tr>
+<tr>
+<td></td>
 <td style="text-align: right;">64</td>
-<td style="text-align: right;">5464</td>
-<td style="text-align: right;">3742</td>
-<td style="text-align: right;">3725</td>
+<td style="text-align: right;">5614</td>
+<td style="text-align: right;">4090</td>
+<td style="text-align: right;">0.72</td>
 <td style="text-align: right;">0.68</td>
+<td style="text-align: right;">0.73</td>
 </tr>
 </tbody>
 </table>
-<p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Ở 64 request, khoảng cách tới Marlin (0.68 đến 0.70) là một vấn đề khác, với tile hàng lớn hơn, mà tôi chưa phân tích.</p>
+<p>Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi <code>M * S</code> vượt 16 và kernel thường chạy. Cột cuối thêm các schedule mặc định theo độ rộng: các tùy chọn tile cố định của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này (autotune chọn khối 32 / 64 cột và look-ahead ở đó; tôi biến các kết quả thắng thành quy tắc, <code>benchmarks/sweep_skinny.py</code>). Cùng với fold, 1 đến 16 request đạt 0.80 đến 0.88 của Marlin và 64 request đạt 0.73 đến 0.80 (+16 % và +10 % so với chỉ fold). Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.</p>
 <h3 id="mot-cai-bay-khi-o">Một cái bẫy khi đo<a class="headerlink" href="#mot-cai-bay-khi-o" title="Permanent link">#</a></h3>
 <p>A/B đầu tiên của tôi không cho thấy khác biệt nào (241 so với 240 token mỗi giây, bốn lần chạy xen kẽ mỗi bên), và một profile của cùng lượt decode với cache biên dịch tắt cho 4.16 so với 3.81 mili giây mỗi token. Lý do: vLLM cache các graph đã biên dịch trên đĩa dưới một hash của cấu hình mà không biết gì về plugin, nên một graph biên dịch trước đó, với đường thường, bị dùng lại âm thầm, và đường fold không bao giờ chạy. Cùng cơ chế đó có thể đã cho kết quả sai (một graph cache có hệ số fold đóng cứng thành hằng số, dùng với weight fold khác). Plugin giờ cho mọi layer gọi cùng một op và đọc hệ số từ shape tensor lúc chạy, nên một graph cũ chỉ chậm, không bao giờ sai; sau khi nâng cấp plugin hãy xóa <code>~/.cache/vllm/torch_compile_cache</code> một lần.</p>
 <h2 id="han-che-cua-plugin">Hạn chế của plugin<a class="headerlink" href="#han-che-cua-plugin" title="Permanent link">#</a></h2>

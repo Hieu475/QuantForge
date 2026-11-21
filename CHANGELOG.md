@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Width-aware default schedules: `_decode_opts` (32 / 64-column blocks for N <= 2048) and `_skinny_opts` (17..64 rows, shape dependent); `torch_ops.default_opts`
+  is shared with `benchmarks/compare_marlin.py` (its non-autotuned mode used an empty schedule for M > 16, not the op's). vLLM, QuantForge / Marlin: 0.80-0.88 at 1-16 requests, 0.73-0.80 at 64.
+
 * `quantforge.kfold`: K-folding for long-K, narrow-N decode layers (`QuantLinear.enable_kfold()`, `nn.enable_kfold(model)`, `kfold=` in `quantize_model` / `load_quantized_checkpoint`,
   on by default in the vLLM plugin): +9 % (Qwen2.5-0.5B) / +15 % (1.5B) vLLM throughput at 1-4 requests, ~0.85x of Marlin there.
 

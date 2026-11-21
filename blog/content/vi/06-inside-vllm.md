@@ -2,7 +2,7 @@
 title: QuantForge bên trong vLLM: một phép so sánh đầu-cuối công bằng, và 20 đến 30 phần trăm còn thiếu đi đâu
 date: 2026-11-20
 order: 6
-summary: Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và một chẩn đoán theo từng layer chỉ ra một điểm yếu của kernel (K dài, N hẹp).
+summary: Một plugin lượng tử hóa của vLLM chạy các kernel đã sinh trong một engine phục vụ thật, throughput so với Marlin ở 1 đến 64 request đồng thời, và cách một chẩn đoán theo từng layer dẫn tới K-folding và các schedule mặc định theo shape (từ 70-80 phần trăm Marlin lên 73-88 phần trăm).
 ---
 
 Các benchmark kernel trong [bài tổng quan](01-overview.html) so sánh GEMM tách rời, và các số đầu-cuối so sánh một model Hugging Face với một model khác. Không cái nào trả lời câu hỏi thực tế: **nếu tôi thay Marlin bằng các kernel đã sinh trong cùng một engine, với cùng một checkpoint, tôi mất hay được bao nhiêu throughput?** Một plugin vLLM cho phép làm thí nghiệm đó.
@@ -35,7 +35,7 @@ Throughput là số token sinh ra mỗi giây cộng trên các request đồng 
 | | 16 | 2012 | 1542 | 0.77 |
 | | 64 | 4929 | 3528 | 0.72 |
 
-Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy **plugin chạy đúng, và bên trong một engine phục vụ thật QuantForge đạt 70 đến 80 phần trăm throughput của Marlin**, không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.
+Kết quả đầu ra khớp nhau: trên năm prompt, bốn prompt sinh cùng 64 token greedy với cả hai kernel và prompt thứ năm khớp 34 token trước khi một thế gần hòa đổi chỗ (làm tròn fp16 khác nhau); chênh lệch tuyệt đối trung bình của log-xác suất các token sinh ra là 0.002 (tối đa 0.017). Vậy **plugin chạy đúng, và bên trong một engine phục vụ thật bản đầu của plugin đạt 70 đến 80 phần trăm throughput của Marlin** (bên dưới: những gì thu hẹp một phần khoảng cách), không phải 100 phần trăm mà bảng kernel batch 1 cho layer 4096 x 4096 có thể gợi ý.
 
 ## 20 đến 30 phần trăm còn thiếu đi đâu
 
@@ -69,18 +69,18 @@ Kernel tính mọi cặp (lát, lát), nhiều hơn cần thiết S lần phép 
 
 Mức kernel, một hàng, cả op trong một CUDA graph (micro giây): 4864 x 896 từ 37.7 xuống 23.3, 8960 x 1536 từ 68.5 xuống 43.0, 1536 x 1536 từ 14.4 xuống 12.6. Trong vLLM, cùng checkpoint, các lần chạy xen kẽ khớp nhau trong 1 phần trăm:
 
-| model | request | Marlin | QuantForge, không fold | QuantForge, fold | fold / Marlin |
-|---|--:|--:|--:|--:|--:|
-| Qwen2.5-0.5B | 1 | 283 | 222 | 242 | 0.85 |
-| | 4 | 1089 | 856 | 940 | 0.86 |
-| | 16 | 3968 | 3300 | 3330 | 0.84 |
-| | 64 | 11141 | 7770 | 7850 | 0.70 |
-| Qwen2.5-1.5B | 1 | 132 | 97 | 112 | 0.85 |
-| | 4 | 518 | 382 | 385 | 0.74 |
-| | 16 | 1945 | 1572 | 1560 | 0.80 |
-| | 64 | 5464 | 3742 | 3725 | 0.68 |
+| model | request | Marlin (tok/s) | QuantForge (tok/s) | tỷ lệ: bản đầu | + K-fold | + schedule (hiện tại) |
+|---|--:|--:|--:|--:|--:|--:|
+| Qwen2.5-0.5B | 1 | 295 | 258 | 0.78 | 0.85 | 0.87 |
+|  | 4 | 1129 | 995 | 0.77 | 0.86 | 0.88 |
+|  | 16 | 4221 | 3650 | 0.81 | 0.84 | 0.86 |
+|  | 64 | 11306 | 9100 | 0.74 | 0.70 | 0.80 |
+| Qwen2.5-1.5B | 1 | 137 | 115 | 0.72 | 0.85 | 0.84 |
+|  | 4 | 531 | 427 | n/a | 0.74 | 0.80 |
+|  | 16 | 2008 | 1646 | 0.77 | 0.80 | 0.82 |
+|  | 64 | 5614 | 4090 | 0.72 | 0.68 | 0.73 |
 
-Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi `M * S` vượt 16 và kernel thường chạy. Ở 64 request, khoảng cách tới Marlin (0.68 đến 0.70) là một vấn đề khác, với tile hàng lớn hơn, mà tôi chưa phân tích.
+Fold tăng 9 phần trăm (0.5B) và 15 phần trăm (1.5B) với một đến bốn request và không đổi từ 16 request trở lên, nơi `M * S` vượt 16 và kernel thường chạy. Cột cuối thêm các schedule mặc định theo độ rộng: các tùy chọn tile cố định của kernel 17 đến 64 hàng và của kernel decode đầu ra hẹp được chỉnh trên 4096 x 4096 và chậm hơn 1.5 đến 3 lần với các shape nhỏ của những model này (autotune chọn khối 32 / 64 cột và look-ahead ở đó; tôi biến các kết quả thắng thành quy tắc, `benchmarks/sweep_skinny.py`). Cùng với fold, 1 đến 16 request đạt 0.80 đến 0.88 của Marlin và 64 request đạt 0.73 đến 0.80 (+16 % và +10 % so với chỉ fold). Tỷ lệ lấy từ một lần chạy Marlin và QuantForge liên tiếp; bản thân Marlin dao động khoảng 4 % giữa các lần chạy theo xung nhịp của laptop.
 
 ### Một cái bẫy khi đo
 

@@ -29,6 +29,7 @@ import torch
 warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from quantforge.e2e import W4A16Gemm, pack_int4  # noqa: E402
+import quantforge.torch_ops as ops  # noqa: E402
 
 
 _FLUSH = None
@@ -174,7 +175,7 @@ def main():
     print(f"{'shape':>18} {'Marlin us':>10} {'QF us':>9} {'cuBLAS us':>10} {'QF/Marlin':>10}   max|err| (marlin / QF, ref max)")
     for sh in ns.shape:
         M, K, N = (int(x) for x in sh.lower().split("x"))
-        opts = "autotune" if ns.autotune else ("decode=true" if M <= 16 else "")
+        opts = "autotune" if ns.autotune else ops.default_opts(ops.bucket_rows(M), K, N)   # the schedule the torch op really uses
         r = run(M, K, N, ns.group_size, opts, ns.warm, ns.rounds)
         out.append(r)
         print(f"{sh:>18} {r['marlin']['us']:10.1f} {r['quantforge']['us']:9.1f} {r['cublas_fp16']['us']:10.1f} "

@@ -42,7 +42,12 @@ def _decode_opts(N: int) -> str:
     blocks): with 81 to 96 column blocks (N = 10240 .. 12288, e.g. the 11008-wide MLP of Llama-7B) the grid is only
     slightly larger than one wave of the 128-deep K tile, and a 32-deep tile (smaller shared memory per block, so all
     blocks are resident) is 8-12 % faster (1 x 4096 x 11008: 150 -> 135 us); from ~104 blocks up it loses again.
-    `set_autotune(True)` replaces the rule by a search."""
+    Narrow outputs (N <= 2048) use 32 / 64 column blocks, as the autotuner picks for them. `set_autotune(True)` replaces the rule by
+    a search."""
+    if N <= 1152 and N % 32 == 0:       # narrow outputs need narrower blocks to fill 20 SMs (autotune winners; 4864 x 896: 49 -> 28 us)
+        return "decode=true block-tile-n=32 warp-tile-n=8 block-tile-k=128 smem-stages=2"
+    if N <= 2048 and N % 64 == 0:
+        return "decode=true block-tile-n=64 warp-tile-n=16 block-tile-k=128 smem-stages=1 prefetch-distance=1"
     bk = 32 if 10240 <= N <= 12288 else 128 if N >= 8192 else 64
     return f"decode=true block-tile-n=128 warp-tile-n=16 block-tile-k={bk} smem-stages=1 prefetch-distance=1"
 
@@ -78,15 +83,34 @@ def clear_cache() -> None:
 # M <= 16 is one decode kernel; 32 and 64 are the skinny kernels (32 / 64-row block tiles); the buckets
 # above are multiples of the 64 / 128-row block tiles.
 _BUCKETS = (16, 32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
-# Skinny schedules, the best of a sweep over tiles / K tile / stages / look-ahead (RTX 4050, cold weights,
-# 4096 x 4096): 32 rows 58.6 us (the old 64-row schedule: 68.6 us), 64 rows 87 us (97 us); the 11008 / 14336
-# wide shapes gain 3-10 % (64 rows) and 20-34 % (32 rows).
+# Skinny schedules (17..64 rows). The 4096 x 4096 class: the best of a sweep over tiles / K tile / stages / look-ahead
+# (RTX 4050, cold weights): 32 rows 57.8 us (the old 64-row schedule: 68.6 us), 64 rows 87 us (97 us). Narrow outputs
+# (N <= 2048, the o_proj / down_proj / qkv of small models) want smaller tiles: with 64 rows, 32-row blocks with a 16 / 32 wide
+# warp tile are 1.2-1.6x faster than the 64-row block (4864 x 896: 77 -> 47.5 us; 896 x 896: 17.7 -> 10.8 us), and with 32 rows
+# a 64-deep K tile helps the wide, short-K outputs (896 x 9728: 35.5 -> 32.2 us). Sweep: benchmarks/sweep_skinny.py.
 _SKINNY_OPTS = {
     32: ("block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=128 "
-         "smem-stages=1"),
+         "smem-stages=1 prefetch-distance=1"),
     64: ("block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-n=128 block-tile-k=64 "
          "smem-stages=1 prefetch-distance=1"),
 }
+
+
+def _skinny_opts(M: int, K: int, N: int) -> str:
+    """Default schedule of a 32- or 64-row call (see the comment above `_SKINNY_OPTS`)."""
+    if M == 32 and N >= 8192 and K <= 2048:
+        return ("block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=64 "
+                "smem-stages=1 prefetch-distance=1")
+    if M == 64 and N <= 2048:
+        wn = 16 if K * N <= 1_200_000 else 32
+        return (f"block-tile-m=32 warp-tile-m=16 warp-tile-n={wn} block-tile-n=128 block-tile-k=128 "
+                "smem-stages=1 prefetch-distance=1")
+    return _SKINNY_OPTS[M]
+
+
+def default_opts(M: int, K: int, N: int) -> str:
+    """Pipeline options the op uses for a call with M rows when autotuning is off (M is the bucketed row count)."""
+    return _decode_opts(N) if M <= 16 else _skinny_opts(M, K, N) if M <= 64 else _prefill_opts(M, K, N)
 
 
 def bucket_rows(M: int) -> int:
@@ -128,7 +152,7 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
                 k = autotune(M, K, N, group_size=g, bits=4 if kind == 4 else 8, fp8=kind == 9,
                               epilogue=activation, accumulate=not overwrite)
             else:
-                opts = _decode_opts(N) if M <= 16 else _SKINNY_OPTS[M] if M <= 64 else _prefill_opts(M, K, N)
+                opts = default_opts(M, K, N)
                 k = W4A16Gemm.build(M, K, N, group_size=g, pad=True, pipeline_opts=opts,
                                     bits=4 if kind == 4 else 8, fp8=kind == 9, epilogue=activation, accumulate=not overwrite)
             _kernels[key] = k
