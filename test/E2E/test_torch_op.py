@@ -456,3 +456,23 @@ def test_gptq_8bit_conversion_matches_the_dense_reference_including_act_order():
     ref_w2 = (q.float() - zero.float()[group_of_row]) * scale.float()[group_of_row]
     ref2 = x.float() @ ref_w2
     assert (qt.w4a16_linear(x, p2, sc2, zz2, G, perm=perm).float() - ref2).abs().max() < 2e-3 * ref2.abs().max()
+
+
+def test_long_inputs_are_processed_in_chunks_with_a_bounded_temporary():
+    """More than 2048 rows: the op works in chunks of 2048 rows (same result; the f32 accumulator is not M x N x 4 bytes)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+
+    M, K, N, G = 6000, 256, 4096, 128
+    act, packed, scale, zp, ref = _case(M, K, N, G)
+    torch.cuda.synchronize()
+    out_bytes = M * N * 2
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    y = qt.w4a16_linear(act, packed, scale, zp, G)
+    torch.cuda.synchronize()
+    peak_extra = torch.cuda.max_memory_allocated() - base
+    assert y.shape == (M, N) and _close(y, ref)
+    assert peak_extra < 0.8 * M * N * 6, (peak_extra, out_bytes)     # unchunked: f32 accumulator + its f16 cast = M*N*6 (147 MB here, chunked ~100)
+    y3 = qt.w4a16_linear(act.reshape(2, 3000, K), packed, scale, zp, G)             # leading dims are kept
+    assert y3.shape == (2, 3000, N) and _close(y3.reshape(M, N), ref)

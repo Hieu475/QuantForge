@@ -461,6 +461,22 @@ layers, no AWQ without zero points. Other checkpoint formats (Qwen2.5-0.5B, the 
 | | 16 | 3482 | 3235 | 0.93 | |
 | | 64 | 10157 | 8600 | 0.85 | |
 
+Other models (same engine, GPTQ 4-bit; tokens/s summed over the requests, two runs agreed to 1 %):
+
+| model | requests | Marlin | QuantForge | QuantForge / Marlin | output vs Marlin |
+|---|--:|--:|--:|--:|---|
+| TinyLlama-1.1B (Llama architecture, `desc_act=true`: real act-order) | 1 | 232 | 209 | 0.90 | 320 of 320 greedy tokens identical, mean abs. log-prob diff 0.0012 |
+| | 4 | 904 | 804 | 0.89 | |
+| | 16 | 3288 | 3003 | 0.91 | |
+| | 64 | 8604 | 6547 | 0.76 | |
+| Qwen2.5-3B | 1 | 81.5 | 71 | 0.87 | 320 of 320 identical, mean diff 0.0019 |
+| | 4 | 320 | 280 | 0.88 | |
+| | 16 | 1215 | 1073 | 0.88 | |
+
+K-folding changes nothing for the 3B model (71 tokens/s with and without it): its narrow layers (2048 outputs) did not gain enough to be folded. **Memory:** a first run of the 3B model failed to start
+on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
+22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).
+
 ### FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)
 
 `quantize_model(model, "fp8_w8a8")` replaces the Linears with `FP8W8A8Linear`: FP8 E4M3 weights *and* activations (per-output-channel weight scale, dynamic per-token

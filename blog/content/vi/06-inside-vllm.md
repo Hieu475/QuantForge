@@ -103,6 +103,22 @@ Plugin cũng đọc checkpoint AWQ 4-bit và GPTQ 8-bit (Qwen2.5-0.5B, cùng eng
 
 Đường GPTQ 8-bit cần một chi tiết chuyển đổi: GPTQ lưu byte không dấu, kernel nhận int8, nên cả weight lẫn zero point đều được dịch đi 128, giữ nguyên `q - zero`. AWQ khác GPTQ ở cách đóng gói (theo chiều đầu ra, với thứ tự nibble hoán vị), bộ chuyển đổi đảo ngược nó.
 
+Các model khác (cùng engine, GPTQ 4-bit; token/s cộng trên các request, hai lần chạy khớp nhau trong 1 %):
+
+| model | request | Marlin | QuantForge | QuantForge / Marlin | đầu ra so với Marlin |
+|---|--:|--:|--:|--:|---|
+| TinyLlama-1.1B (kiến trúc Llama, `desc_act=true`: act-order thật) | 1 | 232 | 209 | 0.90 | 320 trên 320 token greedy trùng, chênh log-xác suất tuyệt đối trung bình 0.0012 |
+| | 4 | 904 | 804 | 0.89 | |
+| | 16 | 3288 | 3003 | 0.91 | |
+| | 64 | 8604 | 6547 | 0.76 | |
+| Qwen2.5-3B | 1 | 81.5 | 71 | 0.87 | 320 trên 320 trùng, chênh trung bình 0.0019 |
+| | 4 | 320 | 280 | 0.88 | |
+| | 16 | 1215 | 1073 | 0.88 | |
+
+K-folding không thay đổi gì cho model 3B (71 token/s có và không có): các layer hẹp của nó (2048 đầu ra) không lợi đủ để được fold. **Bộ nhớ:** lần chạy đầu của model 3B không khởi động được
+trên card 6 GB (vLLM báo -0.32 GiB cho KV cache): op cấp một accumulator f32 cho toàn bộ số hàng của một lần gọi, và lượt profile của vLLM gửi 8192 token, tức 720 MB cho layer gate/up rộng 22016.
+Op giờ xử lý đầu vào dài theo khối 2048 hàng ghi thẳng vào kết quả f16 (bộ nhớ tạm bị chặn, KV cache +0.1 GiB so với +0.24 của Marlin).
+
 ## Hạn chế của plugin
 
 GPTQ 4-bit và 8-bit và AWQ 4-bit có zero point; không có layer MoE; AWQ không có zero point bị từ chối. Lần khởi động đầu của một model biên dịch một kernel cho mỗi shape layer và row bucket (khoảng 0.3 giây mỗi cái, sau đó được cache trên đĩa). Chỉ một kiến trúc GPU (sm_89) và hai model nhỏ được thử.

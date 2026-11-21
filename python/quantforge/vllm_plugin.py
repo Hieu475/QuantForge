@@ -11,6 +11,9 @@ QuantForge layout; every linear layer then calls ``torch.ops.quantforge.w4a16_ge
 ``torch.compile`` and CUDA-graph capture. The kernels are JIT-compiled per (layer shape, row bucket) on first use and cached
 on disk, so the first start of a model takes a while (about 0.3 s per kernel) and later starts do not.
 
+K-folding (``kfold.py``) keeps a second copy of the narrow-output layers: ``QUANTFORGE_KFOLD=0`` disables it,
+``QUANTFORGE_KFOLD_BUDGET_MB`` (default 256) caps the extra memory.
+
 Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points. Limitations: no MoE layers, no
 AWQ with a symmetric / absent zero point, f16 / bf16 activations (bf16 is converted to f16 around the op).
 """
@@ -44,6 +47,8 @@ def register() -> None:
         raise RuntimeError("vLLM is not installed")
 
 
+_FOLD_BYTES = [0]            # bytes of folded weight copies made so far in this process (see QUANTFORGE_KFOLD_BUDGET_MB)
+
 if HAVE_VLLM:
 
     def _install(layer: torch.nn.Module, packed, scale, zero, perm, group: int, drop: tuple) -> None:
@@ -62,6 +67,12 @@ if HAVE_VLLM:
         S = 1
         if os.environ.get("QUANTFORGE_KFOLD", "1") != "0":
             S = kfold.plan_ksplit(packed.shape[0], scale.shape[1], group, 4 if packed.shape[1] * 2 == scale.shape[1] else 8)
+            extra = packed.numel() * packed.element_size() + scale.numel() * 2 + zero.numel()
+            budget = float(os.environ.get("QUANTFORGE_KFOLD_BUDGET_MB", "256")) * 2 ** 20
+            if S > 1 and _FOLD_BYTES[0] + extra > budget:        # the folded copy is extra memory: stop when the budget is spent
+                S = 1
+            elif S > 1:
+                _FOLD_BYTES[0] += extra
         folded = kfold.fold_k(packed, scale.half(), zero, S) if S > 1 else kfold.no_fold(packed.device)
         layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = (param(t) for t in folded)
 

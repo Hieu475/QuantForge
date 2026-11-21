@@ -122,9 +122,9 @@ at::Tensor call_fallback(const at::Tensor &x, const at::Tensor &packed, const at
   return out.cast<at::Tensor>();
 }
 
-at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
-                      const at::Tensor &zero, int64_t group_size, const c10::optional<at::Tensor> &bias,
-                      std::string activation) {
+at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
+                           const at::Tensor &zero, int64_t group_size, const c10::optional<at::Tensor> &bias,
+                           std::string activation) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "x must be a float16 CUDA tensor");
   TORCH_CHECK(x.dim() >= 1 && packed.dim() == 2, "bad shapes");
   // INT4: packed [K, N/2]. INT8 (group-wise only): plain int8 [K, N], i.e. as wide as `scale`.
@@ -162,6 +162,33 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
   std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
   shape.back() = cols;
   return acc.narrow(0, 0, M).narrow(1, 0, cols).to(x.scalar_type()).reshape(shape);
+}
+
+// The kernels accumulate in f32 and the result is converted to f16 afterwards: for a big prefill batch (vLLM profiles with
+// 8192+ tokens) that f32 buffer alone is M x N x 4 bytes (720 MB for N = 22016). Long inputs are therefore processed in
+// chunks of kMaxRows rows written straight into the f16 result, so the temporary stays bounded.
+constexpr int64_t kMaxRows = 2048;
+
+at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
+                      const at::Tensor &zero, int64_t group_size, const c10::optional<at::Tensor> &bias,
+                      std::string activation) {
+  TORCH_CHECK(x.dim() >= 1 && x.size(-1) > 0, "bad shapes");
+  const int64_t K = x.size(-1);
+  const int64_t M = x.numel() / K;
+  if (M <= kMaxRows)
+    return w4a16_gemm_rows(x, packed, scale, zero, group_size, bias, activation);
+  const int64_t N = group_size > 0 ? scale.size(1) : packed.size(1) * 2;
+  const int64_t cols = activation == "swiglu" ? N / 2 : N;
+  at::Tensor x2 = x.reshape({M, K});
+  at::Tensor out = at::empty({M, cols}, x.options());
+  for (int64_t r = 0; r < M; r += kMaxRows) {
+    const int64_t n = std::min<int64_t>(kMaxRows, M - r);
+    out.narrow(0, r, n).copy_(
+        w4a16_gemm_rows(x2.narrow(0, r, n), packed, scale, zero, group_size, bias, activation));
+  }
+  std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
+  shape.back() = cols;
+  return out.reshape(shape);
 }
 
 void set_python_hooks(py::object builder, py::object fallback) {

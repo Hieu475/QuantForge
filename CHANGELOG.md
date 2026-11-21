@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* The op processes inputs of more than 2048 rows in chunks (bounded f32 temporary: Qwen2.5-3B could not start under vLLM on a 6 GB card because of the 8192-token profiling pass). `QUANTFORGE_KFOLD_BUDGET_MB` caps the extra memory of K-folding.
+  Checked in vLLM: TinyLlama-1.1B act-order GPTQ (0.76-0.91 of Marlin), Qwen2.5-3B (0.87-0.88).
+
 * vLLM plugin reads GPTQ 8-bit (`quant.from_gptq8`, act-order included) and AWQ 4-bit checkpoints; Qwen2.5-0.5B throughput vs the matching Marlin method: AWQ 0.81-0.89, GPTQ-Int8 0.85-0.93.
 
 * Width-aware default schedules: `_decode_opts` (32 / 64-column blocks for N <= 2048) and `_skinny_opts` (17..64 rows, shape dependent); `torch_ops.default_opts`

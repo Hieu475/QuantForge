@@ -341,6 +341,80 @@ C' = A' @ W'   -&gt;   y[m] = sum_s C'[m*S + s, s*N:(s+1)*N]    (S diagonal bloc
 </tbody>
 </table>
 <p>The 8-bit GPTQ path needed one conversion detail: GPTQ stores unsigned bytes, the kernels take int8, so the weights and the zero points are both shifted by 128, which leaves <code>q - zero</code> unchanged. AWQ differs from GPTQ in its packing (along the output dimension, with a permuted nibble order), which the converter undoes.</p>
+<p>Other models (same engine, GPTQ 4-bit; tokens/s summed over the requests, two runs agreed to 1 %):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">requests</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">QuantForge / Marlin</th>
+<th>output vs Marlin</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TinyLlama-1.1B (Llama architecture, <code>desc_act=true</code>: real act-order)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">232</td>
+<td style="text-align: right;">209</td>
+<td style="text-align: right;">0.90</td>
+<td>320 of 320 greedy tokens identical, mean abs. log-prob diff 0.0012</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">904</td>
+<td style="text-align: right;">804</td>
+<td style="text-align: right;">0.89</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3288</td>
+<td style="text-align: right;">3003</td>
+<td style="text-align: right;">0.91</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">8604</td>
+<td style="text-align: right;">6547</td>
+<td style="text-align: right;">0.76</td>
+<td></td>
+</tr>
+<tr>
+<td>Qwen2.5-3B</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">81.5</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">0.87</td>
+<td>320 of 320 identical, mean diff 0.0019</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">320</td>
+<td style="text-align: right;">280</td>
+<td style="text-align: right;">0.88</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1215</td>
+<td style="text-align: right;">1073</td>
+<td style="text-align: right;">0.88</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>K-folding changes nothing for the 3B model (71 tokens/s with and without it): its narrow layers (2048 outputs) did not gain enough to be folded. <strong>Memory:</strong> a first run of the 3B model failed to start
+on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
+22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).</p>
 <h2 id="limitations-of-the-plugin">Limitations of the plugin<a class="headerlink" href="#limitations-of-the-plugin" title="Permanent link">#</a></h2>
 <p>GPTQ 4-bit and 8-bit and AWQ 4-bit with zero points; no MoE layers; AWQ without zero points is refused. First start of a model compiles one kernel per layer shape and row bucket (about 0.3 seconds each, cached on disk afterwards). Only one GPU architecture (sm_89) and two small models were tested.</p></article>
 </main>
