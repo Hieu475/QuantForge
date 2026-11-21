@@ -285,3 +285,20 @@ RTX 4050, and for 81 to 96 column blocks (N = 10240 .. 12288) the 32-deep tile (
 (N = 11008: 136 against 150 us); at 104 blocks and more the deep tile wins again. `_decode_opts` uses bk = 32 for
 10240 <= N <= 12288, 128 for N >= 8192 otherwise, 64 below; the autotuner has bk = 32 candidates (candidates version 3).
 1 x 4096 x 11008: 149.5 -> 135.7 us (0.93 of Marlin), 16 x 4096 x 11008: 149.2 -> 135.5 us (0.94).
+
+## Split-K (`split-k=S`, experimental, off by default)
+
+`quantforge-tiling{split-k=S}` first cuts the K reduction with `linalg::tileReductionUsingForall` (`numThreads = [0, 0, S]`): a
+`scf.forall (z)` whose body is an ordinary `[M, K/S] x [K/S, N]` GEMM, writing into a partial-result tensor, and a `linalg.generic` that sums
+the S partial results. The block tiling then runs inside it. `mergeSplitKForall` (TilingPass.cpp) folds the nested foralls into one
+`scf.forall (m, n, z)` so that `quantforge-forall-to-gpu` sees a 3-D grid (`quantforge-gpu-mapping` gives it `[y, x, z]`), and changes three things:
+
+* the partial buffer is `P[S, M, N]`, not `[M, N, S]`: the tile of a block must be contiguous, otherwise `convert-vector-to-gpu` does not recognise the accumulator
+  load and the contraction stays a `vector.contract` that cannot be lowered;
+* blocks read and write their own tile `P[z, m, n]` directly (a whole-slice view `P[z]` makes bufferization copy the full `[M, N]` slice per block, with a device `malloc`);
+* the zero fill of `P` is dropped when the kernel overwrites its output (`split-k-init=false`, set by the pipeline for `accumulate=false`): a fill is vectorised into a
+  host-side `vector<M x N x S x f32>` otherwise. The reduce `linalg.generic` is excluded from vectorisation (`quantforge.no_vectorize`) and becomes a second kernel.
+
+Constraints: `K / S` must be a multiple of `block-tile-k` and of the group size. Result: correct (`test/Transforms/gpu_pipeline_split_k.mlir`, `test/E2E/test_split_k.py`)
+but 14-23 % faster only for long-K, narrow-N layers at 32 rows, and slower for most shapes at 64 rows (second kernel, `S x M x N` extra floats, a device allocation per call that
+would break CUDA-graph capture). A useful version would reduce inside the kernel (atomics / semaphore) and take the scratch as an argument; see the blog post for the numbers.
