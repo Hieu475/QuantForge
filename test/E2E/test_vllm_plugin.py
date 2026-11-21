@@ -60,7 +60,23 @@ def test_vllm_generates_the_same_text_as_marlin_for_a_simple_prompt(model, refer
     for q in (reference, "quantforge"):
         r = subprocess.run([sys.executable, "-c", code, q], capture_output=True, text=True)
         if "TEXT:" not in r.stdout:
-            pytest.skip(f"vLLM could not run {model} ({r.stderr[-200:]})")
+            if q == reference:       # the reference itself cannot run here (no model, no memory): nothing to compare
+                pytest.skip(f"vLLM could not run {model} with {q} ({r.stderr[-200:]})")
+            pytest.fail(f"quantforge failed where {reference} worked on {model}:\n{r.stderr[-1500:]}")   # never hide a plugin bug
         texts[q] = r.stdout.split("TEXT:")[1].strip()
     assert "Paris" in texts["quantforge"]
     assert texts["quantforge"][:40] == texts[reference][:40], texts
+
+
+def test_register_never_raises_even_without_a_usable_vllm(monkeypatch):
+    """vLLM calls the entry point on every start: with a missing or too old vLLM it may only warn."""
+    import warnings
+
+    import quantforge.vllm_plugin as vp
+
+    monkeypatch.setattr(vp, "HAVE_VLLM", False)
+    monkeypatch.setattr(vp, "_IMPORT_ERROR", ImportError("cannot import name 'AutoGPTQConfig'"), raising=False)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        vp.register()
+    assert any("quantforge" in str(x.message) and vp.MIN_VLLM in str(x.message) for x in w)

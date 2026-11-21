@@ -111,6 +111,20 @@ export QUANTFORGE_BUILD_DIR=$PWD/build        # the CMake build directory contai
 quantforge-doctor                             # GPU, nvcc / ptxas, quantforge-opt, and one small kernel against a reference
 ```
 
+### Docker (no toolchain on the host)
+
+```bash
+docker build -f docker/Dockerfile -t quantforge .                    # builds quantforge-opt (LLVM 18), installs torch (CUDA 12.8) and the package
+docker build -f docker/Dockerfile --build-arg WITH_VLLM=1 -t quantforge:vllm .      # + vLLM with the `quantization="quantforge"` plugin
+docker run --rm --gpus all quantforge                                # quantforge-doctor: GPU, toolchain, one kernel against a reference
+docker run --rm --gpus all -v ~/.cache/quantforge:/root/.cache/quantforge -v ~/.cache/huggingface:/root/.cache/huggingface \
+    quantforge:vllm python your_script.py                            # mount the caches: kernels compile once, models download once
+```
+
+Needs the NVIDIA container toolkit on the host. The image is large (9.6 GB compressed, 27 GB on disk: the CUDA toolkit is needed at run time for `nvcc` / `ptxas`, plus the CUDA wheels of
+torch). Checked on the RTX 4050: `quantforge-doctor` passes inside the container and the torch op matches a dense reference. The `.github/workflows/docker.yml` workflow builds the image
+(manual trigger; it only pushes to a registry if you ask it to).
+
 ## Build
 
 Supported toolchain: **LLVM/MLIR 18.1.x** (the MLIR C++ API changes every release;
@@ -447,7 +461,7 @@ Fold helps for 1-4 requests (+9 % / +15 %) and does nothing from 16 requests up 
 silently reused (my first A/B measured nothing for that reason). The plugin therefore makes every layer call the same op and derives the fold factor from tensor shapes at run time; after
 upgrading the plugin, clear that cache once.
 
-Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points (`quantization="quantforge"` picks the reader from the checkpoint). Limitations: no MoE
+vLLM versions: needs >= 0.24 (the classes it extends do not exist before); the generation tests (GPTQ 4-bit, GPTQ 8-bit, AWQ against the matching Marlin method) pass on **0.24.0, 0.25.1 and 0.34.0**, the releases in between were not run. Two API changes had to be absorbed on the way (0.34 reads `use_batch_invariant` in `create_weights`; `is_layer_skipped` changed its keyword), which shows that a new vLLM release may need a small fix. Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points (`quantization="quantforge"` picks the reader from the checkpoint). Limitations: no MoE
 layers, no AWQ without zero points. Other checkpoint formats (Qwen2.5-0.5B, the same engine, tokens/s summed over the requests, two runs agreed to 1 %; each against its own Marlin method):
 
 | format | requests | Marlin | QuantForge | QuantForge / Marlin | output vs Marlin |

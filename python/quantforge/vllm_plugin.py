@@ -14,7 +14,7 @@ on disk, so the first start of a model takes a while (about 0.3 s per kernel) an
 K-folding (``kfold.py``) keeps a second copy of the narrow-output layers: ``QUANTFORGE_KFOLD=0`` disables it,
 ``QUANTFORGE_KFOLD_BUDGET_MB`` (default 256) caps the extra memory.
 
-Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points. Limitations: no MoE layers, no
+Needs vLLM >= 0.24 (the generation tests pass on 0.24.0, 0.25.1 and 0.34.0; the releases in between were not run). Formats: GPTQ 4-bit and 8-bit (symmetric or not, act-order included) and AWQ 4-bit with zero points. Limitations: no MoE layers, no
 AWQ with a symmetric / absent zero point, f16 / bf16 activations (bf16 is converted to f16 around the op).
 """
 from __future__ import annotations
@@ -36,20 +36,41 @@ try:
     from vllm.model_executor.layers.quantization.utils.gptq_utils import get_linear_quant_method
     from vllm.scalar_type import scalar_types
     HAVE_VLLM = True
-except ImportError:                      # vLLM is not installed: the module is importable but registers nothing
+except ImportError as _e:                # vLLM missing, or older than 0.24 (before auto_gptq / auto_awq): registers nothing
     HAVE_VLLM = False
+    _IMPORT_ERROR = _e
+
+MIN_VLLM = "0.24"                        # first release with AutoGPTQConfig / BaseAWQLinearMethod; run on 0.24.0, 0.25.1, 0.34.0
 
 
 def register() -> None:
-    """Entry point (`vllm.general_plugins`). The classes below are defined at import time, at module level, because vLLM
-    pickles the quantization config to its engine process; importing this module is what registers the method."""
+    """Entry point (`vllm.general_plugins`), called by vLLM on every start, whatever model it loads: it must never raise. The
+    classes below are defined at import time, at module level, because vLLM pickles the quantization config to its engine
+    process; importing this module is what registers the method."""
     if not HAVE_VLLM:
-        raise RuntimeError("vLLM is not installed")
+        import warnings
+
+        try:
+            from importlib.metadata import version
+            found = f"vLLM {version('vllm')}"
+        except Exception:                # noqa: BLE001
+            found = "no vLLM"
+        warnings.warn(f"quantforge: the 'quantforge' quantization method is not available ({found}; needs vLLM >= {MIN_VLLM}: "
+                      f"{type(_IMPORT_ERROR).__name__}: {_IMPORT_ERROR})", stacklevel=2)
 
 
 _FOLD_BYTES = [0]            # bytes of folded weight copies made so far in this process (see QUANTFORGE_KFOLD_BUDGET_MB)
 
 if HAVE_VLLM:
+
+    def _layer_skipped(prefix: str, ignored: list, mapping) -> bool:
+        """``is_layer_skipped`` with substring matching: the keyword changed between vLLM releases (``skip_with_substr=True``
+        up to 0.2x, ``match_mode="substring"`` in 0.34)."""
+        import inspect
+
+        kw = {"match_mode": "substring"} if "match_mode" in inspect.signature(is_layer_skipped).parameters \
+            else {"skip_with_substr": True}
+        return is_layer_skipped(prefix, ignored, mapping, **kw)
 
     def _install(layer: torch.nn.Module, packed, scale, zero, perm, group: int, drop: tuple) -> None:
         """Replace the checkpoint tensors of `layer` by the QuantForge layout (shared by the GPTQ and AWQ methods)."""
@@ -100,9 +121,14 @@ if HAVE_VLLM:
     class QuantForgeLinearMethod(AutoGPTQLinearMethod):
         """GPTQ-format weights, QuantForge kernels."""
 
+        # attributes that vLLM's own __init__ sets and its create_weights reads (it differs between releases: 0.34 reads
+        # use_batch_invariant, 0.24 reads input_dtype); defaults as class attributes so that a new one cannot break us
+        use_batch_invariant = False
+        input_dtype = None
+        kernel = None
+
         def __init__(self, quant_config: "QuantForgeConfig") -> None:     # no Marlin check: our kernels run on sm_80+
             self.quant_config = quant_config
-            self.input_dtype = None
             self.quant_type = quant_config.quant_type
 
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -168,7 +194,7 @@ if HAVE_VLLM:
         def get_quant_method(self, layer, prefix):
             if self.awq:
                 if isinstance(layer, LinearBase) or (isinstance(layer, ParallelLMHead) and self.lm_head_quantized):
-                    if is_layer_skipped(prefix, self.modules_to_not_convert, self.packed_modules_mapping, skip_with_substr=True):
+                    if _layer_skipped(prefix, self.modules_to_not_convert, self.packed_modules_mapping):
                         return UnquantizedLinearMethod()
                     return QuantForgeAWQLinearMethod(self)
                 return None

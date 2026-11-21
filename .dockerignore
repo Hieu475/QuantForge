@@ -1,0 +1,7 @@
+.git
+build
+build-ci
+blog/site
+**/__pycache__
+**/*.pyc
+.cache

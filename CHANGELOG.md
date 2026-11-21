@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* `docker/Dockerfile`: image with the compiler, torch and the package (optionally vLLM); `quantforge-doctor` and the torch op verified inside it with `--gpus all`.
+* vLLM plugin works on vLLM 0.24.0, 0.25.1 and 0.34.0 (fixes for 0.34: `use_batch_invariant`, the new `is_layer_skipped` keyword); the slow generation test now fails, instead of skipping, when only the plugin fails.
+* vLLM plugin: needs vLLM >= 0.24 (the `auto_gptq` / `auto_awq` classes it extends are in 0.24-0.34.0 and absent before); with an older or missing vLLM it now warns once
+  instead of registering nothing silently.
+
 ## 0.3.0 (2026-11-21)
 
 * The op processes inputs of more than 2048 rows in chunks (bounded f32 temporary: Qwen2.5-3B could not start under vLLM on a 6 GB card because of the 8192-token profiling pass). `QUANTFORGE_KFOLD_BUDGET_MB` caps the extra memory of K-folding.
