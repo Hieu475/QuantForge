@@ -88,7 +88,7 @@ def test_op_serves_a_shape_that_is_not_in_any_pack_with_the_dense_fallback(tmp_p
 
 @pytest.mark.skipif(os.environ.get("QUANTFORGE_SLOW_TESTS") != "1", reason="slow test: set QUANTFORGE_SLOW_TESTS=1")
 def test_build_ext_and_check_roundtrip_on_a_tiny_model(tmp_path):
-    """`pack build` (plans in one process, kernels recorded in a fresh one), `pack ext`, then `pack check` with the JIT off: no dense fallback.
+    """`pack build --w4a8` (plans in one process, kernels recorded in a fresh one), `pack ext`, then `pack check --w4a8` with the JIT off: no dense fallback, no W4A8 fallback.
 
     Regression: kernels the planners build while recording is paused stay in the process caches, so a single-pass recording missed them."""
     _require_gpu()
@@ -98,10 +98,38 @@ def test_build_ext_and_check_roundtrip_on_a_tiny_model(tmp_path):
     env = dict(os.environ, QUANTFORGE_TUNE_CACHE=str(tmp_path / "tune.json"), QUANTFORGE_KERNEL_CACHE=str(tmp_path / "kcache"))
     run = lambda *a: subprocess.run([sys.executable, "-m", "quantforge.pack", *a], env=env, capture_output=True, text=True)  # noqa: E731
     out = tmp_path / "pack"
-    r = run("build", "--out", str(out), "--model", str(cfg))
+    r = run("build", "--out", str(out), "--model", str(cfg), "--w4a8")
     assert r.returncode == 0, r.stdout + r.stderr
     assert len(list((out / "kernels").glob("*.so"))) > 20 and (out / "plans.json").exists()
     r = run("ext", "--out", str(out))
     assert r.returncode == 0, r.stdout + r.stderr
-    r = run("check", str(out), "--model", str(cfg), "--max-rows", "40")
+    r = run("check", str(out), "--model", str(cfg), "--max-rows", "40", "--w4a8")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_w4a8_op_falls_back_when_its_kernel_is_unavailable(tmp_path, monkeypatch):
+    """No W4A8 kernel in any pack and no toolchain: the hybrid op answers through the W4A16 layout (dual) or a dense torch matmul (compact), correctly."""
+    _require_gpu()
+    from quantforge import quant, w4a8_op
+
+    monkeypatch.setenv("QUANTFORGE_NO_JIT", "1")
+    monkeypatch.setenv("QUANTFORGE_PACK", str(tmp_path))
+    monkeypatch.setenv("QUANTFORGE_KERNEL_CACHE", str(tmp_path / "no-cache"))
+    K, N = 384, 640                                              # a shape no pack and no other test has
+    g = torch.Generator(device="cuda").manual_seed(5)
+    w = torch.randn(N, K, device="cuda", generator=g) * 0.03
+    p8, gs, zp, sw = quant.w4a8_quantize(w)
+    p16, s16, z16 = w4a8_op.from_w4a8(p8, gs, zp, sw)
+    ref_w = quant.w4a8_dequantize(p8, gs, zp, sw).half()
+    empty = torch.empty(0, device="cuda", dtype=torch.float16)
+    before = w4a8_op.FALLBACKS
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for M, compact in ((200, False), (200, True), (5, True)):
+            x = torch.randn(M, K, device="cuda", dtype=torch.float16, generator=g)
+            args = (empty, empty, empty, empty, empty, empty) if compact else (p16, s16, z16, empty, empty, empty)
+            scale_nk = (gs.float() * sw[:, None]).half() if compact else empty
+            y = w4a8_op._impl(x, p8, gs, zp, sw, None, *args, 128, scale_nk)
+            ref = x.float() @ ref_w.float().t()
+            assert (y.float() - ref).abs().max() < 0.03 * ref.abs().max(), (M, compact)
+    assert w4a8_op.FALLBACKS >= before + 3

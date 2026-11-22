@@ -82,6 +82,39 @@ def sweep_layers(shapes, group: int = 128, rows=ROWS, log=print) -> None:
         log(f"  {name:8s} K={K:6d} N={N:6d} bias={int(bias)} fold={S}: {time.time() - t0:5.1f} s")
 
 
+def sweep_w4a8(shapes, rows=ROWS, log=print, modes=("dual", "compact")) -> None:
+    """The W4A8 hybrid op (`w4a8_op`, `quantization="quantforge_w4a8"`) for the same layers: both weight layouts, every row count."""
+    import torch
+
+    from . import kfold, quant, w4a8_op
+
+    dev = torch.device("cuda")
+    for name, K, N, bias in shapes:
+        if K % 128 or N % 128:
+            log(f"  {name}: K={K} N={N} is not a multiple of 128, no W4A8 layer")
+            continue
+        t0 = time.time()
+        g = torch.Generator(device=dev).manual_seed(0)
+        parts = [quant.w4a8_quantize((torch.randn(min(2048, N - r), K, device=dev, generator=g) * 0.03)) for r in range(0, N, 2048)]
+        packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
+        b = (torch.rand(N, device=dev, generator=g) - 0.5).half() if bias else None
+        for mode in modes:
+            if mode == "compact":
+                e = kfold.no_fold(dev)
+                p16, s16, z16, pf, sf, zf = e[0], e[1], e[2], e[0], e[1], e[2]
+                scale_nk = (gs.float() * sw.float()[:, None]).half()
+            else:
+                p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())
+                S = kfold.plan_ksplit(K, N, 128, 4)
+                pf, sf, zf = kfold.fold_k(p16, s16, z16, S) if S > 1 else kfold.no_fold(dev)
+                scale_nk = torch.empty(0, device=dev, dtype=torch.float16)
+            for M in rows:
+                x = (torch.rand(M, K, device=dev, generator=g) * 2 - 1).half()
+                torch.ops.quantforge.w4a8_hybrid(x, packed, gs, zp, sw.float(), b, p16, s16, z16, pf, sf, zf, 128, scale_nk)
+        torch.cuda.synchronize()
+        log(f"  w4a8 {name:8s} K={K:6d} N={N:6d}: {time.time() - t0:5.1f} s")
+
+
 def _pack_plans_from_cache(dest: Path, shapes, group: int) -> int:
     """Copy the planner decisions (fold factors, atomic plans) of these shapes from the autotune cache into the pack."""
     from . import autotune as at
@@ -108,6 +141,8 @@ def cmd_record(a) -> None:
     from . import torch_ops  # noqa: F401
 
     sweep_layers([tuple(x) for x in json.loads(a.shapes)], a.group, log=lambda s: print(s, flush=True))
+    if a.w4a8:
+        sweep_w4a8([tuple(x) for x in json.loads(a.shapes)], log=lambda s: print(s, flush=True))
 
 
 def cmd_build(a) -> None:
@@ -139,7 +174,7 @@ def cmd_build(a) -> None:
     print("pass 1: plans", flush=True)
     sweep_layers(uniq, a.group, log=lambda s: print(s, flush=True))
     print("pass 2: recording kernels", flush=True)
-    r = subprocess.run([sys.executable, "-m", "quantforge.pack", "_record", "--out", str(out), "--group", str(a.group), "--shapes", json.dumps(uniq)])
+    r = subprocess.run([sys.executable, "-m", "quantforge.pack", "_record", "--out", str(out), "--group", str(a.group), "--shapes", json.dumps(uniq)] + (["--w4a8"] if a.w4a8 else []))
     if r.returncode:
         raise SystemExit(r.returncode)
     n = _pack_plans_from_cache(out, uniq, a.group)
@@ -170,6 +205,10 @@ def cmd_check(a) -> None:
         f"    for tp in {a.tp!r}:\n"
         "        shapes += pack.layer_shapes(pack.load_config(m), tp)\n"
         f"pack.sweep_layers(shapes, {a.group}, rows=tuple(range(1, {a.max_rows + 1})) + pack.ROWS)\n"
+        f"if {a.w4a8!r}:\n"
+        "    from quantforge import w4a8_op\n"
+        f"    pack.sweep_w4a8(shapes, rows=tuple(range(1, {a.max_rows + 1})) + pack.ROWS)\n"
+        "    torch_ops.DENSE_FALLBACKS += w4a8_op.FALLBACKS\n"
         "print('DENSE', torch_ops.DENSE_FALLBACKS, 'MISSING KERNELS', len(torch_ops.PACK_MISSES))\n"
         "for m in sorted(set(torch_ops.PACK_MISSES))[:20]: print('  missing (M, K, N, kind):', m)\n"
         "sys.exit(1 if torch_ops.DENSE_FALLBACKS or torch_ops.PACK_MISSES else 0)\n")
@@ -252,6 +291,7 @@ def main(argv=None) -> None:
     b.add_argument("--model", action="append", required=True, help="Hugging Face id, local directory or config.json (repeatable)")
     b.add_argument("--tp", type=int, nargs="+", default=[1], help="tensor-parallel sizes (default 1)")
     b.add_argument("--group", type=int, default=128)
+    b.add_argument("--w4a8", action="store_true", help="also record the kernels of the W4A8 hybrid op (`quantization=\"quantforge_w4a8\"`)")
     ar = sub.add_parser("archive", help="pack a pack directory into a .tar.gz")
     ar.add_argument("pack")
     ar.add_argument("out")
@@ -262,6 +302,7 @@ def main(argv=None) -> None:
     rc.add_argument("--out", required=True)
     rc.add_argument("--group", type=int, default=128)
     rc.add_argument("--shapes", required=True)
+    rc.add_argument("--w4a8", action="store_true")
     e = sub.add_parser("ext", help="build the C++ torch runtime for this torch into the pack")
     e.add_argument("--out", required=True)
     e.add_argument("--arch", default="8.0;8.6;8.9+PTX", help="TORCH_CUDA_ARCH_LIST of the one CUDA kernel of the runtime")
@@ -271,6 +312,7 @@ def main(argv=None) -> None:
     c.add_argument("--tp", type=int, nargs="+", default=[1])
     c.add_argument("--group", type=int, default=128)
     c.add_argument("--max-rows", type=int, default=300)
+    c.add_argument("--w4a8", action="store_true", help="check the W4A8 hybrid op too")
     a = ap.parse_args(argv)
     {"build": cmd_build, "check": cmd_check, "ext": cmd_ext, "_record": cmd_record, "archive": cmd_archive, "install": cmd_install}[a.cmd](a)
 

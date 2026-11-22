@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 
 from . import kfold, quant
+from .e2e import KernelUnavailable
 
 _KERNELS: dict = {}
 _BUCKETS = (32, 64, 96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
@@ -117,6 +118,27 @@ def _min_int8_rows() -> int:
 _DEFAULT_MIN_INT8_ROWS = 64     # measured: the INT8 kernel has a floor (~170 us for 1536 x 17920 at any M <= 128), the W4A16 skinny kernels win up to 64 rows, INT8 from ~96
 
 
+FALLBACKS = 0          # calls served by the fallbacks below (no kernel in a pack, no toolchain); a pack covers a model when this stays 0
+_warned = False
+
+
+def _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group):
+    """No W4A8 kernel for this shape (not in a kernel pack, no toolchain to compile it): the W4A16 kernels when the W4A16 layout is kept, else a dense
+    torch matmul with the dequantised weight (correct, slow). Warns once."""
+    global FALLBACKS, _warned
+    FALLBACKS += 1
+    if not _warned:
+        import warnings
+        warnings.warn("quantforge: no W4A8 kernel for a layer shape (not in a kernel pack, no toolchain to compile it); using a slower fallback for it. "
+                      "Build a pack with `python -m quantforge.pack build --w4a8`.")
+        _warned = True
+    if packed16.numel() > 0:
+        return kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
+    w = quant.w4a8_dequantize(p8, gs, zp, sw.float(), group).half()
+    y = x2 @ w.t()
+    return y if bias is None else y + bias
+
+
 def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, bias: Optional[torch.Tensor],
           packed16: torch.Tensor, scale16: torch.Tensor, zero16: torch.Tensor, packed_f: torch.Tensor, scale_f: torch.Tensor,
           zero_f: torch.Tensor, group: int, scale_nk: torch.Tensor) -> torch.Tensor:
@@ -125,18 +147,24 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     M = x2.shape[0]
     if M <= 16 and packed16.numel() == 0:                             # compact: decode from the W4A8 layout itself (no second copy)
         b = None if bias is None else bias.contiguous()
-        if M in (1, 2, 4, 8) and x2.is_contiguous() and x2.data_ptr() % 16 == 0:         # exactly M rows: no padded copy (valid-rows kernel)
-            out = torch.empty(M, N, device=x.device, dtype=torch.float16)
-            _decode_kernel(K, N, bias is not None, M).launch(x2, p8, zp, scale_nk, out, b)
-            return out.reshape(*lead, N)
-        out = torch.empty(16, N, device=x.device, dtype=torch.float16)
-        _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
-        return out[:M].reshape(*lead, N)
+        try:
+            if M in (1, 2, 4, 8) and x2.is_contiguous() and x2.data_ptr() % 16 == 0:     # exactly M rows: no padded copy (valid-rows kernel)
+                out = torch.empty(M, N, device=x.device, dtype=torch.float16)
+                _decode_kernel(K, N, bias is not None, M).launch(x2, p8, zp, scale_nk, out, b)
+                return out.reshape(*lead, N)
+            out = torch.empty(16, N, device=x.device, dtype=torch.float16)
+            _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
+            return out[:M].reshape(*lead, N)
+        except KernelUnavailable:
+            return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
     if M <= _min_int8_rows() and packed16.numel() > 0:                # decode and small batches: the W4A16 kernels (memory bound / skinny, same bytes)
         y = kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
         return y.reshape(*lead, N)
     Mp = _bucket(M)
-    k = _kernel(Mp, K, N, bias is not None)
+    try:
+        k = _kernel(Mp, K, N, bias is not None)
+    except KernelUnavailable:
+        return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
     xq, s_x = _quantize_tokens(x2)
     if Mp != M:                                                       # zero rows (scale 0) up to the bucket
         xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
