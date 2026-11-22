@@ -653,3 +653,27 @@ def test_atomic_op_serves_17_to_64_rows(rows):
     ref = x.float() @ deq + b.float()
     assert y.shape == (rows, N) and torch.isfinite(y).all()
     assert (y.float() - ref).abs().max() < 0.05 * ref.abs().max().clamp(min=1.0)
+
+
+@pytest.mark.parametrize("rows", [40, 64])
+def test_planned_tile_schedule_is_used_and_correct(rows):
+    """`tile_plan.plan_tile` stores a per-shape schedule that `default_opts` returns; the op built with it matches the reference
+    (1536 x 17920 at 64 rows: a 64 x 32 warp tile with a 32-deep K tile beats the default on the RTX 4050; elsewhere the default stays)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant, tile_plan
+
+    K, N, G = 1536, 17920, 128
+    bucket = qt.bucket_rows(rows)
+    planned = tile_plan.plan_tile(bucket, K, N)
+    assert qt.default_opts(bucket, K, N) == (planned or qt._default_skinny(bucket, K, N))
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.03
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    qt.clear_cache()
+    y = torch.ops.quantforge.w4a16_gemm(x, packed, s, z, G, None, "none")
+    ref = x.float() @ deq
+    assert (y.float() - ref).abs().max() < 0.02 * ref.abs().max()

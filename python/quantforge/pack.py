@@ -92,6 +92,8 @@ def _pack_plans_from_cache(dest: Path, shapes, group: int) -> int:
         for k, v in cache.items():
             if k.startswith(("kfold", "atomic")) and f"|g{group}|" in k and k.endswith(f"|K{K}|N{N}"):
                 keep[k] = v
+            elif k.startswith("tile") and k.endswith(f"|K{K}|N{N}"):       # per-shape tile schedules (group independent)
+                keep[k] = v
     old = {}
     if (dest / "plans.json").exists():
         old = json.loads((dest / "plans.json").read_text())

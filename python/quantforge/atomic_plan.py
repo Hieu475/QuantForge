@@ -118,6 +118,13 @@ def preplan(K: int, N: int, group_size: int) -> None:
     """Decide the 16-, 32- and 64-row plans of a layer now (at weight loading), not at the first call of that size: that may be inside a CUDA graph capture."""
     if os.environ.get("QUANTFORGE_NO_ATOMIC") or not torch.cuda.is_available():
         return
+    from . import tile_plan
+
+    for rows in (32, 64):          # the tile of the plain kernel first: the atomic plans are measured against it
+        try:
+            tile_plan.plan_tile(rows, K, N, group_size=group_size)
+        except Exception:  # noqa: BLE001
+            pass
     for rows in (16, 32, 64):
         try:
             plan_atomic(K, N, group_size, rows=rows)

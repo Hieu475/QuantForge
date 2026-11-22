@@ -118,9 +118,21 @@ def _skinny_opts(M: int, K: int, N: int) -> str:
     return _SKINNY_OPTS[M]
 
 
+def _default_skinny(M: int, K: int, N: int) -> str:
+    """The rule-based schedule of a 32- / 64-row call (what `default_opts` returns when no plan exists)."""
+    return _skinny_opts(M, K, N)
+
+
 def default_opts(M: int, K: int, N: int) -> str:
-    """Pipeline options the op uses for a call with M rows when autotuning is off (M is the bucketed row count)."""
-    return _decode_opts(N) if M <= 16 else _skinny_opts(M, K, N) if M <= 64 else _prefill_opts(M, K, N)
+    """Pipeline options the op uses for a call with M rows when autotuning is off (M is the bucketed row count). 32 / 64 rows: the schedule
+    `tile_plan.plan_tile` measured for this shape when there is one (autotune cache or kernel pack), else the rule."""
+    if M <= 16:
+        return _decode_opts(N)
+    if M <= 64:
+        from . import tile_plan
+
+        return tile_plan.lookup(M, K, N) or _skinny_opts(M, K, N)
+    return _prefill_opts(M, K, N)
 
 
 def bucket_rows(M: int) -> int:
