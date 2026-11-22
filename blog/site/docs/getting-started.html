@@ -16,6 +16,7 @@
 <div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li class=cur><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Getting started</h1><p class="lede">Install, build, test, and the first calls.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
 <ul>
 <li><a href="#install-the-python-package">Install the Python package</a></li>
+<li><a href="#kernel-packs-run-without-llvm-quantforge-opt-or-nvcc">Kernel packs: run without LLVM, quantforge-opt or nvcc</a></li>
 <li><a href="#docker-no-toolchain-on-the-host">Docker (no toolchain on the host)</a></li>
 <li><a href="#build">Build</a></li>
 <li><a href="#test">Test</a></li>
@@ -28,6 +29,26 @@ pip install ./python[hf]                      # needs a CUDA build of torch; [hf
 export QUANTFORGE_BUILD_DIR=$PWD/build        # the CMake build directory containing tools/quantforge-opt
 quantforge-doctor                             # GPU, nvcc / ptxas, quantforge-opt, and one small kernel against a reference
 </code></pre>
+<h2 id="kernel-packs-run-without-llvm-quantforge-opt-or-nvcc">Kernel packs: run without LLVM, <code>quantforge-opt</code> or <code>nvcc</code><a class="headerlink" href="#kernel-packs-run-without-llvm-quantforge-opt-or-nvcc" title="Permanent link">#</a></h2>
+<p>The compiler is only needed to <em>make</em> kernels. Every kernel it produces is a ~55 KB shared library that links against <code>libcuda</code> alone (the device code is PTX, which the driver compiles
+for whatever GPU it finds, so one pack serves every sm_80+ card). A <strong>kernel pack</strong> is a directory of those libraries for the layer shapes of a model, plus the measured plans (K-fold factors, atomic split-K) and the C++ torch runtime built for one torch / CUDA:</p>
+<pre><code class="language-bash"># on a machine with the toolchain (once per set of models; `build` plans first, then records the kernels in a fresh process)
+python -m quantforge.pack build --out ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4     # any HF id / config.json; --tp 1 2 for tensor parallel
+python -m quantforge.pack ext   --out ./qwen15-pack                                                 # the C++ runtime for this torch (no nvcc needed to load it)
+python -m quantforge.pack check ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4          # every row count 1..300 and up to 8192 with JIT off: fails on any gap
+
+python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: a nine-model pack is 9.4 MiB (38 MiB unpacked)
+
+# on the machine that serves (pip install the package, no compiler, no LLVM)
+quantforge-pack install qwen15-pack.tar.gz                                                       # file or https URL -&gt; ~/.cache/quantforge/pack (or --dest DIR + QUANTFORGE_PACK=DIR)
+quantforge-doctor                                                                                # runs a kernel from the pack against a reference
+python -c &quot;from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')&quot;
+</code></pre>
+<p>A pack of Qwen2.5-0.5B is 110 kernels / 5.9 MiB, of Qwen2.5-1.5B 104 kernels / 5.7 MiB. Measured inside vLLM with <code>QUANTFORGE_NO_JIT=1</code>, the kernel cache disabled and the pack as the only source of kernels,
+Qwen2.5-1.5B decodes at 129 / 506 / 1917 / 4757 tokens/s for 1 / 4 / 16 / 64 requests against Marlin's 141 / 553 / 2082 / 5871 (0.91 / 0.91 / 0.92 / 0.81, the same as with the compiler). The same check was run for a pack of nine models at once (Qwen2.5 0.5B / 1.5B / 3B / 7B, Llama-3.2 1B / 3B, Llama-3.1 8B, Mistral-7B-v0.3, Phi-3.5-mini: 28 distinct layer shapes, 686 kernels, 38 MiB, built in under three minutes): every row count from 1 to 130 plus samples up to 8192 runs with the JIT off and no dense fallback. Qwen2.5-3B from that pack, inside vLLM: 75 / 297 / 1134 / 2704 tokens/s at 1 / 4 / 16 / 64 requests against Marlin's 82 / 320 / 1214 / 3560 (0.91 / 0.93 / 0.93 / <strong>0.76</strong>: the 64-request regime is the weak one, see the 64-row notes below). A shape the pack does not hold is not an error:
+the op warns once and serves it with a dense torch path (dequantise + cuBLAS: correct, several times slower), so a model never fails to load because of a missing kernel; <code>quantforge.torch_ops.DENSE_FALLBACKS</code> counts those calls.
+<code>QUANTFORGE_PACK</code> takes several directories; <code>~/.cache/quantforge/pack</code> and the package's own <code>kernel_pack</code> are always searched. Limits: the tile rules and plans were measured on one RTX 4050 (a pack built on another GPU
+carries that GPU's plans; the plans of another GPU model are not used without the compiler), the extension is tied to the torch / CUDA / Python it was built for (otherwise it is built on first use if <code>nvcc</code> exists, else the slower Python op runs).</p>
 <h2 id="docker-no-toolchain-on-the-host">Docker (no toolchain on the host)<a class="headerlink" href="#docker-no-toolchain-on-the-host" title="Permanent link">#</a></h2>
 <pre><code class="language-bash">docker build -f docker/Dockerfile -t quantforge .                    # builds quantforge-opt (LLVM 18), installs torch (CUDA 12.8) and the package
 docker build -f docker/Dockerfile --build-arg WITH_VLLM=1 -t quantforge:vllm .      # + vLLM with the `quantization=&quot;quantforge&quot;` plugin

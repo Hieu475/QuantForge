@@ -5,6 +5,7 @@
      "posts": ["01-overview"],
      "items": [
        {"src": "README.md", "heading": "Install the Python package", "own": true},
+       {"src": "README.md", "heading": "Kernel packs: run without LLVM"},
        {"src": "README.md", "heading": "Docker"},
        {"src": "README.md", "heading": "Build"},
        {"src": "README.md", "heading": "Test"},
