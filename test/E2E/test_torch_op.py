@@ -677,3 +677,28 @@ def test_planned_tile_schedule_is_used_and_correct(rows):
     y = torch.ops.quantforge.w4a16_gemm(x, packed, s, z, G, None, "none")
     ref = x.float() @ deq
     assert (y.float() - ref).abs().max() < 0.02 * ref.abs().max()
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8, 16])
+def test_planned_decode_tile_is_used_and_correct(rows):
+    """16 rows: `tile_plan.plan_tile(16, K, N)` decides the schedule (valid-rows capable tile where the rule's cannot be); results match the reference
+    for the exact-row sizes and for the ones that go through a padded copy."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant, tile_plan
+
+    K, N, G = 3584, 3584, 128
+    planned = tile_plan.plan_tile(16, K, N)
+    assert qt.default_opts(rows, K, N) == (planned or qt._decode_opts(N))
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.02
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    buf = torch.full((rows + 16, K), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:rows] = x
+    qt.clear_cache()
+    y = torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, G, None, "none")
+    ref = x.float() @ deq
+    assert torch.isfinite(y).all() and (y.float() - ref).abs().max() < 0.02 * ref.abs().max()

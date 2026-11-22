@@ -127,7 +127,9 @@ def default_opts(M: int, K: int, N: int) -> str:
     """Pipeline options the op uses for a call with M rows when autotuning is off (M is the bucketed row count). 32 / 64 rows: the schedule
     `tile_plan.plan_tile` measured for this shape when there is one (autotune cache or kernel pack), else the rule."""
     if M <= 16:
-        return _decode_opts(N)
+        from . import tile_plan
+
+        return tile_plan.lookup(16, K, N) or _decode_opts(N)
     if M <= 64:
         from . import tile_plan
 
