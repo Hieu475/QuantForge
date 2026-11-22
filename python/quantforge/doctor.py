@@ -17,6 +17,37 @@ def _line(ok: bool | None, what: str, detail: str = "") -> bool:
     return ok is not False
 
 
+def _check_pack_kernel(packs) -> bool:
+    """Without the compiler: run the probe shape recorded in a pack's meta.json from the pack and compare it with a reference."""
+    import json
+
+    import torch
+
+    from . import torch_ops
+    from .e2e import dequant_reference, pack_int4
+
+    for d in packs:
+        try:
+            K, N, G = json.loads((d / "meta.json").read_text())["probe"]
+        except (OSError, ValueError, KeyError):
+            continue
+        g = torch.Generator(device="cuda").manual_seed(0)
+        q = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.int8, generator=g)
+        scale = (torch.rand(K // G, N, device="cuda", generator=g) * 0.1 + 0.01).half()
+        zp = torch.randint(0, 16, (K // G, N), device="cuda", dtype=torch.int8, generator=g)
+        deq = dequant_reference(q, scale, zp).float()
+        before, worst = torch_ops.DENSE_FALLBACKS, 0.0
+        for M in (1, 7, 16, 64):
+            x = torch.randn(M, K, device="cuda", generator=g).half()
+            ref = x.float() @ deq
+            worst = max(worst, ((torch_ops.w4a16_linear(x, pack_int4(q), scale, zp, G).float() - ref).abs().max() / ref.abs().max()).item())
+        dense = torch_ops.DENSE_FALLBACKS - before
+        ok = worst < 5e-3 and not dense
+        return _line(ok, "kernel from pack", f"{K}x{N} at 1/7/16/64 rows, max relative error {worst:.1e}, C++ runtime {torch_ops.CPP_RUNTIME}"
+                     + (f", {dense} dense fallback calls (the pack lacks this shape)" if dense else ""))
+    return _line(None, "kernel from pack", "no pack has a probe shape (built before `meta.json` recorded one)")
+
+
 def main() -> int:
     from . import __version__
 
@@ -85,6 +116,8 @@ def main() -> int:
             good &= _line(err < 2e-3 * ref.abs().max().item() + 1e-2, "kernel", f"compiled, ran, max|err| {err:.4f}")
         except Exception as e:  # noqa: BLE001
             good &= _line(False, "kernel", f"{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
+    if not opt and packs and has_gpu:
+        good &= _check_pack_kernel(packs)
     print("everything works" if good else "problems found (see above)")
     return 0 if good else 1
 

@@ -122,8 +122,12 @@ python -m quantforge.pack build --out ./qwen15-pack --model Qwen/Qwen2.5-1.5B-In
 python -m quantforge.pack ext   --out ./qwen15-pack                                                 # the C++ runtime for this torch (no nvcc needed to load it)
 python -m quantforge.pack check ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4          # every row count 1..300 and up to 8192 with JIT off: fails on any gap
 
+python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: a nine-model pack is 9.4 MiB (38 MiB unpacked)
+
 # on the machine that serves (pip install the package, no compiler, no LLVM)
-QUANTFORGE_PACK=./qwen15-pack python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')"
+quantforge-pack install qwen15-pack.tar.gz                                                       # file or https URL -> ~/.cache/quantforge/pack (or --dest DIR + QUANTFORGE_PACK=DIR)
+quantforge-doctor                                                                                # runs a kernel from the pack against a reference
+python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')"
 ```
 
 A pack of Qwen2.5-0.5B is 110 kernels / 5.9 MiB, of Qwen2.5-1.5B 104 kernels / 5.7 MiB. Measured inside vLLM with `QUANTFORGE_NO_JIT=1`, the kernel cache disabled and the pack as the only source of kernels,

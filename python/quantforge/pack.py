@@ -1,6 +1,7 @@
 """Kernel packs: ready-made kernels for the layer shapes of a model, so that a machine without LLVM, ``quantforge-opt`` or ``nvcc`` runs them.
 
     python -m quantforge.pack build --out ./pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4     # needs the toolchain once
+    python -m quantforge.pack archive ./pack pack.tar.gz ; python -m quantforge.pack install pack.tar.gz   # ship it / unpack it where it is used
     python -m quantforge.pack check ./pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4           # runs every row count with JIT off
     QUANTFORGE_PACK=./pack python your_vllm_script.py                                             # no toolchain needed
 
@@ -144,6 +145,9 @@ def cmd_build(a) -> None:
     meta["gpu"] = torch.cuda.get_device_name(0)
     meta["torch"] = torch.__version__
     meta["abi"] = 1
+    small = min((sh for sh in uniq if sh[1] % a.group == 0), key=lambda sh: sh[1] * sh[2], default=None)
+    if small and "probe" not in meta:
+        meta["probe"] = [small[1], small[2], a.group]       # `quantforge-doctor` runs this shape from the pack
     meta["kernels"] = len(list((out / "kernels").glob("*.so")))
     meta_p.write_text(json.dumps(meta, indent=1) + "\n")
     size = sum(f.stat().st_size for f in (out / "kernels").glob("*.so")) / 2 ** 20
@@ -190,6 +194,50 @@ def cmd_ext(a) -> None:
     print(f"{out / 'quantforge_rt.so'}  (TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}, torch {torch.__version__})")
 
 
+def cmd_archive(a) -> None:
+    import tarfile
+
+    src = Path(a.pack).resolve()
+    with tarfile.open(a.out, "w:gz") as tf:
+        for sub in ("kernels", "ext", "plans.json", "meta.json"):
+            if (src / sub).exists():
+                tf.add(src / sub, arcname=sub)
+    print(f"{a.out}: {Path(a.out).stat().st_size / 2 ** 20:.1f} MiB")
+
+
+def cmd_install(a) -> None:
+    """Unpack a pack archive (a file or an http(s) URL) into ``~/.cache/quantforge/pack``, merging with what is there."""
+    import shutil
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    dest = Path(a.dest).expanduser() if a.dest else Path.home() / ".cache" / "quantforge" / "pack"
+    with tempfile.TemporaryDirectory() as tmp:
+        arch = a.source
+        if a.source.startswith(("http://", "https://")):
+            arch = str(Path(tmp) / "pack.tar.gz")
+            urllib.request.urlretrieve(a.source, arch)
+        stage = Path(tmp) / "x"
+        with tarfile.open(arch) as tf:
+            for m in tf.getmembers():       # no absolute paths, no escaping the directory, no links
+                if m.name.startswith(("/", "..")) or ".." in Path(m.name).parts or not (m.isfile() or m.isdir()):
+                    raise SystemExit(f"refusing archive member {m.name!r}")
+            tf.extractall(stage, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+        for f in stage.rglob("*"):
+            if f.is_file():
+                t = dest / f.relative_to(stage)
+                if f.name == "plans.json" and t.exists():
+                    merged = json.loads(t.read_text())
+                    merged.update(json.loads(f.read_text()))
+                    t.write_text(json.dumps(merged, indent=1, sort_keys=True) + "\n")
+                elif f.name != "meta.json" or not t.exists():
+                    t.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, t)
+    n = len(list((dest / "kernels").glob("*.so")))
+    print(f"installed into {dest}: {n} kernels in total")
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="python -m quantforge.pack", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -198,6 +246,12 @@ def main(argv=None) -> None:
     b.add_argument("--model", action="append", required=True, help="Hugging Face id, local directory or config.json (repeatable)")
     b.add_argument("--tp", type=int, nargs="+", default=[1], help="tensor-parallel sizes (default 1)")
     b.add_argument("--group", type=int, default=128)
+    ar = sub.add_parser("archive", help="pack a pack directory into a .tar.gz")
+    ar.add_argument("pack")
+    ar.add_argument("out")
+    ins = sub.add_parser("install", help="unpack a pack archive (file or URL) into ~/.cache/quantforge/pack")
+    ins.add_argument("source")
+    ins.add_argument("--dest", help="another directory (then point QUANTFORGE_PACK at it)")
     rc = sub.add_parser("_record", help=argparse.SUPPRESS)
     rc.add_argument("--out", required=True)
     rc.add_argument("--group", type=int, default=128)
@@ -212,7 +266,7 @@ def main(argv=None) -> None:
     c.add_argument("--group", type=int, default=128)
     c.add_argument("--max-rows", type=int, default=300)
     a = ap.parse_args(argv)
-    {"build": cmd_build, "check": cmd_check, "ext": cmd_ext, "_record": cmd_record}[a.cmd](a)
+    {"build": cmd_build, "check": cmd_check, "ext": cmd_ext, "_record": cmd_record, "archive": cmd_archive, "install": cmd_install}[a.cmd](a)
 
 
 if __name__ == "__main__":
