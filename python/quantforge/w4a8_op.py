@@ -20,7 +20,7 @@ import torch
 from . import kfold, quant
 
 _KERNELS: dict = {}
-_BUCKETS = (96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+_BUCKETS = (32, 64, 96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
 
 
 def from_w4a8(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor):
@@ -52,6 +52,8 @@ def _int8_opts(Mp: int, K: int, N: int) -> str:
         return (f"block-tile-m={bm} block-tile-n={bn} block-tile-k=128 warp-tile-m={wm} warp-tile-n={wn} smem-stages=1 "
                 "thread-tile-k=32 smem-pad=16 accumulate=false")
 
+    if Mp <= 64 and N >= 8192 and N % 64 == 0 and Mp % 64 == 0:
+        return o(64, 64, 32, 32)                                       # 1536 x 17920 at 64 rows: 90 us (32 x 128 blocks: slower)
     if Mp <= 96 or (K >= 4 * N and Mp <= 128):
         return o(32, 128, 32, 32)
     if Mp == 128 and N < 8192:
