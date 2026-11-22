@@ -99,6 +99,10 @@ if HAVE_VLLM:
             elif S > 1:
                 _FOLD_BYTES[0] += extra
         folded = kfold.fold_k(packed, scale.half(), zero, S) if S > 1 else kfold.no_fold(packed.device)
+        if packed.shape[1] * 2 == scale.shape[1] and group > 0:      # INT4: decide the atomic split-K plans of this shape now
+            from . import atomic_plan
+
+            atomic_plan.preplan(packed.shape[0], scale.shape[1], group)
         layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = (param(t) for t in folded)
 
     def _apply(layer: torch.nn.Module, x: torch.Tensor, bias):

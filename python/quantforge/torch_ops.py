@@ -223,23 +223,27 @@ _kernels_atomic: dict = {}
 
 
 def _kernel_atomic(M: int, K: int, N: int, group_size: int):
-    """The split-K kernel with in-kernel atomic reduction for M <= 16 rows (see `atomic_plan`), or a `_NoKernel` (not hot: the C++ op takes
-    the plain path). M in {1, 2, 4, 8}: exactly M rows (`valid-rows`) when the tile allows cp.async; otherwise a 16-row kernel on a padded copy."""
+    """The split-K kernel with in-kernel atomic reduction (see `atomic_plan`), or a `_NoKernel` (not hot: the C++ op takes the plain path).
+    M <= 16: M in {1, 2, 4, 8} exactly M rows (`valid-rows`) when the tile allows cp.async, otherwise a 16-row kernel on a padded copy.
+    17 <= M <= 64: the 32- / 64-row kernel of the bucket on a padded copy."""
     from . import atomic_plan
     from .e2e import W4A16GemmAtomic
 
-    plan = atomic_plan.plan_atomic(K, N, group_size)
+    rows = 16 if M <= 16 else bucket_rows(M)
+    if rows > 64:
+        return _NoKernel(16, -1, -1)
+    plan = atomic_plan.plan_atomic(K, N, group_size, rows=rows, measure=False)   # planned when the layer was built (`atomic_plan.preplan`)
     if plan is None:
         return _NoKernel(16, -1, -1)
     S, opts = plan
-    R = M if M in (1, 2, 4, 8) and atomic_plan.cp_async_ok(opts) and not os.environ.get("QUANTFORGE_NO_VALID_ROWS") else 16
+    R = rows if rows > 16 else (M if M in (1, 2, 4, 8) and atomic_plan.cp_async_ok(opts) and not os.environ.get("QUANTFORGE_NO_VALID_ROWS") else 16)
     key = (R, K, N, group_size)
     k = _kernels_atomic.get(key)
     if k is None:
         with _lock:
             k = _kernels_atomic.get(key)
             if k is None:
-                k = W4A16GemmAtomic.build(16, K, N, group_size, S, pipeline_opts=opts, valid_rows=R if R < 16 else 0)
+                k = W4A16GemmAtomic.build(rows, K, N, group_size, S, pipeline_opts=opts, valid_rows=R if R < rows else 0)
                 k.Mp, k.Kp, k.Np = R, K, N
                 _kernels_atomic[key] = k
     return k
@@ -291,6 +295,7 @@ def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
 
 
 _warned_dense = False
+PACK_MISSES: list = []     # (M, K, N, activation) of every kernel that was neither in a pack nor compilable
 DENSE_FALLBACKS = 0        # calls served by the dense fallback (a kernel pack covers a model when this stays 0)
 
 
@@ -417,6 +422,7 @@ def _load_cpp_runtime():
             try:
                 return builder_(M, K, N, group_size, device_index, activation, overwrite, kind)
             except KernelUnavailable:      # not in a pack, no toolchain: the C++ op takes the Python fallback (the dense one)
+                PACK_MISSES.append((M, K, N, activation))      # also for the optional kernels (atomic, f16-store, fold), which then fall back silently
                 return 0, 0, 16, -1, -1
 
         def builder_(M, K, N, group_size, device_index, activation, overwrite, kind):

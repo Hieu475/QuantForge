@@ -604,3 +604,52 @@ def test_atomic_op_matches_the_plain_path(rows):
     ref = x.float() @ deq + b.float()
     assert y.shape == (rows, N) and torch.isfinite(y).all()
     assert (y.float() - ref).abs().max() < 0.05 * ref.abs().max().clamp(min=1.0)
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_atomic_split_k_kernel_skinny_tiles(rows):
+    """`W4A16GemmAtomic` with the 32- / 64-row skinny schedules: same contract as for 16 rows (added onto `out`)."""
+    _require_gpu()
+    from quantforge import atomic_plan, quant
+    from quantforge.e2e import W4A16GemmAtomic
+
+    K, N, G, S = 2048, 128, 128, 4
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.05
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    k = W4A16GemmAtomic.build(rows, K, N, G, S, pipeline_opts=atomic_plan.tile_opts(64, 16, 64, rows))
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    init = torch.randn(rows, N, device="cuda", generator=g)
+    out = init.clone()
+    k.launch(x, packed, s, z, out)
+    torch.cuda.synchronize()
+    assert torch.allclose(out, init + x.float() @ deq, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [17, 24, 32, 33, 48, 64])
+def test_atomic_op_serves_17_to_64_rows(rows):
+    """17..64 rows take the 32- / 64-row atomic split-K kernel of the bucket when the planner measures it faster (8960 x 1536 on the RTX 4050);
+    bias and the rows past the bucket's padding behave as for the plain kernel."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import atomic_plan, quant
+
+    if qt._cpp is None:
+        pytest.skip("needs the C++ runtime")
+    K, N, G = 8960, 1536, 128
+    bucket = qt.bucket_rows(rows)
+    if atomic_plan.plan_atomic(K, N, G, rows=bucket) is None:
+        pytest.skip("the planner keeps the plain kernel for this shape on this GPU")
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.02
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    b = torch.randn(N, device="cuda", dtype=torch.float16, generator=g)
+    y = torch.ops.quantforge.w4a16_gemm(x, packed, s, z, G, b, "none")
+    ref = x.float() @ deq + b.float()
+    assert y.shape == (rows, N) and torch.isfinite(y).all()
+    assert (y.float() - ref).abs().max() < 0.05 * ref.abs().max().clamp(min=1.0)

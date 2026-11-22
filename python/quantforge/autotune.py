@@ -37,6 +37,30 @@ def _flush_l2():
     _FLUSH.max()  # read, not write: a memset would leave dirty lines whose write-back slows the next kernel
 
 
+def event_time(fn, iters=20, repeats=2, flush=True) -> float:
+    """Best per-call GPU time (seconds) of ``fn`` (one kernel launch) measured with CUDA events, L2 flushed before each call. Unlike `device_time`
+    it starts no profiler session: the planners use it, and a profiler session started in the middle of a caller's work (model loading, a layer's
+    first forward) corrupts the caller's own profiler. The L2-flush kernel (~100 us) keeps the GPU busy while the launch is enqueued, so the two
+    events bracket the kernel alone."""
+    import torch
+
+    for _ in range(2):
+        fn()
+    torch.cuda.synchronize()
+    best = float("inf")
+    for _ in range(repeats):
+        for _ in range(iters):
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            if flush:
+                _flush_l2()
+            e0.record()
+            fn()
+            e1.record()
+            e1.synchronize()
+            best = min(best, e0.elapsed_time(e1) * 1e-3)
+    return best
+
+
 def device_time(fn, name_part="a16_gemm", iters=20, repeats=3, flush=True) -> float:
     """Best per-call device time (seconds) of the kernels whose name contains `name_part`."""
     import torch

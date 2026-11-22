@@ -44,8 +44,35 @@ quantforge-pack install qwen15-pack.tar.gz                                      
 quantforge-doctor                                                                                # runs a kernel from the pack against a reference
 python -c &quot;from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')&quot;
 </code></pre>
-<p>A pack of Qwen2.5-0.5B is 110 kernels / 5.9 MiB, of Qwen2.5-1.5B 104 kernels / 5.7 MiB. Measured inside vLLM with <code>QUANTFORGE_NO_JIT=1</code>, the kernel cache disabled and the pack as the only source of kernels,
-Qwen2.5-1.5B decodes at 129 / 506 / 1917 / 4757 tokens/s for 1 / 4 / 16 / 64 requests against Marlin's 141 / 553 / 2082 / 5871 (0.91 / 0.91 / 0.92 / 0.81, the same as with the compiler). The same check was run for a pack of nine models at once (Qwen2.5 0.5B / 1.5B / 3B / 7B, Llama-3.2 1B / 3B, Llama-3.1 8B, Mistral-7B-v0.3, Phi-3.5-mini: 28 distinct layer shapes, 686 kernels, 38 MiB, built in under three minutes): every row count from 1 to 130 plus samples up to 8192 runs with the JIT off and no dense fallback. Qwen2.5-3B from that pack, inside vLLM: 75 / 297 / 1134 / 2704 tokens/s at 1 / 4 / 16 / 64 requests against Marlin's 82 / 320 / 1214 / 3560 (0.91 / 0.93 / 0.93 / <strong>0.76</strong>: the 64-request regime is the weak one, see the 64-row notes below). A shape the pack does not hold is not an error:
+<p>A pack of Qwen2.5-0.5B is 110 kernels / 5.9 MiB, of Qwen2.5-1.5B 104 kernels / 5.7 MiB. Measured inside vLLM with <code>QUANTFORGE_NO_JIT=1</code>, the kernel cache and the plan cache disabled and the pack as the only source of kernels and decisions, against Marlin in the same session (tokens/s, two interleaved runs agree to 1 %):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">requests</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">QuantForge from a pack</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-1.5B GPTQ-Int4</td>
+<td style="text-align: right;">1 / 4 / 16 / 32 / 64</td>
+<td style="text-align: right;">141 / 553 / 2086 / 3680 / 5820</td>
+<td style="text-align: right;">129 / 507 / 1914 / 3356 / 4861</td>
+<td style="text-align: right;">0.92 / 0.92 / 0.92 / 0.91 / <strong>0.84</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-3B GPTQ-Int4</td>
+<td style="text-align: right;">1 / 4 / 16 / 32 / 64</td>
+<td style="text-align: right;">81 / 320 / 1210 / 2193 / 3534</td>
+<td style="text-align: right;">75 / 296 / 1130 / 1894 / 2771</td>
+<td style="text-align: right;">0.93 / 0.93 / 0.93 / 0.86 / <strong>0.78</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The weak regime is 32-64 concurrent requests, where the 32- and 64-row GEMMs are compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37); split-K with atomics (<code>atomic_plan</code>, rows 32 / 64) lifted the narrow layers there (1.5B at 64 requests 0.81 -&gt; 0.84, 3B 0.76 -&gt; 0.78), the wide GEMMs are what is left (see <code>CHANGELOG.md</code>). The same check was run for a pack of nine models at once (Qwen2.5 0.5B / 1.5B / 3B / 7B, Llama-3.2 1B / 3B, Llama-3.1 8B, Mistral-7B-v0.3, Phi-3.5-mini: 28 distinct layer shapes, 686 kernels, 38 MiB, built in about a minute once the kernels are cached): every row count from 1 to 130 plus samples up to 8192 runs with the JIT off, no dense fallback and no kernel missing (<code>pack check</code> fails on either). A shape the pack does not hold is not an error:
 the op warns once and serves it with a dense torch path (dequantise + cuBLAS: correct, several times slower), so a model never fails to load because of a missing kernel; <code>quantforge.torch_ops.DENSE_FALLBACKS</code> counts those calls.
 <code>QUANTFORGE_PACK</code> takes several directories; <code>~/.cache/quantforge/pack</code> and the package's own <code>kernel_pack</code> are always searched. Limits: the tile rules and plans were measured on one RTX 4050 (a pack built on another GPU
 carries that GPU's plans; the plans of another GPU model are not used without the compiler), the extension is tied to the torch / CUDA / Python it was built for (otherwise it is built on first use if <code>nvcc</code> exists, else the slower Python op runs).</p>

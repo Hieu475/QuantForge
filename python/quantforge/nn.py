@@ -114,6 +114,10 @@ class QuantLinear(nn.Module):
 
         kind = 8 if self.fmt == "int8" else 4 if self.fmt == "int4" else 0
         S = kfold.plan_ksplit(self.in_features, self.out_features, self.group_size, kind) if ksplit is None else ksplit
+        if kind == 4 and self.group_size > 0:
+            from . import atomic_plan
+
+            atomic_plan.preplan(self.in_features, self.out_features, self.group_size)
         if S > 1 and kind in (4, 8):
             pf, sf, zf = kfold.fold_k(self.packed, self.scale, self.zero, S)
             self.register_buffer("packed_f", pf, persistent=False)
@@ -122,9 +126,16 @@ class QuantLinear(nn.Module):
             self.ksplit = S
         return self.ksplit
 
+    _atomic_planned = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = x.dtype
         xh = x if dt == torch.float16 else x.half()
+        if not self._atomic_planned and self.fmt == "int4" and self.group_size > 0 and x.is_cuda and not torch.compiler.is_compiling():
+            self._atomic_planned = True      # the op only looks plans up (it must not start profiler sessions inside an operator call): decide them once, here
+            from . import atomic_plan
+
+            atomic_plan.preplan(self.in_features, self.out_features, self.group_size)
         if self.ksplit > 1:
             from . import kfold
 

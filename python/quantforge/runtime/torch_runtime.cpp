@@ -180,11 +180,11 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
 
   // Long-K narrow-N layers (down_proj, o_proj), 1..16 rows: K split over blocks that add their partial results atomically to a zeroed f32 buffer
   // (atomic_plan.py decides per shape; not hot = keep the plain kernel), then one kernel converts to f16 (+ bias). No weight copy, any row count.
-  if (post && bits == 4 && group_size > 0 && M <= 16 && !cpp_no_atomic()) {
+  if (post && bits == 4 && group_size > 0 && M <= 64 && !cpp_no_atomic()) {
     Kernel ka = lookup(M, K, N, group_size, x.device().index(), "atomic", true, 4);
     if (ka.hot && ka.fn) {
       at::Tensor act = (ka.Mp == M) ? x2 : padded_activations(x2, ka.Mp);
-      at::Tensor acc = at::zeros({16, N}, x.options().dtype(at::kFloat));
+      at::Tensor acc = at::zeros({std::max<int64_t>(ka.Mp, 16), N}, x.options().dtype(at::kFloat));   // 16 rows for the decode tile, else the bucket
       Desc2 a0 = describe(act), a1 = describe(pk), a2 = describe(scale), a3 = describe(zero), a4 = describe(acc), resa{};
       ka.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
       ka.fn(&resa, &a0, &a1, &a2, &a3, &a4, nullptr);

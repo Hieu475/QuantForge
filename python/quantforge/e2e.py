@@ -1032,7 +1032,7 @@ func.func @{cls.NAME}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %
 
 
 class W4A16GemmAtomic:
-    """W4A16 GEMM for a skinny M (one 16-row tile) whose K reduction is split over ``split_k`` blocks that add their partial results with
+    """W4A16 GEMM for a skinny M (one 16-row tile, or 32 / 64 rows with the skinny schedules) whose K reduction is split over ``split_k`` blocks that add their partial results with
     ``red.global.add.f32`` to the f32 output (``epilogue=atomic-add``): ONE kernel, no partial buffer, no weight copy. The caller initialises ``out``
     (zeros, or the value to accumulate onto) and converts it afterwards. Fills the GPU for the long-K, narrow-N layers (``down_proj``,
     ``o_proj``) at any 1..16 rows, which K-folding (``kfold.py``, a second copy of the weights, M * S <= 16) cannot. The order of the float
@@ -1055,8 +1055,8 @@ class W4A16GemmAtomic:
     def build(cls, M: int, K: int, N: int, group_size: int = 128, split_k: int = 2, workdir=None, chip: str = "sm_80",
               pipeline_opts: str = "", valid_rows: int = 0) -> "W4A16GemmAtomic":
         _check_shape(M, K, N, tile_sizes(pipeline_opts))
-        if M > 16 or split_k < 2 or K % (split_k * group_size):
-            raise ValueError("W4A16GemmAtomic: M <= 16, split_k >= 2 and K a multiple of split_k * group_size")
+        if M > 64 or split_k < 2 or K % (split_k * group_size):
+            raise ValueError("W4A16GemmAtomic: M <= 64, split_k >= 2 and K a multiple of split_k * group_size")
         if valid_rows:
             if not 0 < valid_rows < M:
                 raise ValueError("valid_rows must satisfy 0 < valid_rows < M")

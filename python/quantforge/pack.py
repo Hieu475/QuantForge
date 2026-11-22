@@ -57,7 +57,7 @@ def sweep_layers(shapes, group: int = 128, rows=ROWS, log=print) -> None:
     """Run each layer through the op for every row count (what the plugin does at run time)."""
     import torch
 
-    from . import kfold
+    from . import atomic_plan, kfold
     from .quant import pack_int4
 
     dev = torch.device("cuda")
@@ -72,6 +72,7 @@ def sweep_layers(shapes, group: int = 128, rows=ROWS, log=print) -> None:
         scale = (torch.rand(K // group, N, device=dev, generator=g) * 0.1 + 0.01).half()
         zero = torch.randint(0, 16, (K // group, N), device=dev, dtype=torch.int8, generator=g)
         S = kfold.plan_ksplit(K, N, group, 4)
+        atomic_plan.preplan(K, N, group)
         folded = kfold.fold_k(packed, scale, zero, S) if S > 1 else kfold.no_fold(dev)
         b = (torch.rand(N, device=dev, generator=g) - 0.5).half() if bias else None
         for M in rows:
@@ -158,6 +159,7 @@ def cmd_check(a) -> None:
     env = dict(os.environ, QUANTFORGE_NO_JIT="1", QUANTFORGE_PACK=str(Path(a.pack).resolve()))
     env.pop("QUANTFORGE_PACK_RECORD", None)
     env["QUANTFORGE_KERNEL_CACHE"] = "/nonexistent"
+    env["QUANTFORGE_TUNE_CACHE"] = "/nonexistent/tune.json"      # decisions must come from the pack, not from this machine's cache
     code = (
         "import sys, json; from quantforge import pack, torch_ops\n"
         "shapes=[]\n"
@@ -165,10 +167,11 @@ def cmd_check(a) -> None:
         f"    for tp in {a.tp!r}:\n"
         "        shapes += pack.layer_shapes(pack.load_config(m), tp)\n"
         f"pack.sweep_layers(shapes, {a.group}, rows=tuple(range(1, {a.max_rows + 1})) + pack.ROWS)\n"
-        "print('DENSE', torch_ops.DENSE_FALLBACKS)\n"
-        "sys.exit(1 if torch_ops.DENSE_FALLBACKS else 0)\n")
+        "print('DENSE', torch_ops.DENSE_FALLBACKS, 'MISSING KERNELS', len(torch_ops.PACK_MISSES))\n"
+        "for m in sorted(set(torch_ops.PACK_MISSES))[:20]: print('  missing (M, K, N, kind):', m)\n"
+        "sys.exit(1 if torch_ops.DENSE_FALLBACKS or torch_ops.PACK_MISSES else 0)\n")
     r = subprocess.run([sys.executable, "-c", code], env=env)
-    print("pack covers the model: no dense fallback" if r.returncode == 0 else "pack does NOT cover every shape (see the warning above)")
+    print("pack covers the model: every kernel is in the pack, no dense fallback" if r.returncode == 0 else "pack does NOT cover every shape (see above)")
     sys.exit(r.returncode)
 
 
