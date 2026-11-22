@@ -14,10 +14,33 @@ to a single PTX kernel that reads the **packed** weights from HBM, dequantizes
 them while staging tiles into shared memory, and feeds Tensor Cores
 (`mma.sync.m16n8k16` + `ldmatrix`), with `cp.async` + double buffering.
 
-> **Status: research prototype (v0.0.x).** W4A16 and W8A16 GEMM with per-tensor
-> **or group-wise** scale / zero point (AWQ / GPTQ checkpoints can be repacked),
-> a skinny-M **decode** schedule, an autotuner; static tile-aligned shapes in the
-> compiler, NVIDIA sm_80+. See [Limitations](#limitations).
+> **Status: alpha (v0.4).** Beyond the compiler this repository ships what is needed to *use* the kernels: a **vLLM plugin** (`quantization="quantforge"` for 4-bit GPTQ / AWQ
+> checkpoints, `quantization="quantforge_w4a8"` for INT4 weights with INT8 activations), PyTorch integration (`quantize_model`, GPTQ, `torch.ops.quantforge.*`,
+> `save_gptq` to write a standard GPTQ checkpoint), and **kernel packs**, ready-made kernels that run without LLVM or `nvcc`. NVIDIA sm_80+, Linux, measured on one
+> RTX 4050 laptop GPU only. See [Limitations](#limitations).
+
+## Quick start
+
+```bash
+pip install quantforge                      # + a CUDA build of torch, and vLLM for the plugin
+quantforge-pack install <pack.tar.gz>       # ready-made kernels (or build them, see "Kernel packs"); without a pack the first call compiles them (needs the toolchain)
+quantforge-doctor                           # GPU, toolchain, packs; runs a kernel against a reference
+python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')"
+```
+
+## Headline results
+
+Decode throughput in vLLM against its Marlin kernel on the same GPU, same model, tokens/s summed over the concurrent requests (RTX 4050 laptop, 6 GB; Qwen2.5-1.5B; two
+interleaved runs; details, other models and every negative result in the sections below and in [CHANGELOG.md](CHANGELOG.md)):
+
+| concurrent requests | 1 | 16 | 32 | 64 | 128 | 192 | 256 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.93 | 0.93 | 0.91 | 0.85 | 0.81 | 0.88 | 0.87 |
+| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.95 | 0.96 | 0.95 | 0.97 | 0.96 | **1.06** | **1.06** |
+
+Prefill is 1.1-1.15x of Marlin. The W4A8 path is not the same numerics as Marlin's W4A16 (INT8 activations; weights quantised by round-to-nearest on load, or GPTQ-quantised into a
+W4A8 checkpoint: wikitext-2 perplexity of Qwen2.5-0.5B 23.7 / 21.1 against 20.5 for GPTQ W4A16). Qwen2.5-3B reaches 0.93 / 0.87 / 0.78 / 0.76-0.82 of Marlin at 1 / 32 / 64 / 96-256 requests with W4A16;
+Llama-3.2-1B (checkpoint made with this repository) gives the same greedy text as Hugging Face.
 
 ## Performance snapshot
 
@@ -648,12 +671,14 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 
 ## Limitations
 
-* **Speed:** 0.85–1.01× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050 (decode 4096² on par, the wide decode shapes 0.93–0.97×), but only **0.67–0.87× at
-  M = 32 … 256** (see the table above). The gap is not DRAM, tile choice or dequantisation arithmetic (ablated:
-  1–3 %); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 75.8 µs at M = 64 (compiler
-  87, Marlin 59), see `PIPELINE.md` -- closing it needs tuning of a hand-written kernel, which is not done.
-  Also not done: stream-K / persistent scheduling and split-K (the decode grid can exceed the resident-block
-  count, `PIPELINE.md`).
+* **Speed:** the W4A16 kernels are on par with Marlin up to 16 rows and 1.1-1.15x faster in prefill, but 0.8-0.9x of Marlin at 32-256 concurrent rows of decode (the table
+  above was measured at the start of the work; the tile planners, 32-row buckets and split-K added later raised the end-to-end ratios, see "Headline results" and the CHANGELOG): there the GEMM is
+  compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
+  arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
+  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores) is what beats Marlin at high concurrency, at W4A8 quality.
+* Not supported: MoE layers (the experts of Mixtral / Qwen-MoE are not routed through the linear-layer hook), AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
+  runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
+  one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
 * Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row
   tiles (the torch op buckets M and picks them; `autotune` searches them).
 * W4A16, W8A16 and FP8 (E4M3) weights with f16 activations (the torch op picks the kernel from the
