@@ -48,6 +48,32 @@ jobs:
         run: PATH="$PWD/.venv/bin:$PATH" cmake --build build-ci --target check-quantforge
 
   # ---------------------------------------------------------------------------
+  # CPU only: the Python package builds (sdist + wheel), the metadata passes twine, the wheel installs into a clean environment and its command line tools and
+  # kernel-pack helpers import and run (no GPU needed for that).
+  # ---------------------------------------------------------------------------
+  python-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --outdir dist python
+          python -m twine check dist/*
+      - name: Install the wheel and run the CLIs
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheelenv/bin/python -c "import quantforge, quantforge.pack, quantforge.tile_plan, quantforge.atomic_plan; print(quantforge.__version__)"
+          /tmp/wheelenv/bin/quantforge-pack --help
+          /tmp/wheelenv/bin/quantforge-pack install --help
+
+  # ---------------------------------------------------------------------------
   # Self-hosted runner with an NVIDIA GPU (labels: self-hosted, linux, gpu),
   # CUDA toolkit in /usr/local/cuda and a Python env with torch + pytest.
   # Compiles real kernels, runs them, compares with PyTorch, runs the
