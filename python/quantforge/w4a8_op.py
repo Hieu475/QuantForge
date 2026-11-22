@@ -53,8 +53,15 @@ def _int8_opts(Mp: int, K: int, N: int) -> str:
         return (f"block-tile-m={bm} block-tile-n={bn} block-tile-k=128 warp-tile-m={wm} warp-tile-n={wn} smem-stages=1 "
                 "thread-tile-k=32 smem-pad=16 accumulate=false")
 
-    if Mp <= 64 and N >= 8192 and N % 64 == 0 and Mp % 64 == 0:
-        return o(64, 64, 32, 32)                                       # 1536 x 17920 at 64 rows: 90 us (32 x 128 blocks: slower)
+    if Mp <= 64 and K % 128 == 0 and K // (256 if K % 256 == 0 else 128) >= 4 and N % 64 == 0:     # a K loop shorter than the pipeline depth is not worth it (and not safe)
+        # 32 / 64 rows (the compact layout runs 17-64 requests on the INT8 kernel): 64-column blocks with 16 x 32 warp tiles and a 256-deep K tile; measured (us, old -> new)
+        # 8960 x 1536 93 -> 54 (32 rows), 94 -> 60 (64 rows); 1536 x 1536 16.6 -> 11.5; 1536 x 2048 18.6 -> 12.8; wide outputs 2-7 %
+        bk = 256 if K % 256 == 0 else 128
+        narrow = N <= 2048 or K >= 4 * N
+        if Mp == 32 or narrow or N % 128:
+            return (f"block-tile-m=32 block-tile-n=64 block-tile-k={bk} warp-tile-m=16 warp-tile-n=32 smem-stages=2 thread-tile-k=32 smem-pad=16 accumulate=false")
+        return (f"block-tile-m=64 block-tile-n=128 block-tile-k=128 warp-tile-m=32 warp-tile-n=32 smem-stages=1 prefetch-distance=1 thread-tile-k=32 "
+                "smem-pad=16 accumulate=false")
     if Mp <= 96 or (K >= 4 * N and Mp <= 128):
         return o(32, 128, 32, 32)
     if Mp == 128 and N < 8192:
@@ -74,13 +81,27 @@ def _kernel(Mp: int, K: int, N: int, has_bias: bool):
     return k
 
 
+def _decode_opts(K: int, N: int) -> str:
+    """Schedule of the single-layout decode kernel (`W4A8DecodeGemm`, 16 rows). The fixed `bn64 wn16 bk128 stages=3` of the first version loses 4-38 % to a
+    256-deep K tile with 8-wide warp tiles (cold weights, us, old -> new): 4096 x 4096 89.8 -> 57.5, 8960 x 1536 83.2 -> 51.8, 11008 x 2048 109.5 -> 76.7,
+    1536 x 1536 13.0 -> 10.3, 3584 x 4608 58.4 -> 51.5, 1536 x 17920 82.8 -> 80.0; 32-column blocks for the narrow outputs (N <= 1536). K must be a
+    multiple of 256 (else the old schedule)."""
+    from .e2e import W4A8_DECODE_OPTS
+
+    if K % 256 or N % 64 or K // 256 < 4:                 # (a K loop of fewer than 4 tiles is not pipelined safely: the first schedule)
+        return W4A8_DECODE_OPTS
+    bn = 32 if N <= 1536 else 64
+    return f"decode=true block-tile-n={bn} warp-tile-n=8 block-tile-k=256 smem-stages=3 accumulate=false"
+
+
 def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16):
     key = ("dec", K, N, has_bias, rows)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8DecodeGemm
 
-        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias, valid_rows=rows if rows < 16 else 0)
+        k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias, valid_rows=rows if rows < 16 else 0,
+                                                 pipeline_opts=_decode_opts(K, N))
     return k
 
 

@@ -269,7 +269,7 @@ if HAVE_VLLM:
                 parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
                 packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
-            if os.environ.get("QUANTFORGE_W4A8_DECODE", "w4a16") == "compact":
+            if os.environ.get("QUANTFORGE_W4A8_DECODE", "compact") == "compact":
                 # one copy of the nibbles: the decode reads the W4A8 layout itself (slower, a quarter of fp16's memory)
                 e = kfold.no_fold(w.device)
                 if not self.checkpoint:
