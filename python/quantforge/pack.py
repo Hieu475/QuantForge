@@ -98,10 +98,18 @@ def _pack_plans_from_cache(dest: Path, shapes, group: int) -> int:
     return len(keep)
 
 
+def cmd_record(a) -> None:
+    """Second pass of ``build`` (a fresh process): every plan is cached by now, so nothing is measured and every kernel the op asks for is recorded."""
+    os.environ["QUANTFORGE_PACK_RECORD"] = str(Path(a.out).resolve())
+    from . import torch_ops  # noqa: F401
+
+    sweep_layers([tuple(x) for x in json.loads(a.shapes)], a.group, log=lambda s: print(s, flush=True))
+
+
 def cmd_build(a) -> None:
     out = Path(a.out).resolve()
     (out / "kernels").mkdir(parents=True, exist_ok=True)
-    os.environ["QUANTFORGE_PACK_RECORD"] = str(out)
+    os.environ.pop("QUANTFORGE_PACK_RECORD", None)
     import torch
 
     from . import torch_ops  # noqa: F401 - registers the op
@@ -121,7 +129,14 @@ def cmd_build(a) -> None:
             seen.add(sh[1:])
             uniq.append(sh)
     t0 = time.time()
+    # pass 1 measures the planners' candidates (K-fold factors, atomic split-K) and caches the decisions. The kernels the planners build live on in
+    # this process, so a recording made here would miss them: pass 2 runs in a fresh process with every plan cached and records everything.
+    print("pass 1: plans", flush=True)
     sweep_layers(uniq, a.group, log=lambda s: print(s, flush=True))
+    print("pass 2: recording kernels", flush=True)
+    r = subprocess.run([sys.executable, "-m", "quantforge.pack", "_record", "--out", str(out), "--group", str(a.group), "--shapes", json.dumps(uniq)])
+    if r.returncode:
+        raise SystemExit(r.returncode)
     n = _pack_plans_from_cache(out, uniq, a.group)
     meta_p = out / "meta.json"
     meta = json.loads(meta_p.read_text()) if meta_p.exists() else {"models": []}
@@ -183,6 +198,10 @@ def main(argv=None) -> None:
     b.add_argument("--model", action="append", required=True, help="Hugging Face id, local directory or config.json (repeatable)")
     b.add_argument("--tp", type=int, nargs="+", default=[1], help="tensor-parallel sizes (default 1)")
     b.add_argument("--group", type=int, default=128)
+    rc = sub.add_parser("_record", help=argparse.SUPPRESS)
+    rc.add_argument("--out", required=True)
+    rc.add_argument("--group", type=int, default=128)
+    rc.add_argument("--shapes", required=True)
     e = sub.add_parser("ext", help="build the C++ torch runtime for this torch into the pack")
     e.add_argument("--out", required=True)
     e.add_argument("--arch", default="8.0;8.6;8.9+PTX", help="TORCH_CUDA_ARCH_LIST of the one CUDA kernel of the runtime")
@@ -193,7 +212,7 @@ def main(argv=None) -> None:
     c.add_argument("--group", type=int, default=128)
     c.add_argument("--max-rows", type=int, default=300)
     a = ap.parse_args(argv)
-    {"build": cmd_build, "check": cmd_check, "ext": cmd_ext}[a.cmd](a)
+    {"build": cmd_build, "check": cmd_check, "ext": cmd_ext, "_record": cmd_record}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,9 @@
 Kernel packs (`quantforge.pack`): a machine without the toolchain runs the kernels a pack holds, and a shape the pack lacks
 falls back to a dense torch path instead of failing.
 """
+import json
+import os
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -81,3 +84,24 @@ def test_op_serves_a_shape_that_is_not_in_any_pack_with_the_dense_fallback(tmp_p
         out = qt.w4a16_linear(act, pack_int4(q), scale, zp, G)
     assert qt.DENSE_FALLBACKS > before
     assert (out.float() - ref).abs().max().item() < 2e-2 * ref.abs().max().item() + 1e-2
+
+
+@pytest.mark.skipif(os.environ.get("QUANTFORGE_SLOW_TESTS") != "1", reason="slow test: set QUANTFORGE_SLOW_TESTS=1")
+def test_build_ext_and_check_roundtrip_on_a_tiny_model(tmp_path):
+    """`pack build` (plans in one process, kernels recorded in a fresh one), `pack ext`, then `pack check` with the JIT off: no dense fallback.
+
+    Regression: kernels the planners build while recording is paused stay in the process caches, so a single-pass recording missed them."""
+    _require_gpu()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"model_type": "llama", "hidden_size": 512, "num_attention_heads": 8, "num_key_value_heads": 4,
+                               "intermediate_size": 1536, "head_dim": 64}))
+    env = dict(os.environ, QUANTFORGE_TUNE_CACHE=str(tmp_path / "tune.json"), QUANTFORGE_KERNEL_CACHE=str(tmp_path / "kcache"))
+    run = lambda *a: subprocess.run([sys.executable, "-m", "quantforge.pack", *a], env=env, capture_output=True, text=True)  # noqa: E731
+    out = tmp_path / "pack"
+    r = run("build", "--out", str(out), "--model", str(cfg))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(list((out / "kernels").glob("*.so"))) > 20 and (out / "plans.json").exists()
+    r = run("ext", "--out", str(out))
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = run("check", str(out), "--model", str(cfg), "--max-rows", "40")
+    assert r.returncode == 0, r.stdout + r.stderr

@@ -45,13 +45,26 @@ def main() -> int:
     for tool in ("nvcc", "ptxas"):
         found = shutil.which(tool) or (os.path.join(cuda, "bin", tool) if os.path.exists(os.path.join(cuda, "bin", tool)) else None)
         _line(found is not None, tool, found or f"not on PATH and not in {cuda}/bin")
+    packs = []
+    try:
+        from .e2e import ext_tag, pack_dirs
+
+        packs = pack_dirs()
+        for d in packs:
+            n = len(list((d / "kernels").glob("*.so")))
+            ext = (d / "ext" / ext_tag() / "quantforge_rt.so").exists()
+            _line(None, "kernel pack", f"{d}: {n} kernels, C++ runtime for this torch: {'yes' if ext else 'no'}")
+    except Exception as e:  # noqa: BLE001
+        _line(None, "kernel pack", f"{type(e).__name__}: {e}")
     try:
         from .e2e import _find_quantforge_opt
 
         opt = _find_quantforge_opt()
         good &= _line(True, "quantforge-opt", opt)
     except Exception as e:  # noqa: BLE001
-        good &= _line(False, "quantforge-opt", f"{e} (build it with CMake and set QUANTFORGE_BUILD_DIR)")
+        # without the compiler the kernels must come from a pack: not a failure when one is installed
+        good &= _line(None if packs else False, "quantforge-opt",
+                      f"{e} (build it with CMake and set QUANTFORGE_BUILD_DIR" + (")" if not packs else "; kernels come from the pack)"))
         opt = None
     if opt and has_gpu:
         try:

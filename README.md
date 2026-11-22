@@ -117,7 +117,7 @@ The compiler is only needed to *make* kernels. Every kernel it produces is a ~55
 for whatever GPU it finds, so one pack serves every sm_80+ card). A **kernel pack** is a directory of those libraries for the layer shapes of a model, plus the measured plans (K-fold factors, atomic split-K) and the C++ torch runtime built for one torch / CUDA:
 
 ```bash
-# on a machine with the toolchain (once per model; seconds if the kernels are cached, a few minutes if not)
+# on a machine with the toolchain (once per set of models; `build` plans first, then records the kernels in a fresh process)
 python -m quantforge.pack build --out ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4     # any HF id / config.json; --tp 1 2 for tensor parallel
 python -m quantforge.pack ext   --out ./qwen15-pack                                                 # the C++ runtime for this torch (no nvcc needed to load it)
 python -m quantforge.pack check ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4          # every row count 1..300 and up to 8192 with JIT off: fails on any gap
@@ -127,7 +127,7 @@ QUANTFORGE_PACK=./qwen15-pack python -c "from vllm import LLM; LLM('Qwen/Qwen2.5
 ```
 
 A pack of Qwen2.5-0.5B is 110 kernels / 5.9 MiB, of Qwen2.5-1.5B 104 kernels / 5.7 MiB. Measured inside vLLM with `QUANTFORGE_NO_JIT=1`, the kernel cache disabled and the pack as the only source of kernels,
-Qwen2.5-1.5B decodes at 129 / 506 / 1917 / 4757 tokens/s for 1 / 4 / 16 / 64 requests against Marlin's 141 / 553 / 2082 / 5871 (0.91 / 0.91 / 0.92 / 0.81, the same as with the compiler). A shape the pack does not hold is not an error:
+Qwen2.5-1.5B decodes at 129 / 506 / 1917 / 4757 tokens/s for 1 / 4 / 16 / 64 requests against Marlin's 141 / 553 / 2082 / 5871 (0.91 / 0.91 / 0.92 / 0.81, the same as with the compiler). The same check was run for a pack of nine models at once (Qwen2.5 0.5B / 1.5B / 3B / 7B, Llama-3.2 1B / 3B, Llama-3.1 8B, Mistral-7B-v0.3, Phi-3.5-mini: 28 distinct layer shapes, 686 kernels, 38 MiB, built in under three minutes): every row count from 1 to 130 plus samples up to 8192 runs with the JIT off and no dense fallback. Qwen2.5-3B from that pack, inside vLLM: 75 / 297 / 1134 / 2704 tokens/s at 1 / 4 / 16 / 64 requests against Marlin's 82 / 320 / 1214 / 3560 (0.91 / 0.93 / 0.93 / **0.76**: the 64-request regime is the weak one, see the 64-row notes below). A shape the pack does not hold is not an error:
 the op warns once and serves it with a dense torch path (dequantise + cuBLAS: correct, several times slower), so a model never fails to load because of a missing kernel; `quantforge.torch_ops.DENSE_FALLBACKS` counts those calls.
 `QUANTFORGE_PACK` takes several directories; `~/.cache/quantforge/pack` and the package's own `kernel_pack` are always searched. Limits: the tile rules and plans were measured on one RTX 4050 (a pack built on another GPU
 carries that GPU's plans; the plans of another GPU model are not used without the compiler), the extension is tied to the torch / CUDA / Python it was built for (otherwise it is built on first use if `nvcc` exists, else the slower Python op runs).
