@@ -16,7 +16,7 @@
   graphs: the kernel is launched on the current stream with no synchronisation or allocation of
   its own. Compile / JIT-load happens on the first call of each shape, so **warm every shape up
   once before capturing a graph** (a module load is not allowed during capture).
-* Kernels are built per (row bucket, K, N, group size) and cached (``bucket_rows``: <= 16, 64, 128,
+* Kernels are built per (row bucket, K, N, group size) and cached (``bucket_rows``: <= 16, 32, 64, 96, 128, 160, 192, 224, 256,
   256, 384, 512, ... 4096, then multiples of 1024; the call's activations are zero-padded to the bucket);
   ``M <= 16`` uses the decode schedule, ``M <= 32`` / ``M <= 64`` 32- / 64-row tiles.
   ``set_autotune(True)`` measures the tile options once per shape (``quantforge.autotune``, cached
@@ -87,7 +87,7 @@ def clear_cache() -> None:
 # lengths 1..4096 compiles at most len(_BUCKETS) kernels per layer shape instead of one per length.
 # M <= 16 is one decode kernel; 32 and 64 are the skinny kernels (32 / 64-row block tiles); the buckets
 # above are multiples of the 64 / 128-row block tiles.
-_BUCKETS = (16, 32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+_BUCKETS = (16, 32, 64, 96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
 # Skinny schedules (17..64 rows). The 4096 x 4096 class: the best of a sweep over tiles / K tile / stages / look-ahead
 # (RTX 4050, cold weights): 32 rows 57.8 us (the old 64-row schedule: 68.6 us), 64 rows 87 us (97 us). Narrow outputs
 # (N <= 2048, the o_proj / down_proj / qkv of small models) want smaller tiles: with 64 rows, 32-row blocks with a 16 / 32 wide
@@ -119,8 +119,20 @@ def _skinny_opts(M: int, K: int, N: int) -> str:
 
 
 def _default_skinny(M: int, K: int, N: int) -> str:
-    """The rule-based schedule of a 32- / 64-row call (what `default_opts` returns when no plan exists)."""
-    return _skinny_opts(M, K, N)
+    """The rule-based schedule of a 32- .. 256-row call (what `default_opts` returns when no plan exists)."""
+    return _skinny_opts(M, K, N) if M <= 64 else _mid_opts(M, K, N)
+
+
+def _mid_opts(M: int, K: int, N: int) -> str:
+    """Schedule of a 96..256-row call (decode at 65-256 concurrent requests). The buckets are multiples of 32 so that a batch of 96 or 192 rows is not padded to
+    128 / 256 (that wasted 25-33 % of the arithmetic of a compute-bound GEMM): 64-row blocks when the count is a multiple of 64, else 32-row blocks. Measured
+    at 96 / 160 / 192 rows (cold weights): 8960 x 1536 263 -> 119 us, 4096 x 4096 150 -> 108, 1536 x 2048 54 -> 29, 1536 x 17920 244 -> 209; very wide
+    outputs (N >= 20000) keep the 128-row default tile, which wins at 128 / 224 / 256 rows there (2048 x 22016: 379 / 739 against 397 / 815 us)."""
+    if N >= 20000:
+        return _prefill_opts(M, K, N)
+    if M % 64 == 0:
+        return "block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-n=128 block-tile-k=64 smem-stages=1 prefetch-distance=1"
+    return "block-tile-m=32 warp-tile-m=16 warp-tile-n=32 block-tile-n=128 block-tile-k=64 smem-stages=1 prefetch-distance=1"
 
 
 def default_opts(M: int, K: int, N: int) -> str:
@@ -134,6 +146,10 @@ def default_opts(M: int, K: int, N: int) -> str:
         from . import tile_plan
 
         return tile_plan.lookup(M, K, N) or _skinny_opts(M, K, N)
+    if M <= 256:
+        from . import tile_plan
+
+        return tile_plan.lookup(M, K, N) or _mid_opts(M, K, N)
     return _prefill_opts(M, K, N)
 
 

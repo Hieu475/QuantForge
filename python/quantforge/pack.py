@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-ROWS = tuple(range(1, 17)) + (17, 24, 32, 33, 48, 64, 65, 96, 128, 129, 192, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
+ROWS = tuple(range(1, 17)) + (17, 24, 32, 33, 48, 64, 65, 80, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
                               2048, 2049, 3000, 4096, 8192)
 
 
@@ -114,6 +114,7 @@ def cmd_build(a) -> None:
     out = Path(a.out).resolve()
     (out / "kernels").mkdir(parents=True, exist_ok=True)
     os.environ.pop("QUANTFORGE_PACK_RECORD", None)
+    os.environ["QUANTFORGE_PLAN_MID"] = "1"          # plan the 96..256-row schedules too (they are looked up, never measured, at run time)
     import torch
 
     from . import torch_ops  # noqa: F401 - registers the op

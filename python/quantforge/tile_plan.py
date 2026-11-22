@@ -32,10 +32,24 @@ _CANDIDATES = {
     64: [(64, 32, 32), (32, 64, 32), (64, 16, 64), (32, 32, 64), (64, 64, 32)],
     32: [(32, 64, 32), (32, 16, 64), (32, 32, 64), (16, 32, 64), (16, 16, 64), (16, 32, 32)],
 }
+# 96 .. 256 rows (block-tile-m, warp-tile-m, warp-tile-n, block-tile-k); the empty options (the 128-row default tile) are a candidate too
+_MID_ROWS = (96, 128, 160, 192, 224, 256)
+_MID_BM64 = [(64, 32, 64, 64), (64, 64, 32, 32), (64, 32, 32, 32), (64, 32, 64, 32), (64, 32, 32, 64)]
+_MID_BM32 = [(32, 16, 32, 64), (32, 32, 32, 32), (32, 16, 16, 64), (32, 32, 64, 32), (32, 16, 32, 128)]
+for _r in _MID_ROWS:
+    _CANDIDATES[_r] = []          # candidates come from `_mid_candidates`
+
+
+def _mid_candidates(rows: int) -> list:
+    return (_MID_BM64 if rows % 64 == 0 else []) + _MID_BM32
 
 
 def _opts(rows: int, wm: int, wn: int, bk: int) -> str:
     return f"block-tile-m={rows} warp-tile-m={wm} warp-tile-n={wn} {_BASE} block-tile-k={bk}"
+
+
+def _opts_mid(bm: int, wm: int, wn: int, bk: int) -> str:
+    return f"block-tile-m={bm} warp-tile-m={wm} warp-tile-n={wn} {_BASE} block-tile-k={bk}"
 
 
 def _opts16(bn: int, wn: int, bk: int) -> str:
@@ -58,6 +72,10 @@ def lookup(rows: int, K: int, N: int) -> Optional[str]:
     from . import autotune as at
 
     v = at._load().get(_key(rows, K, N, _gpu()))
+    if v == "default":
+        from . import torch_ops
+
+        return torch_ops._prefill_opts(rows, K, N)
     return v or None
 
 
@@ -97,16 +115,23 @@ def plan_tile(rows: int, K: int, N: int, device: Optional[int] = None, group_siz
     if rows == 16:
         return _plan_decode(K, N, group_size, dev, key, cache, x, packed, scale, zero)
 
-    base = time_of(torch_ops._default_skinny(rows, K, N))
+    base_opts = torch_ops._default_skinny(rows, K, N)
+    base = time_of(base_opts)
     best, best_t = None, float("inf")
-    for wm, wn, bk in _CANDIDATES[rows]:
-        if K % bk or wm > rows:
+    if rows in _MID_ROWS:
+        cands = [_opts_mid(*c) for c in _mid_candidates(rows) if K % c[3] == 0]
+        cands.append(torch_ops._prefill_opts(rows, K, N))                 # the 128-row default tile
+    else:
+        cands = [_opts(rows, wm, wn, bk) for wm, wn, bk in _CANDIDATES[rows] if K % bk == 0 and wm <= rows]
+    for opts in cands:
+        if opts == base_opts:
             continue
-        opts = _opts(rows, wm, wn, bk)
         t = time_of(opts)
         if t < best_t:
             best, best_t = opts, t
     choice = best if best is not None and best_t <= MIN_GAIN * base else None
+    if choice == "":
+        choice = "default"                       # the 128-row default tile (empty options) is stored under a name
     if os.environ.get("QUANTFORGE_PLAN_VERBOSE"):
         print(f"tile plan rows={rows} K={K} N={N}: default {base*1e6:.1f} us, best {best_t*1e6:.1f} us {best if choice else '(keep default)'}", flush=True)
     cache[key] = choice or ""

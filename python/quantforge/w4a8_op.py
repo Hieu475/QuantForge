@@ -12,6 +12,7 @@ eager here (a few small kernels), the compiled fused variants of ``nn.py`` are f
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -82,6 +83,16 @@ def _quantize_tokens(x2: torch.Tensor):
     return xq, s.reshape(-1)
 
 
+def _min_int8_rows() -> int:
+    """Calls with at most this many rows use the W4A16 kernels (when the W4A16 layout is kept), more rows the INT8 tensor-core kernel.
+    The crossover is a measurement (see the CHANGELOG); `QUANTFORGE_W4A8_MIN_ROWS` overrides it."""
+    v = os.environ.get("QUANTFORGE_W4A8_MIN_ROWS")
+    return int(v) if v else _DEFAULT_MIN_INT8_ROWS
+
+
+_DEFAULT_MIN_INT8_ROWS = 64     # measured: the INT8 kernel has a floor (~170 us for 1536 x 17920 at any M <= 128), the W4A16 skinny kernels win up to 64 rows, INT8 from ~96
+
+
 def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, bias: Optional[torch.Tensor],
           packed16: torch.Tensor, scale16: torch.Tensor, zero16: torch.Tensor, packed_f: torch.Tensor, scale_f: torch.Tensor,
           zero_f: torch.Tensor, group: int, scale_nk: torch.Tensor) -> torch.Tensor:
@@ -97,7 +108,7 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
         out = torch.empty(16, N, device=x.device, dtype=torch.float16)
         _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
         return out[:M].reshape(*lead, N)
-    if M <= 16:                                                       # decode: the W4A16 kernels (memory bound, same bytes)
+    if M <= _min_int8_rows() and packed16.numel() > 0:                # decode and small batches: the W4A16 kernels (memory bound / skinny, same bytes)
         y = kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
         return y.reshape(*lead, N)
     Mp = _bucket(M)

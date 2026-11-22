@@ -224,8 +224,8 @@ def test_row_buckets_share_kernels_and_stay_correct():
     import time
     import quantforge.torch_ops as qt
 
-    assert [qt.bucket_rows(m) for m in (1, 16, 17, 32, 33, 64, 65, 128, 129, 300, 4096, 4097, 5000)] == \
-        [16, 16, 32, 32, 64, 64, 128, 128, 256, 384, 4096, 5120, 5120]
+    assert [qt.bucket_rows(m) for m in (1, 16, 17, 32, 33, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257, 300, 4096, 4097, 5000)] == \
+        [16, 16, 32, 32, 64, 64, 96, 96, 128, 128, 160, 192, 224, 256, 384, 384, 4096, 5120, 5120]
     K, N, G = 256, 192, 64
     _, packed, scale, zp, _ = _case(1, K, N, G)
     qt.clear_cache()
@@ -242,17 +242,17 @@ def test_row_buckets_share_kernels_and_stay_correct():
         assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), M
     assert len(qt._kernels) == 3
     t = time.time()
-    for M in (65, 100, 128, 129, 200, 256):                    # 128- and 256-row buckets
+    for M in (65, 100, 128, 129, 200, 256):                    # the 96-, 128-, 160-, 224- and 256-row buckets
         act, _, _, _, ref = _case(M, K, N, G)
         assert _close(qt.w4a16_linear(act, packed, scale, zp, G), ref), M
-    assert len(qt._kernels) == 5
+    assert len(qt._kernels) == 8
     # a length that falls in an already compiled bucket must not compile anything
     act = _case(250, K, N, G)[0]
     t = time.time()
     qt.w4a16_linear(act, packed, scale, zp, G)
     torch.cuda.synchronize()
     assert time.time() - t < 0.5, "an already compiled bucket must not recompile"
-    assert len(qt._kernels) == 5
+    assert len(qt._kernels) == 8
 
 
 def test_stale_padding_rows_do_not_leak_into_results():
@@ -702,3 +702,24 @@ def test_planned_decode_tile_is_used_and_correct(rows):
     y = torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, G, None, "none")
     ref = x.float() @ deq
     assert torch.isfinite(y).all() and (y.float() - ref).abs().max() < 0.02 * ref.abs().max()
+
+
+@pytest.mark.parametrize("rows", [65, 96, 97, 130, 160, 192, 200, 256])
+def test_mid_row_buckets_match_the_reference(rows):
+    """65..256 rows run in 32-row-aligned buckets (not padded to 128 / 256) with 32- or 64-row blocks; results, with a bias, match the reference."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import quant
+
+    K, N, G = 1536, 2048, 128
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.03
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    b = torch.randn(N, device="cuda", dtype=torch.float16, generator=g)
+    y = torch.ops.quantforge.w4a16_gemm(x, packed, s, z, G, b, "none")
+    ref = x.float() @ deq + b.float()
+    assert y.shape == (rows, N) and (y.float() - ref).abs().max() < 0.02 * ref.abs().max()
+    assert qt.bucket_rows(rows) % 32 == 0 and qt.bucket_rows(rows) >= rows
