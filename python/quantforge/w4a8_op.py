@@ -20,7 +20,7 @@ import torch
 from . import kfold, quant
 
 _KERNELS: dict = {}
-_BUCKETS = (128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+_BUCKETS = (96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
 
 
 def from_w4a8(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor):
@@ -39,13 +39,35 @@ def _bucket(m: int) -> int:
     return -(-m // 4096) * 4096
 
 
+def _int8_opts(Mp: int, K: int, N: int) -> str:
+    """Schedule of the INT8 kernel for Mp (96 .. 256: multiples of 32) rows. The 128 x 128 block with 64 x 64 warp tiles of the large-batch default leaves most of the GPU idle
+    or half-used below ~512 rows; measured with cold weights (us, default -> chosen): 8960 x 1536 at 128 rows 183 -> 108 (32 x 128 blocks), at 256 rows 186 -> 139
+    (64 x 64 blocks); 1536 x 17920 at 128 rows 165 -> 138, at 256 rows 266 -> 243; the rows between (96 .. 224) have no 128-row padding any more (1536 x 17920 at 192: 190)."""
+    from .e2e import W4A8_GEMM_OPTS
+
+    if Mp > 256:
+        return W4A8_GEMM_OPTS
+
+    def o(bm, bn, wm, wn):
+        return (f"block-tile-m={bm} block-tile-n={bn} block-tile-k=128 warp-tile-m={wm} warp-tile-n={wn} smem-stages=1 "
+                "thread-tile-k=32 smem-pad=16 accumulate=false")
+
+    if Mp <= 96 or (K >= 4 * N and Mp <= 128):
+        return o(32, 128, 32, 32)
+    if Mp == 128 and N < 8192:
+        return W4A8_GEMM_OPTS
+    if N % 64 == 0 and Mp % 64 == 0:
+        return o(64, 64, 32, 32)
+    return o(32, 128, 32, 32)
+
+
 def _kernel(Mp: int, K: int, N: int, has_bias: bool):
     key = (Mp, K, N, has_bias)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8GemmDq
 
-        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias)
+        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias, pipeline_opts=_int8_opts(Mp, K, N))
     return k
 
 
