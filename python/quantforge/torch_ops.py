@@ -165,6 +165,56 @@ def _kernel(M: int, K: int, N: int, group_size: int, device_index: int,
     return k
 
 
+def _tile_threads(opts: str) -> tuple:
+    """(threads per block, block-tile-k) of a decode option string."""
+    import re
+    g = lambda k, d: int(m.group(1)) if (m := re.search(rf"{k}=(\d+)", opts)) else d  # noqa: E731
+    return 32 * (g("block-tile-n", 128) // g("warp-tile-n", 16)), g("block-tile-k", 64)
+
+
+_kernels_fold: dict = {}
+
+
+def _kernel_fold(R: int, K: int, N: int, group_size: int, kind: int):
+    """The overwrite (f32 accumulator) kernel of the K-folded GEMM for exactly R <= 16 activation rows: a 16-row tile whose missing rows are
+    zero-filled by cp.async (`valid-rows`), so the caller passes the activations as they are, no padded copy. The accumulator the caller allocates
+    must have 16 rows (the kernel stores them all). Falls back to the bucket kernel (padded copy) when the shape cannot use cp.async for the
+    activation tile (the tile must split evenly over the block's threads) or R = 16."""
+    key = (R, K, N, group_size, kind)
+    k = _kernels_fold.get(key)
+    if k is not None:
+        return k
+    with _lock:
+        k = _kernels_fold.get(key)
+        if k is None:
+            base = default_opts(16, K, N)
+            opts = base
+            # cp.async needs the 16 x bk activation tile to split evenly over the block's threads: take the default schedule if it does,
+            # else 64-column blocks of 4 warps with the same K tile (9.5 us against 9.4 for the 1536 x 3 folded shape). A deeper K tile for the wide folds
+            # (10752 columns) measured 57 us against 45 with the padded copy, so those keep the padded copy
+            tail = base[base.index(" block-tile-k"):] if " block-tile-k" in base else ""
+            cands = [base, "decode=true block-tile-n=64 warp-tile-n=16" + tail]
+            for c in cands:
+                th, kb = _tile_threads(c)
+                if (16 * kb // 8) % th == 0 and K % kb == 0 and (c == base or N % 64 == 0):
+                    opts = c
+                    break
+            threads, bk = _tile_threads(opts)
+            if R < 16 and not _autotune and not os.environ.get("QUANTFORGE_NO_VALID_ROWS") and (16 * bk // 8) % threads == 0:
+                try:
+                    k = W4A16Gemm.build(16, K, N, group_size=group_size or None, pipeline_opts=f"{opts} valid-rows={R}",
+                                        bits=4 if kind == 4 else 8, fp8=kind == 9, accumulate=False)
+                    k.Mp = R
+                except Exception:  # noqa: BLE001 - not buildable with valid-rows: the padded kernel below
+                    k = None
+            if k is not None:
+                _kernels_fold[key] = k
+    if k is None:                                  # (outside the lock: `_kernel` takes it too)
+        k = _kernel(R, K, N, group_size, 0, "none", True, kind)
+        _kernels_fold[key] = k
+    return k
+
+
 class _NoKernel:
     """Stands for a shape the f16-store kernel cannot serve (K or N not a multiple of its tile, autotune on): the C++ op then uses the f32 path."""
 
@@ -271,6 +321,9 @@ def _load_cpp_runtime():
             addr = lambda f: (ctypes.cast(f, ctypes.c_void_p).value or 0) if f is not None else 0  # noqa: E731
             if activation in ("f16s", "f16sb"):               # the f16-store kernel (W4A16GemmF16)
                 k = _kernel_f16(M, K, N, group_size, activation == "f16sb")
+                return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
+            if activation == "foldvr":                        # K-folded GEMM: exact rows, no padded copy (see _kernel_fold)
+                k = _kernel_fold(M, K, N, group_size, kind)
                 return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
             k = _kernel(M, K, N, group_size, device_index, activation, overwrite, kind)
             return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np

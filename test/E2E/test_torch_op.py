@@ -514,3 +514,38 @@ def test_decode_call_reads_only_its_own_rows_and_is_one_kernel(rows, bias):
         torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, 128, b, "none")
         torch.cuda.synchronize()
     assert len([e for e in p.events() if e.device_time > 0]) == 1
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4])
+def test_kfold_call_reads_only_its_own_rows_and_is_two_kernels(rows):
+    """K-folded GEMM (1536 x 1536 folded 3 ways, M * 3 rows of a 16-row tile): cp.async zero-fills the rest of the activation tile, so the
+    activations may sit in a buffer whose neighbouring rows are NaN, and the call is the GEMM plus the reduce kernel (no padded copy)."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import kfold, quant
+    from torch.profiler import ProfilerActivity, profile
+
+    if qt._cpp is None or not getattr(qt._cpp, "HAS_KFOLD", False):
+        pytest.skip("needs the C++ runtime with the K-fold op")
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    K = N = 1536
+    S = 3
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.05
+    q, s, z = quant.quantize_groupwise(w, 128)
+    packed = quant.pack_int4(q)
+    pf, sf, zf = kfold.fold_k(packed, s, z, S)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    buf = torch.full((rows + 16, K), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:rows] = x
+    deq = (q.float() - z.float().repeat_interleave(128, 0)) * s.float().repeat_interleave(128, 0)
+    ref = x.float() @ deq
+    call = lambda: torch.ops.quantforge.w4a16_gemm_kfold(buf[:rows], packed, s, z, pf, sf, zf, 128, None)  # noqa: E731
+    y = call()
+    assert y.shape == (rows, N) and torch.isfinite(y).all() and _close(y, ref)
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        call()
+        torch.cuda.synchronize()
+    assert len([e for e in p.events() if e.device_time > 0]) == 2

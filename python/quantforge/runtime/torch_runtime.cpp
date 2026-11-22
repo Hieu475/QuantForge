@@ -260,7 +260,8 @@ at::Tensor w4a16_gemm_kfold(const at::Tensor &x, const at::Tensor &packed, const
   const int64_t N = scale.size(1), Nf = S * N, Kf = K / S;
   const int bits = (packed_f.size(1) == Nf) ? 8 : 4;
   c10::cuda::CUDAGuard guard(x.device());
-  Kernel k = lookup(M * S, Kf, Nf, group_size, x.device().index(), "none", /*overwrite=*/true, bits);
+  // "foldvr": exactly M * S rows (cp.async zero-fills the rest of the 16-row tile); the accumulator then has 16 rows (the kernel stores them all)
+  Kernel k = lookup(M * S, Kf, Nf, group_size, x.device().index(), "foldvr", /*overwrite=*/true, bits);
   at::Tensor x2 = x.reshape({M * S, Kf}).contiguous();
   std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
   shape.back() = N;
@@ -274,7 +275,7 @@ at::Tensor w4a16_gemm_kfold(const at::Tensor &x, const at::Tensor &packed, const
     return y.reshape(shape);
   }
   at::Tensor act = (k.Mp == M * S) ? x2 : padded_activations(x2, k.Mp);
-  at::Tensor acc = at::empty({k.Mp, Nf}, x.options().dtype(at::kFloat));
+  at::Tensor acc = at::empty({std::max<int64_t>(k.Mp, 16), Nf}, x.options().dtype(at::kFloat));
   Desc2 d0 = describe(act), d1 = describe(packed_f), d2 = describe(scale_f), d3 = describe(zero_f),
         d4 = describe(acc), result{};
   k.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
