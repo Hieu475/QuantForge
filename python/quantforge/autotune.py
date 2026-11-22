@@ -120,11 +120,26 @@ def _cache_path() -> Path:
     return Path(os.environ.get("QUANTFORGE_TUNE_CACHE", Path.home() / ".cache" / "quantforge" / "tune.json"))
 
 
+def _pack_plans() -> dict:
+    """Decisions (fold factors, atomic split-K plans) shipped in kernel packs (`quantforge.pack`): read-only, below the user's cache."""
+    out: dict = {}
+    from .e2e import pack_dirs
+
+    for d in reversed(pack_dirs()):
+        try:
+            out.update(json.loads((d / "plans.json").read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 def _load() -> dict:
     try:
-        return json.loads(_cache_path().read_text())
+        user = json.loads(_cache_path().read_text())
     except (OSError, ValueError):
-        return {}
+        user = {}
+    plans = _pack_plans()
+    return {**plans, **user} if plans else user
 
 
 def _store(cache: dict) -> None:

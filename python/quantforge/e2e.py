@@ -33,7 +33,9 @@ import math
 import os
 import re
 import shutil
+import contextlib
 import subprocess
+import threading
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,14 +208,107 @@ def _cache_key(ir: str, chip: str, opts: str) -> str:
     return hashlib.sha256(f"{_toolchain_fingerprint()}\0{chip}\0{opts}\0{ir}".encode()).hexdigest()[:32]
 
 
+class KernelUnavailable(RuntimeError):
+    """The kernel is not in any kernel pack and this machine has no toolchain to compile it."""
+
+
+# Kernel packs (`quantforge.pack`): directories of ready-made kernels (one self-contained `<key>.so` each, linked only
+# against libcuda), so a machine without LLVM / quantforge-opt / nvcc can run the kernels a pack was built for. The pack key
+# does not involve the toolchain: it hashes the target, the pipeline options and the IR. `QUANTFORGE_PACK` (a path list)
+# adds pack directories; `~/.cache/quantforge/pack` and the `kernel_pack` directory of the package are always searched.
+# `QUANTFORGE_PACK_RECORD=<dir>` copies every kernel the process uses into <dir> (how a pack is built).
+PACK_ABI = 1
+
+
+def pack_key(ir: str, chip: str, opts: str) -> str:
+    return hashlib.sha256(f"pack{PACK_ABI}\0{chip}\0{opts}\0{ir}".encode()).hexdigest()[:32]
+
+
+def pack_dirs() -> list[Path]:
+    dirs = [Path(d) for d in os.environ.get("QUANTFORGE_PACK", "").split(os.pathsep) if d]
+    dirs += [Path.home() / ".cache" / "quantforge" / "pack", Path(__file__).resolve().parent / "kernel_pack"]
+    return [d for d in dirs if d.is_dir()]
+
+
+def ext_tag() -> str:
+    """Identifies the torch build a prebuilt extension (pack ``ext/<tag>/quantforge_rt.so``) was linked against."""
+    import sys
+
+    import torch
+
+    abi = int(bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)))
+    return f"torch{torch.__version__.split('+')[0]}-cu{torch.version.cuda}-abi{abi}-py{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _toolchain_available() -> bool:
+    if os.environ.get("QUANTFORGE_NO_JIT"):
+        return False
+    try:
+        _find_quantforge_opt(), _find_llvm_tool("mlir-translate"), _find_llvm_tool("llc")
+    except FileNotFoundError:
+        return False
+    return shutil.which("gcc") is not None
+
+
+_record_paused = threading.local()
+
+
+@contextlib.contextmanager
+def pause_recording():
+    """Kernels built inside (the candidates a planner measures) are not copied into the pack being recorded."""
+    prev = getattr(_record_paused, "on", False)
+    _record_paused.on = True
+    try:
+        yield
+    finally:
+        _record_paused.on = prev
+
+
+def recording_paused(fn):
+    """Decorator: `fn` (a planner that builds and times candidate kernels) leaves no candidate in the pack being recorded."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with pause_recording():
+            return fn(*a, **kw)
+    return wrapper
+
+
+def _record_to_pack(key: str, compiled: "Compiled") -> None:
+    rec = os.environ.get("QUANTFORGE_PACK_RECORD")
+    if rec and not getattr(_record_paused, "on", False):
+        dst = Path(rec) / "kernels" / f"{key}.so"
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_suffix(f".tmp{os.getpid()}")
+            shutil.copy2(compiled.lib_path, tmp)
+            os.replace(tmp, dst)
+
+
 def compile_ir(
     ir: str,
     workdir: str | os.PathLike,
     chip: str = "sm_80",
     pipeline_opts: str = "",
 ) -> Compiled:
-    """Run the full pipeline on `ir` and return the shared library + PTX."""
+    """Run the full pipeline on `ir` and return the shared library + PTX (or the ready-made kernel of a pack)."""
     opts = f"chip={chip}" + (f" {pipeline_opts}" if pipeline_opts else "")
+    pkey = pack_key(ir, chip, opts)
+    for d in pack_dirs():
+        so = d / "kernels" / f"{pkey}.so"
+        if so.exists():
+            c = Compiled(so, Path(os.devnull), {}, True)
+            _record_to_pack(pkey, c)
+            return c
+    if not _toolchain_available():
+        raise KernelUnavailable(
+            f"no kernel for this shape in a kernel pack (QUANTFORGE_PACK, ~/.cache/quantforge/pack) and no toolchain to compile it "
+            f"(quantforge-opt / mlir-translate / llc / gcc not found, or QUANTFORGE_NO_JIT is set); options: {opts}")
+    compiled = _compile_ir_cached(ir, workdir, chip, opts)
+    _record_to_pack(pkey, compiled)
+    return compiled
+
+
+def _compile_ir_cached(ir: str, workdir, chip: str, opts: str) -> Compiled:
     cache_root = _kernel_cache_dir()
     entry = None
     if cache_root is not None:

@@ -31,7 +31,8 @@ from typing import Optional
 
 import torch
 
-from .e2e import W4A16Gemm
+from .e2e import KernelUnavailable, W4A16Gemm
+from .quant import unpack_int4
 
 __all__ = ["w4a16_linear", "set_autotune", "clear_cache", "bucket_rows", "CPP_RUNTIME"]
 
@@ -289,6 +290,41 @@ def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
     return k
 
 
+_warned_dense = False
+DENSE_FALLBACKS = 0        # calls served by the dense fallback (a kernel pack covers a model when this stays 0)
+
+
+def _dense_impl(x, packed, scale, zero_point, group_size, bias=None, activation="none"):
+    """Last resort when a shape has no kernel (not in a kernel pack and no toolchain to compile it): dequantize the INT4 weight
+    with torch and use cuBLAS. Correct but slow (the f16 weight is materialised on every call)."""
+    global _warned_dense, DENSE_FALLBACKS
+    DENSE_FALLBACKS += 1
+    if not _warned_dense:
+        import warnings
+        warnings.warn("quantforge: no kernel for a layer shape (not in a kernel pack, no toolchain to compile it); "
+                      "using a slow dense fallback for it. Build a pack for the model: `python -m quantforge.pack build`.")
+        _warned_dense = True
+    if weight_kind(packed, scale, group_size) != 4 or not group_size:
+        raise KernelUnavailable("the dense fallback serves group-wise INT4 weights only")
+    K = x.shape[-1]
+    q = unpack_int4(packed).to(torch.float16)
+    g = group_size
+    w = (q.view(K // g, g, -1) - zero_point.to(torch.float16).unsqueeze(1)) * scale.unsqueeze(1)
+    y = x.reshape(-1, K) @ w.reshape(K, -1)
+    if bias is not None:
+        y = y + bias.to(y.dtype)
+    if activation == "swiglu":
+        g_, u_ = y[:, 0::2].float(), y[:, 1::2].float()
+        y = (torch.nn.functional.silu(g_) * u_).to(x.dtype)
+    elif activation == "relu":
+        y = torch.relu(y)
+    elif activation == "silu":
+        y = torch.nn.functional.silu(y)
+    elif activation == "gelu":
+        y = torch.nn.functional.gelu(y, approximate="tanh")
+    return y.reshape(*x.shape[:-1], y.shape[-1])
+
+
 def _python_impl(
     x: torch.Tensor,
     packed: torch.Tensor,
@@ -313,7 +349,10 @@ def _python_impl(
     overwrite = swiglu or bias is None
     x2 = x.reshape(-1, K).contiguous()
     M = x2.shape[0]
-    kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite, kind)
+    try:
+        kern = _kernel(M, K, N, group_size, x.device.index or 0, activation, overwrite, kind)
+    except KernelUnavailable:
+        return _dense_impl(x, packed, scale, zero_point, group_size, bias, activation)
     if group_size and (kern.Kp, kern.Np) == (K, N) and x2.is_cuda and not (
             x2.data_ptr() % 16 or packed.data_ptr() % 16 or scale.data_ptr() % 16
             or zero_point.data_ptr() % 16) and packed.is_contiguous() and scale.is_contiguous() \
@@ -339,21 +378,48 @@ def _fake(x, packed, scale, zero_point, group_size, bias=None, activation="none"
     return x.new_empty(*x.shape[:-1], cols)
 
 
+def _prebuilt_ext():
+    """The C++ runtime built ahead of time for this torch (a kernel pack's ``ext/<tag>/quantforge_rt.so``), or None: no compiler needed."""
+    if os.environ.get("QUANTFORGE_NO_PREBUILT_EXT"):
+        return None
+    import importlib.util
+
+    from .e2e import ext_tag, pack_dirs
+
+    tag = ext_tag()
+    for d in pack_dirs():
+        so = d / "ext" / tag / "quantforge_rt.so"
+        if so.exists():
+            spec = importlib.util.spec_from_file_location("quantforge_rt", so)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
 def _load_cpp_runtime():
     """Compile (once, cached by torch) and load the C++ dispatcher hot path; None if unavailable."""
     if os.environ.get("QUANTFORGE_NO_CPP"):
         return None
     try:
         import ctypes
-        from torch.utils import cpp_extension
+        ext = _prebuilt_ext()
+        if ext is None:
+            from torch.utils import cpp_extension
 
-        rt = Path(__file__).resolve().parent / "runtime"
-        src = rt / "torch_runtime.cpp"
-        cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-        ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu")], with_cuda=True,
-                                 extra_include_paths=[f"{cuda}/include"], verbose=False)
+            rt = Path(__file__).resolve().parent / "runtime"
+            src = rt / "torch_runtime.cpp"
+            cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+            ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu")], with_cuda=True,
+                                     extra_include_paths=[f"{cuda}/include"], verbose=False)
 
         def builder(M, K, N, group_size, device_index, activation, overwrite, kind):
+            try:
+                return builder_(M, K, N, group_size, device_index, activation, overwrite, kind)
+            except KernelUnavailable:      # not in a pack, no toolchain: the C++ op takes the Python fallback (the dense one)
+                return 0, 0, 16, -1, -1
+
+        def builder_(M, K, N, group_size, device_index, activation, overwrite, kind):
             addr = lambda f: (ctypes.cast(f, ctypes.c_void_p).value or 0) if f is not None else 0  # noqa: E731
             if activation in ("f16s", "f16sb"):               # the f16-store kernel (W4A16GemmF16)
                 k = _kernel_f16(M, K, N, group_size, activation == "f16sb")

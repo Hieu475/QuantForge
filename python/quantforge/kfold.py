@@ -25,6 +25,8 @@ import torch
 
 from . import torch_ops  # noqa: F401  (registers quantforge::w4a16_gemm)
 
+from .e2e import recording_paused  # noqa: E402
+
 MAX_N = 2048          # wider outputs already have enough blocks (measured: no gain from N = 4096)
 MIN_GAIN = 0.85       # fold only if the folded GEMM takes <= 85 % of the plain one
 _KEY_VERSION = 2
@@ -94,6 +96,7 @@ def linear(x: torch.Tensor, packed, scale, zero, folded, group_size: int,
     return torch.ops.quantforge.w4a16_gemm_kfold(x, packed, scale, zero, *folded, group_size, bias)
 
 
+@recording_paused
 def plan_ksplit(K: int, N: int, group_size: int, kind: int = 4, device: int | None = None) -> int:
     """Best fold factor for a ``[K, N]`` weight at one row (1 = leave it alone). Measured on the real op, cached in the
     autotune cache; among the factors within 5 % of the best the smallest wins (it serves more rows: ``M * S <= 16``)."""
@@ -110,6 +113,10 @@ def plan_ksplit(K: int, N: int, group_size: int, kind: int = 4, device: int | No
     groups = K // group_size
     cands = [s for s in (2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16) if groups % s == 0 and (S := s) and s * N <= 1 << 15]
     if not cands:
+        return 1
+    from .e2e import _toolchain_available
+
+    if not _toolchain_available():     # no kernel pack decision for this shape and nothing to measure with: do not fold (not cached)
         return 1
     dev = torch.device("cuda", device)
     g = torch.Generator(device=dev).manual_seed(0)

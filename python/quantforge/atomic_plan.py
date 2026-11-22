@@ -23,6 +23,9 @@ _KEY_VERSION = 1
 _TILES = [(64, 16, 128), (128, 16, 128), (64, 16, 64), (128, 16, 64), (64, 8, 64)]   # (block-tile-n, warp-tile-n, block-tile-k)
 
 
+from .e2e import recording_paused  # noqa: E402
+
+
 def tile_opts(bn: int, wn: int, bk: int) -> str:
     return f"decode=true block-tile-n={bn} warp-tile-n={wn} block-tile-k={bk} smem-stages=1 prefetch-distance=1"
 
@@ -33,6 +36,7 @@ def cp_async_ok(opts: str) -> bool:
     return (16 * g("block-tile-k") // 8) % (32 * g("block-tile-n") // g("warp-tile-n")) == 0
 
 
+@recording_paused
 def plan_atomic(K: int, N: int, group_size: int, device: Optional[int] = None) -> Optional[tuple]:
     """``(S, opts)`` or None (keep the plain kernel). Measured with cold weights, cached."""
     if os.environ.get("QUANTFORGE_NO_ATOMIC") or not group_size or N > MAX_N or K < MIN_RATIO * N or K % group_size or N % 64:
@@ -47,6 +51,10 @@ def plan_atomic(K: int, N: int, group_size: int, device: Optional[int] = None) -
     if key in cache:
         v = cache[key]
         return None if not v else (int(v.split("|")[0]), v.split("|")[1])
+    from .e2e import _toolchain_available
+
+    if not _toolchain_available():     # nothing to measure with: keep the plain kernel, and do not cache that decision
+        return None
     groups = K // group_size
     dev = torch.device("cuda", device)
     g = torch.Generator(device=dev).manual_seed(0)
