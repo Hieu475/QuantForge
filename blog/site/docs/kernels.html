@@ -24,6 +24,7 @@
 <li><a href="#fp8-e4m3-weights">FP8 (E4M3) weights</a></li>
 <li><a href="#wave-aware-k-tile-for-wide-decode-layers-2026-11-20">Wave-aware K tile for wide decode layers (2026-11-20)</a></li>
 <li><a href="#split-k-split-ks-experimental-off-by-default">Split-K (split-k=S, experimental, off by default)</a></li>
+<li><a href="#split-k-with-an-in-kernel-reduction-epilogueatomic-add">Split-K with an in-kernel reduction (epilogue=atomic-add)</a></li>
 <li><a href="#profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050">Profile of a 7B decode step (Mistral-7B-Instruct, RTX 4050)</a></li>
 </ul>
 </div>
@@ -208,6 +209,17 @@ the S partial results. The block tiling then runs inside it. <code>mergeSplitKFo
 <p>Constraints: <code>K / S</code> must be a multiple of <code>block-tile-k</code> and of the group size. Result: correct (<code>test/Transforms/gpu_pipeline_split_k.mlir</code>, <code>test/E2E/test_split_k.py</code>)
 but 14-23 % faster only for long-K, narrow-N layers at 32 rows, and slower for most shapes at 64 rows (second kernel, <code>S x M x N</code> extra floats, a device allocation per call that
 would break CUDA-graph capture). A useful version would reduce inside the kernel (atomics / semaphore) and take the scratch as an argument; see the blog post for the numbers.</p>
+<h2 id="split-k-with-an-in-kernel-reduction-epilogueatomic-add">Split-K with an in-kernel reduction (<code>epilogue=atomic-add</code>)<a class="headerlink" href="#split-k-with-an-in-kernel-reduction-epilogueatomic-add" title="Permanent link">#</a></h2>
+<p><code>split-k=S epilogue=atomic-add</code> keeps the 3-D grid of split-K (<code>scf.forall (m, n, z)</code>, every block owns a K slice) but <code>quantforge-fuse-epilogue</code>
+turns the stores of the accumulator fragments into <code>red.global.add.f32</code> on the f32 output argument (tagged <code>quantforge.int8_out</code>, initialised by the
+caller). The partial buffer <code>P[S, M, N]</code>, its <code>gpu.alloc</code> and the reduce kernel are erased (a rank-reducing subview of <code>P</code> is read as a <code>[16, bn]</code> tile:
+the dropped <code>z</code> dimension is the slice, which all blocks share). One kernel, nothing allocated per call, so a CUDA graph can capture it. <code>valid-rows=R</code>
+guards the atomics of the missing rows. Float additions arrive in any order: results differ by an ulp from run to run.</p>
+<p><code>e2e.W4A16GemmAtomic</code> wraps it; <code>atomic_plan.plan_atomic(K, N, group)</code> picks (S, tile) by measurement (cold weights, cached in the autotune cache) and
+only keeps the atomic kernel when kernel + memset + f32 -&gt; f16 conversion (~1.5 us) take &lt;= 88 % of the plain kernel: long-K narrow layers (K / N &gt;= 2.5, N &lt;= 2048).
+RTX 4050, 16 rows, cold weights: 8960 x 1536 60 -&gt; 46 us (Marlin 41), 4864 x 896 26.7 -&gt; 24.3 us (Marlin 15.5; K-folding reaches 18.8 at &lt;= 8 rows), 1536 x 1536 and 896 x 896 no gain.
+Unlike K-folding it needs no second copy of the weights and serves every row count up to 16. The cost is the atomics themselves: the same
+4864 x 896 split in 2 takes 22.1 us with atomics against 18.3 with plain stores (K-folded).</p>
 <h2 id="profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050">Profile of a 7B decode step (Mistral-7B-Instruct, RTX 4050)<a class="headerlink" href="#profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050" title="Permanent link">#</a></h2>
 <p><code>torch.profiler</code> + the Chrome trace (kernel name, grid, duration) of one batch-1 decode step: grid 224
 = the fused gate/up GEMM (N = 28672, 32 calls), 32 = o_proj and down_proj (alternating 54 / 180 us), 48 =
