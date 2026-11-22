@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quantforge"
+name = "quantforge-llm"
 dynamic = ["version"]
 description = "MLIR-based generator of INT4 / INT8 / FP8 weight-only GEMM kernels for LLM inference, with PyTorch integration (quantize_model, GPTQ, AWQ / GPTQ checkpoint loading)"
 readme = "README.md"

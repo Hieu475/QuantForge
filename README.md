@@ -22,7 +22,7 @@ them while staging tiles into shared memory, and feeds Tensor Cores
 ## Quick start
 
 ```bash
-pip install quantforge                      # + a CUDA build of torch, and vLLM for the plugin
+pip install quantforge-llm                  # (import name `quantforge`) + a CUDA build of torch, and vLLM for the plugin
 quantforge-pack install <pack.tar.gz>       # ready-made kernels (or build them, see "Kernel packs"); without a pack the first call compiles them (needs the toolchain)
 quantforge-doctor                           # GPU, toolchain, packs; runs a kernel against a reference
 python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')"
