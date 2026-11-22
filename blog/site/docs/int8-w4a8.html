@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INT8 and W4A8 GEMM - Docs - QuantForge Notes</title>
+<meta name="description" content="Integer tensor cores: the int8-dequant epilogue and packed W4A8 dequantisation.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li class=cur><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>INT8 and W4A8 GEMM</h1><p class="lede">Integer tensor cores: the int8-dequant epilogue and packed W4A8 dequantisation.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/python/quantforge/PIPELINE.md">python/quantforge/PIPELINE.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#int8-gemm-experimental">INT8 GEMM (experimental)</a><ul>
+<li><a href="#epilogueint8-dequant">epilogue=int8-dequant</a></li>
+<li><a href="#w4a8-w4a8gemmdq-a-plain-linalggeneric-as-the-weight-producer">W4A8 (W4A8GemmDq): a plain linalg.generic as the weight producer</a></li>
+<li><a href="#packed-w4a8-dequantisation-quantforge-vectorize-dequant-pack_k8-layout">Packed W4A8 dequantisation (quantforge-vectorize-dequant, pack_k8 layout)</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</details><h2 id="int8-gemm-experimental">INT8 GEMM (experimental)<a class="headerlink" href="#int8-gemm-experimental" title="Permanent link">#</a></h2>
+<p><code>i8 x i8 -&gt; i32</code> goes through the same pipeline as the W4A16 kernels (<code>linalg.matmul_transpose_b</code>, B as <code>[N, K]</code>: <code>ldmatrix</code> cannot transpose 8-bit data). What it needed:
+<code>FoldExtSIIntoContract</code> in <code>quantforge-vectorization</code> (the vectorised matmul is <code>contract(extsi a, extsi b, acc)</code>; LLVM 18 folds only <code>extf</code>), the pipeline option <code>thread-tile-k</code> (32 selects
+<code>mma.m16n8k32</code>; 16 would give <code>m16n8k16</code>, which is no faster than f16), <code>smem-pad=16</code> (a row of an int8 tile must stay 16-byte aligned for <code>ldmatrix</code>) and i32 support in <code>quantforge-overwrite-output</code>.
+Schedule: <code>quantforge.e2e.INT8_GEMM_OPTS</code> (best of 129 exact combinations). <code>SharedMemoryPromotionPass::isTileSizedSubview</code> recognises operand tiles by shape (<code>[M-tile x K]</code>, <code>[K x N-tile]</code>); a transposed B is
+<code>[N-tile x K]</code> and used to be found only when block N happened to equal block M / warp M, otherwise the <em>warp</em> tile was promoted into a buffer shared by all warps (wrong results for 48 of 180 combinations);
+<code>[N-tile x K]</code> is accepted now, and <code>test/E2E/test_int8_gemm.py</code> covers the combinations that failed.</p>
+<h3 id="epilogueint8-dequant"><code>epilogue=int8-dequant</code><a class="headerlink" href="#epilogueint8-dequant" title="Permanent link">#</a></h3>
+<p>The program is <code>matmul_transpose_b (i8 -&gt; i32)</code> followed by a <code>linalg.generic</code> (<code>quantforge.no_tile</code>, <code>quantforge.no_vectorize</code>) computing <code>y = f16(c * sx[m] * sw[n] + bias[n])</code>; the function arguments are tagged
+<code>quantforge.int8_row_scale / int8_col_scale / int8_bias / int8_out</code>. <code>quantforge-fuse-epilogue{kind=int8-dequant}</code> (after the overwrite pass) rewrites every <code>vector&lt;2xi32&gt;</code> accumulator store of the GEMM kernel: the pair is converted
+(<code>sitofp</code>, two multiplies, bias, <code>truncf</code>) and stored to the f16 output at absolute coordinates with ONE 4-byte <code>st.global.b32</code> (inline asm; the generic lowering of a <code>vector&lt;2xf16&gt;</code> store gave two 2-byte stores). The elementwise
+kernel (every other <code>gpu.launch</code> that touches the int32 buffer), the dead subviews and the buffer's <code>gpu.alloc</code> / <code>gpu.dealloc</code> are erased: <strong>the device allocation matters</strong>, a first version left it and every call did a <code>cudaMalloc</code> of
+<code>M x N x 4</code> bytes (device time 1.1 ms, wall time 2.1 ms; ncu said the kernel was fine, the profiler's device time versus the wall time per launch said where the second millisecond was).</p>
+<h3 id="w4a8-w4a8gemmdq-a-plain-linalggeneric-as-the-weight-producer">W4A8 (<code>W4A8GemmDq</code>): a plain <code>linalg.generic</code> as the weight producer<a class="headerlink" href="#w4a8-w4a8gemmdq-a-plain-linalggeneric-as-the-weight-producer" title="Permanent link">#</a></h3>
+<p>INT4 weights with INT8 activations need no new pass: the program is a <code>linalg.generic</code> (<code>quantforge.no_tile</code>, <code>quantforge.no_vectorize</code>) that builds the int8 weight <code>Bt[n, k] = (nibble(Bp[n, k floordiv 2], k mod 2) - zp[n, k floordiv 128]) * gs[n, k floordiv 128]</code>
+(all <code>i8</code> arithmetic; the packed byte, scale and zero point are read with <code>tensor.extract</code> at <code>k divui 2</code> / <code>k divui 128</code>, <strong>not</strong> through affine maps with <code>floordiv</code>: those expand to signed floor-division sequences that <code>quantforge-simplify-index-math</code> cannot fold, so the byte loads stayed scalar <code>ld.global.u8</code> (80 per tile instead of 16 <code>ld.global.u32</code>; -7 % time)) followed by the <code>matmul_transpose_b</code> and the <code>int8-dequant</code> generic above. After bufferisation the producer is a standalone elementwise kernel writing an <code>[N x K]</code> int8 buffer, and the existing
+<code>quantforge-fuse-producer-into-loads</code> pass (it is not specific to <code>qf.dequant</code>: any store whose backward slice is pure and reads only inputs) recomputes it at the loads that stage the B tile and deletes the kernel and the buffer,
+so the 4-bit weights are the only weight traffic and the whole GEMM + dequantisation is one kernel (<code>w4a8_gemm_dq</code>, 1 launch in the profiler). The accumulation is int32 over all of K: the group scale is an <em>integer</em> and is folded
+into the int8 weight before the <code>mma</code>, the only float scale is per output channel and lives in the epilogue (QServe's progressive quantisation). <code>quantforge.quant.w4a8_quantize</code> picks (gs, zp) per group by minimum squared error among the
+pairs for which <code>(q - zp) * gs</code> stays inside int8, because the kernel's 8-bit arithmetic wraps. Cost: the dequantisation (and, per row block, its repetition) is ALU work in the main loop, 50-58 TOPS against 59-72 for the int8 kernel (ncu: 3.7x the instructions of the int8 kernel, issue-bound; the 8-bit arithmetic is still done in 16-bit registers and re-packed with <code>bfi</code>: a SWAR form on the loaded 32-bit word, as <code>quantforge-vectorize-dequant</code> does for the f16 path, is the next step and would be worth about 3 % of whole-model prefill).</p>
+<h3 id="packed-w4a8-dequantisation-quantforge-vectorize-dequant-pack_k8-layout">Packed W4A8 dequantisation (<code>quantforge-vectorize-dequant</code>, <code>pack_k8</code> layout)<a class="headerlink" href="#packed-w4a8-dequantisation-quantforge-vectorize-dequant-pack_k8-layout" title="Permanent link">#</a></h3>
+<p>The W4A8 nibbles are stored so that no byte permutation is needed to unpack them: in each block of 8 consecutive k, byte j holds element j (low nibble) and element j + 4 (high), so <code>w &amp; 0x0F0F0F0F</code> of a 32-bit word is four <em>consecutive</em> elements and
+<code>(w &gt;&gt; 4) &amp; 0x0F0F0F0F</code> the next four (<code>quant.pack_k8</code>). The producer is written so that the index arithmetic simplifies completely (<code>divui</code> / <code>remui</code> only, the group index taken from <code>(k / 16) * 16</code>, or <code>/ 8</code> for the 8-wide f16 items of the decode kernel,
+so that the (scale, zero point) loads of one work item are ONE value; a signed <code>floordiv</code> or <code>k &amp; 4</code> defeats <code>quantforge-simplify-index-math</code>). <code>quantforge-vectorize-dequant</code> then recognises the 16 scalar trees <code>(nibble - z) * s</code> of a <code>vector&lt;16xi8&gt;</code> store and emits 32-bit word arithmetic:
+<code>word * s</code> (a nibble times s &lt;= 16 is at most 240: no carry between bytes) and the zero point subtracted per byte with <code>((x | H) - (y &amp; ~H)) ^ ((x ^ ~y) &amp; H)</code>, H = 0x80808080: about 10 instructions per four elements instead of ~30, bit-identical (mod 256). The f16 decode variant
+(<code>vector&lt;8xf16&gt;</code>, <code>mulf(sitofp(nibble - z), s)</code>) uses the magic-number form of the W4A16 path (<code>1152 + q</code>, <code>sub.f16x2</code>, <code>mul.f16x2</code>). FileCheck: <code>test/Transforms/vectorize_dequant_w4a8.mlir</code>.
+A scalar-load extension of <code>quantforge-prefetch-weight-loads</code> (the scale / zero point <code>memref.load</code>s) was tried for the decode kernel and gave nothing: reverted.</p><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/07-fp8-tensor-cores.html">FP8 tensor cores on a laptop GPU: twice the speed on paper, no speed-up in a model</a></li></ul></aside><div class="pager"><a href="kernels.html">&larr; Kernels and measurements</a><a href="runtime.html">Runtime and PyTorch op &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

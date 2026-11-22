@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runtime and PyTorch op - Docs - QuantForge Notes</title>
+<meta name="description" content="Host side, compile cache, row buckets and the launches around the GEMM.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li class=cur><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Runtime and PyTorch op</h1><p class="lede">Host side, compile cache, row buckets and the launches around the GEMM.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a>, <a href="https://github.com/Hieu475/QuantForge/blob/main/python/quantforge/PIPELINE.md">python/quantforge/PIPELINE.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#as-a-pytorch-op">As a PyTorch op</a></li>
+<li><a href="#runtime-host-side">Runtime (host side)</a></li>
+<li><a href="#compile-cache-and-row-buckets">Compile cache and row buckets</a></li>
+<li><a href="#launches-around-the-gemm-torch-op">Launches around the GEMM (torch op)</a></li>
+</ul>
+</div>
+</details><h2 id="as-a-pytorch-op">As a PyTorch op<a class="headerlink" href="#as-a-pytorch-op" title="Permanent link">#</a></h2>
+<pre><code class="language-python">import quantforge.torch_ops                       # registers torch.ops.quantforge.w4a16_gemm
+y = quantforge.torch_ops.w4a16_linear(x, packed, scale, zero_point, group_size=128, bias=b)
+# x: f16 [..., K]  -&gt;  y: f16 [..., N] (f32 accumulation); also works under torch.compile
+</code></pre>
+<p>The op is a <code>torch.library.custom_op</code> (fake implementation included), is covered by <code>opcheck</code>,
+<code>torch.compile(fullgraph=True)</code> and CUDA-graph capture/replay (<code>test/E2E/test_torch_op.py</code>).
+The op is registered by a small C++ extension (<code>runtime/torch_runtime.cpp</code>, built on first import in
+about 10 s and cached by torch; <code>QUANTFORGE_NO_CPP=1</code> or a failed build falls back to the Python
+implementation) that keeps the whole call in C++ and calls back into Python only to compile a new
+shape or for the uncommon cases (K / N padding, per-tensor parameters, unaligned tensors).
+Kernels are compiled for a <em>row bucket</em> (≤ 16, 64, 128, 256, 384, 512, … 4096, then multiples of 1024; the
+activations are zero-padded to the bucket) on first use, so 24 different prompt lengths need 9 kernels, and the
+compiled libraries are kept in <code>~/.cache/quantforge/kernels</code> (key = IR + options + tool binaries + shim source;
+<code>QUANTFORGE_KERNEL_CACHE</code> relocates it, <code>QUANTFORGE_NO_KERNEL_CACHE=1</code> disables it): a restarted server
+compiles nothing (the test suite takes 4 s instead of 46 s on a warm cache). Kernels are compiled per shape and cached; <strong>warm each shape up once before
+capturing a graph</strong> (module loading is not allowed during capture). <code>set_autotune(True)</code> tunes
+the tile options per shape instead of using the default decode schedule.
+Measured 4096 × 4096, weights L2-resident (8 MB &lt; 24 MB L2): op ≈ 52–61 µs per call (eager or
+graph) against Marlin's 19–25 µs — with the L2 warm the QuantForge kernel (~43 µs) is
+latency-bound, Marlin is not. With the weights streamed from DRAM (a real model has far more weight
+than L2) the kernel is faster than Marlin (table above); the extra small kernels around it
+(output init, f16 conversion, M &lt; 16 padding) cost a few µs.</p>
+<p>The generated kernels issue 16-byte vector loads on the packed weights, scales and zero
+points: those tensors must be 16-byte aligned (cudaMalloc / PyTorch allocations are; the
+harness raises on interior views).</p>
+<p>The whole lowering is described in <a href="https://github.com/Hieu475/QuantForge/blob/main/python/quantforge/PIPELINE.md"><code>python/quantforge/PIPELINE.md</code></a>
+(stages, every option, measured effect of each optimization).</p>
+<h2 id="runtime-host-side">Runtime (host side)<a class="headerlink" href="#runtime-host-side" title="Permanent link">#</a></h2>
+<p><code>python/quantforge/runtime/mgpu_cuda_runtime.c</code> implements the <code>mgpu*</code> calls of the generated
+host code on the CUDA driver API. The PTX module is JIT-compiled once and cached by the address
+of its embedded image; <code>W4A16Gemm.run</code> hands it PyTorch's current stream (<code>mgpuSetStream</code>), the
+stream is neither created nor synchronised per call, so a call is an ordinary asynchronous op
+ordered after the caller's pending work. Per-call wall time of <code>run</code> (1 × 4096 × 4096, group-wise):
+211–272 µs before, ~45–50 µs now (kernel ~50 µs). An M &lt; 16 call only pads the activations and the
+output (the weights, scales and zero points are not copied).</p>
+<h2 id="compile-cache-and-row-buckets">Compile cache and row buckets<a class="headerlink" href="#compile-cache-and-row-buckets" title="Permanent link">#</a></h2>
+<p><code>compile_ir</code> publishes <code>libqf_kernel.so</code> + <code>lowered.mlir</code> under <code>~/.cache/quantforge/kernels/&lt;key&gt;/</code>
+(atomic rename, safe for concurrent processes); the key hashes the IR, the target and pipeline
+options, the path / size / mtime of <code>quantforge-opt</code>, <code>mlir-translate</code> and <code>llc</code>, and the source of the
+CUDA shim, so a rebuilt compiler never serves a stale kernel. A compile takes ~0.3 s for a decode kernel
+(more for large prefill tiles); a hit costs a file read. <code>torch_ops</code> additionally maps the row count of
+a call to a bucket (<code>bucket_rows</code>) so that a server sees a handful of kernels per layer shape, not one
+per prompt length; rows above the real M are zero activations and are dropped.</p>
+<h2 id="launches-around-the-gemm-torch-op">Launches around the GEMM (torch op)<a class="headerlink" href="#launches-around-the-gemm-torch-op" title="Permanent link">#</a></h2>
+<p>A call with M &lt; 16 rows used to launch: pad the activations (<code>at::constant_pad_nd</code> = allocate + fill +
+copy), the GEMM, the f32 -&gt; f16 conversion of the result (and, before the overwrite kernel, a zeroing
+of the accumulator). The C++ hot path now copies the rows into a reusable zero-initialised
+<code>[Mp, K]</code> buffer (one launch; stale rows past M are harmless because a GEMM row only reads its own
+activation row, tested with NaN / inf poison), and the kernel overwrites its output. What remains is
+three launches per Linear. Removing the other two was measured to be worth little (a fused QKV and
+gate/up already cut the number of Linears per layer from 7 to 4) and costly: no pad needs the kernel
+to read only M activation rows (cp.async with a source size of 0 for the missing rows, one kernel per
+M; reading them unpadded faults with <code>illegal address</code>), and no convert needs an f16 output memref
+with an f32 accumulator, which the tensor-level IR cannot express without a temporary.</p><div class="pager"><a href="int8-w4a8.html">&larr; INT8 and W4A8 GEMM</a><a href="vllm.html">vLLM plugin &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compiler pipeline - Docs - QuantForge Notes</title>
+<meta name="description" content="The gpu pipeline: stages, options and constraints.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li class=cur><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Compiler pipeline</h1><p class="lede">The gpu pipeline: stages, options and constraints.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/python/quantforge/PIPELINE.md">python/quantforge/PIPELINE.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#stages">Stages</a></li>
+<li><a href="#options">Options</a></li>
+<li><a href="#constraints">Constraints</a></li>
+<li><a href="#group-wise-quantization">Group-wise quantization</a></li>
+<li><a href="#testing">Testing</a></li>
+</ul>
+</div>
+</details><pre><code>quantforge-opt in.mlir --quantforge-gpu-pipeline='chip=sm_80' -o lowered.mlir
+</code></pre>
+<p>Input: tensor-level IR with <code>qf.unpack</code> / <code>qf.dequant</code> / <code>linalg.matmul</code>
+(see <code>python/quantforge/e2e.py::w4a16_gemm_ir</code>). <code>qf.dequant</code> takes per-tensor
+(rank-0) <strong>or group-wise</strong> scale / zero point (<code>tensor&lt;K/G x N&gt;</code> against a
+<code>tensor&lt;K x N&gt;</code> weight; the group extent must divide K). <code>qf.unpack</code> may be
+omitted: <code>qf.dequant</code> of an <code>i8</code> <code>[K, N]</code> tensor is the W8A16 kernel. Output: LLVM-dialect module with
+the kernel(s) embedded as <code>gpu.binary</code> (PTX) and a host function +
+<code>_mlir_ciface_&lt;name&gt;</code> wrapper calling the <code>mgpu*</code> runtime
+(<code>python/quantforge/runtime/mgpu_cuda_runtime.c</code>).</p>
+<h2 id="stages">Stages<a class="headerlink" href="#stages" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>What</th>
+<th>Passes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>tensor level</td>
+<td><code>quantforge-tiling</code> (4-level) → <code>quantforge-gpu-mapping</code> → <code>quantforge-vectorization</code> → <code>fuse-unpack-dequant</code> → <code>lower-dequant-to-arith</code> (a <code>qf.dequant</code> without unpack)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>bufferization</td>
+<td><code>quantforge-bufferize</code> (+ self-copy removal), <code>canonicalize</code>, <code>cse</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>GPU launch</td>
+<td><code>convert-linalg-to-parallel-loops</code> + <code>scf-parallel-loop-tiling</code> (dequant), <code>quantforge-forall-to-gpu</code>, <code>convert-parallel-loops-to-gpu</code>, <code>quantforge-host-alloc-to-gpu</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>threads / smem</td>
+<td><code>quantforge-thread-distribute</code>, <code>quantforge-smem-promotion</code>, <code>quantforge-fuse-producer-into-loads</code>, <code>quantforge-simplify-index-math</code> → <code>quantforge-vectorize-global-loads</code>, <code>quantforge-hoist-vector-transfers</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>device lowering</td>
+<td><code>convert-vector-to-gpu{use-nvgpu}</code>, <code>gpu-kernel-outlining</code>, <code>quantforge-workgroup-alloc-to-attribution</code>, <code>convert-nvgpu-to-nvvm</code>, <code>quantforge-lower-vector</code>, scf/memref/math → LLVM</td>
+</tr>
+<tr>
+<td>6</td>
+<td>binary</td>
+<td><code>nvvm-attach-target</code>, <code>convert-gpu-to-nvvm</code>, <code>gpu-to-llvm</code>, <code>gpu-module-to-binary{format=isa}</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="options">Options<a class="headerlink" href="#options" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>option</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>chip</code>, <code>features</code>, <code>opt-level</code>, <code>format</code></td>
+<td><code>sm_80</code>, <code>+ptx80</code>, 3, <code>isa</code></td>
+<td>NVVM target / output format (PTX is JIT-compiled forward-compatibly)</td>
+</tr>
+<tr>
+<td><code>threads</code></td>
+<td>true</td>
+<td>128 threads per block (32 lanes × 2 × 2 warps); false = 1 thread/block</td>
+</tr>
+<tr>
+<td><code>smem</code></td>
+<td>true</td>
+<td>stage A/B tiles through shared memory (cooperative copy + barriers)</td>
+</tr>
+<tr>
+<td><code>tensor-core</code></td>
+<td>true</td>
+<td><code>mma.sync.m16n8k16</code> + <code>ldmatrix</code>; falls back to FMA code if <code>threads</code>/<code>smem</code> are off</td>
+</tr>
+<tr>
+<td><code>fuse-dequant</code></td>
+<td>true</td>
+<td>recompute unpack+dequant while staging B → one kernel, packed INT4 read from HBM</td>
+</tr>
+<tr>
+<td><code>async-copy</code></td>
+<td>true</td>
+<td><code>cp.async</code> (16 B) for tiles whose source is a kernel argument (the A tile)</td>
+</tr>
+<tr>
+<td><code>vector-copy</code></td>
+<td>true</td>
+<td>16-byte work items + one <code>st.shared.v4</code> for copies that cannot use <code>cp.async</code> (the fused B tile)</td>
+</tr>
+<tr>
+<td><code>decode</code></td>
+<td>false</td>
+<td>skinny-M schedule (M ≤ 16): 16×64 block tile, 16×16 warp tile, K tile 128, 1 stage; explicitly given tile/stage options still win. M a multiple of 16, N of 64 (pad with <code>pad=True</code>)</td>
+</tr>
+<tr>
+<td><code>block-tile-m</code>, <code>block-tile-n</code></td>
+<td>128, 128</td>
+<td>C tile per thread block (multiples of the warp tile; M, N must be multiples)</td>
+</tr>
+<tr>
+<td><code>vectorize-loads</code></td>
+<td>true</td>
+<td>merge the per-element global loads of the fused dequantisation (packed bytes, group-wise scale / zero point) into 16-byte vector loads. <strong>Assumes the weight / scale / zero-point buffers are 16-byte aligned</strong> (the Python harness checks)</td>
+</tr>
+<tr>
+<td><code>accumulate</code></td>
+<td>true</td>
+<td><code>true</code>: <code>C += A @ W</code> (accumulators start from C: bias / residual by initialisation). <code>false</code>: <code>C = A @ W</code>: <code>quantforge-overwrite-output</code> zeroes the initial accumulator loads (only loads that feed <code>vector.insert</code> chains, never the loop-carried look-ahead registers), so the caller need not zero the output and no read of C happens. Tensor Core + <code>hoist-acc</code> path only</td>
+</tr>
+<tr>
+<td><code>epilogue</code></td>
+<td>none</td>
+<td><code>none</code> | <code>relu</code> | <code>silu</code> | <code>gelu</code> | <code>swiglu</code>: <code>quantforge-fuse-epilogue</code> applies the activation to the f32 accumulator fragments right before their store, <code>out = act(out_init + A @ W)</code>. silu / gelu use the PTX <code>ex2.approx.ftz.f32</code> (inline asm: <code>convert-gpu-to-nvvm</code> rejects <code>llvm.intr.exp2</code> and there is no libdevice); gelu is the tanh form written as <code>x * sigmoid(2c (x + 0.044715 x^3))</code>. f32 accumulators only. <code>swiglu</code>: gate and up weights interleaved by column (<code>quant.interleave_gate_up</code>), so the two columns of each MMA accumulator pair a thread holds are (gate_j, up_j); the store becomes <code>C[r, c/2] = silu(v0) * v1</code> into the root output memref (subview chain folded), output half as wide; implies <code>accumulate=false</code> (the pair is written where another block may still read it)</td>
+</tr>
+<tr>
+<td><code>prefetch-distance</code></td>
+<td>0</td>
+<td><code>quantforge-prefetch-weight-loads</code>: issue the weight loads (packed bytes, scale, zero point) of the K loop this many tiles ahead, carried in registers through <code>iter_args</code> (~14 regs / thread / tile). Bit-identical results. Measured (decode, group-wise): 1 → −19 % on K ≫ N (1 × 11008 × 4096: 196 → 158 µs), neutral on 4096², ≥ 2 never helps; the autotuner tries distance 1. Needs <code>vectorize-loads</code></td>
+</tr>
+<tr>
+<td><code>smem-stages</code></td>
+<td>2</td>
+<td>K-loop buffering: 2 = prefetch tile i+1 while computing tile i; 1 = copy, wait, compute. Falls back to 1 if the buffers exceed 48 KiB</td>
+</tr>
+<tr>
+<td><code>register-tile</code></td>
+<td>true</td>
+<td>Tensor Core only: unroll the warp's m16×n8 loops and keep its whole 64×64 accumulator in registers across the K loop</td>
+</tr>
+<tr>
+<td><code>hoist-acc</code></td>
+<td>true</td>
+<td>accumulator tile lives in registers across the innermost K loop</td>
+</tr>
+<tr>
+<td><code>smem-pad</code></td>
+<td>8</td>
+<td>row padding (elements) of shared tiles — removes ldmatrix bank conflicts</td>
+</tr>
+<tr>
+<td><code>block-tile-k</code></td>
+<td>32</td>
+<td>K extent of the shared tiles</td>
+</tr>
+<tr>
+<td><code>warp-tile-m</code>, <code>warp-tile-n</code></td>
+<td>64, 64</td>
+<td>C tile per warp (block is 128×128)</td>
+</tr>
+<tr>
+<td><code>sink-index</code></td>
+<td>true</td>
+<td>sink index constants into <code>gpu.launch</code> before outlining (Tensor Core path only, see below)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="constraints">Constraints<a class="headerlink" href="#constraints" title="Permanent link">#</a></h2>
+<ul>
+<li>M, N multiples of the block tile (128, or 16 / 64 with <code>decode=true</code>) and K a
+  multiple of <code>block-tile-k</code> (and of the group size) — use
+  <code>W4A16Gemm.build(..., pad=True)</code> for other shapes (exact zero padding).</li>
+<li>Accumulator may be f32 (default, exact vs. reference) or f16.</li>
+<li>The scalar FMA path (<code>tensor-core=false</code>) is correct but slow, and
+  <code>gpu-launch-sink-index-computations</code> is deliberately not applied to it: with
+  the sunk constants LLVM 18's NVPTX backend miscompiles the vectorised f16
+  shared-memory loads that feed <code>fpext</code> (wrong results for <code>opt-level</code> ≥ 1,
+  correct at 0; <code>compute-sanitizer</code> reports no race/memory error).</li>
+<li><code>quantforge-swizzle-load</code> is <strong>not</strong> in the pipeline: it only rewrites 2-D
+  <code>memref.load/store</code>, while the compute stage reads shared memory through
+  <code>ldmatrix</code> / <code>vector.transfer_read</code>. Mixing would corrupt data, so the pass now
+  skips such buffers with a warning; padding (<code>smem-pad</code>) removes the same bank
+  conflicts without changing addressing.</li>
+</ul>
+<h2 id="group-wise-quantization">Group-wise quantization<a class="headerlink" href="#group-wise-quantization" title="Permanent link">#</a></h2>
+<p><code>qf.dequant %w, %scale, %zp</code> with <code>scale</code>, <code>zp : tensor&lt;(K/G) x N&gt;</code>: element <code>[k, n]</code>
+uses parameter <code>[k / G, n]</code>. The fused kernel recomputes the dequantisation while
+staging the B tile, so the scale / zero point of a thread's 8 columns are one
+16-byte + one 8-byte load per work item (<code>vectorize-loads</code>). Cost relative to
+per-tensor parameters at 4096³: ~12 % (2048³: ~10 %), decode ~15–20 %.
+Checkpoints in AWQ / GPTQ layout are repacked by <code>quantforge.quant.from_awq</code> /
+<code>from_gptq</code>; act-order (<code>desc_act</code>) GPTQ goes through <code>quant.from_gptq_act_order</code>, which permutes the rows offline and returns the activation permutation (<code>perm=</code> in the torch op).</p>
+<h2 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">#</a></h2>
+<pre><code>lit test/Transforms                       # QUANTFORGE_BUILD_DIR=&lt;build&gt;, FILECHECK=FileCheck-18
+python test/E2E/test_w4a16_e2e.py         # runs on the GPU, compares with PyTorch
+python python/quantforge/benchmark.py 2048
+</code></pre><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/01-overview.html">QuantForge: generating INT4 / INT8 / FP8 GEMM kernels with MLIR</a></li></ul></aside><div class="pager"><a href="quantisation.html">&larr; Quantisation formats</a><a href="kernels.html">Kernels and measurements &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -106,3 +106,19 @@ details.tv { margin: 8px 4px 0; font-size: 0.85rem; color: var(--text-2); }
 details.tv summary { cursor: pointer; }
 details.tv table { font-size: 0.85rem; }
 @media (max-width: 560px) { body { font-size: 16px; } h1 { font-size: 1.7rem; } }
+
+/* docs: sidebar + article */
+main.wrap:has(.docs) { max-width: 1080px; }
+.docs { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 36px; align-items: start; }
+.docs .side { position: sticky; top: 16px; font-size: 0.93rem; }
+.docs .side summary { font-weight: 600; cursor: pointer; margin-bottom: 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.8rem; }
+.docs .side ul { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--line); }
+.docs .side li a { display: block; padding: 5px 12px; color: var(--text-2); text-decoration: none; margin-left: -1px; border-left: 2px solid transparent; }
+.docs .side li a:hover { color: var(--text); }
+.docs .side li.cur a { color: var(--text); font-weight: 600; border-left-color: var(--s1); }
+.docs article { min-width: 0; }
+.docs pre, .docs table { max-width: 100%; overflow-x: auto; display: block; }
+.related { margin-top: 2.4em; border-top: 1px solid var(--line); }
+.related h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 2.4em; padding-top: 16px; border-top: 1px solid var(--line); }
+@media (max-width: 800px) { .docs { grid-template-columns: 1fr; gap: 8px; } .docs .side { position: static; } }

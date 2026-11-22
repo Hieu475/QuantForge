@@ -28,9 +28,9 @@ def _fmt(v, decimals):
 
 UI = {
     "en": {"posts": "Posts", "about": "About", "contents": "Contents", "table": "Table view", "marlin": "Marlin = 1.0",
-           "other": "Tiếng Việt", "lang": "en"},
+           "other": "Tiếng Việt", "lang": "en", "docs": "Docs", "related": "Related posts", "prev": "Previous", "next": "Next", "source": "From", "pages": "Documentation"},
     "vi": {"posts": "Bài viết", "about": "Giới thiệu", "contents": "Mục lục", "table": "Xem dạng bảng", "marlin": "Marlin = 1.0",
-           "other": "English", "lang": "vi"},
+           "other": "English", "lang": "vi", "docs": "Tài liệu (EN)", "related": "Bài blog liên quan", "prev": "Trước", "next": "Tiếp", "source": "Từ", "pages": "Tài liệu"},
 }
 LANG = "en"
 
@@ -190,7 +190,7 @@ LAYOUT = """<!doctype html>
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href="{root}index.html">{site_title}</a>
-  <nav><a href="{home}">{t_posts}</a><a href="{about}">{t_about}</a>{gh}<a class="langsw" href="{other_href}" hreflang="{other_lang}">{other}</a></nav>
+  <nav><a href="{home}">{t_posts}</a><a href="{docs}">{t_docs}</a><a href="{about}">{t_about}</a>{gh}<a class="langsw" href="{other_href}" hreflang="{other_lang}">{other}</a></nav>
 </div></header>
 <main class="wrap">
 {content}
@@ -201,7 +201,7 @@ LAYOUT = """<!doctype html>
 """
 
 
-def page(title, description, content, root="", rel="index.html"):
+def page(title, description, content, root="", rel="index.html", other_href=None):
     """root: relative path from this page to the site root; rel: this page's path inside its language folder."""
     ui = UI[LANG]
     prefix = "" if LANG == "en" else "vi/"
@@ -212,8 +212,8 @@ def page(title, description, content, root="", rel="index.html"):
     S = SITE[LANG]
     return LAYOUT.format(title=html.escape(title), description=html.escape(description), content=content, root=root, lang=ui["lang"],
                          site_title=html.escape(S["title"]), assets=to_site_root, gh=gh, footer=S["footer"], home=f"{root}index.html", about=f"{root}about.html",
-                         t_posts=ui["posts"], t_about=ui["about"], other=ui["other"], other_lang=("vi" if LANG == "en" else "en"),
-                         other_href=f"{to_site_root}{other_prefix}{rel}")
+                         t_posts=ui["posts"], t_about=ui["about"], docs=f"{to_site_root}docs/index.html", t_docs=ui["docs"], other=ui["other"], other_lang=("vi" if LANG == "en" else "en"),
+                         other_href=other_href or f"{to_site_root}{other_prefix}{rel}")
 
 
 def build_language(lang, out_dir, content_dir, root_to_site):
@@ -248,6 +248,129 @@ def build_language(lang, out_dir, content_dir, root_to_site):
     return len(posts)
 
 
+# --------------------------------------------------------------------------- docs (assembled from README / PIPELINE.md / CHANGELOG)
+REPO = ROOT.parent
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+
+def _headings(lines):
+    """[(index, level, title)] of the Markdown headings outside fenced code blocks."""
+    out, fence = [], False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+        elif not fence and (m := HEADING.match(line)):
+            out.append((i, len(m.group(1)), m.group(2)))
+    return out
+
+
+def extract(item):
+    """One section of a source file: the heading, its body and (unless item['own']) its sub-sections.
+    Headings are shifted so the section title becomes an h2. Relative links point at the file on GitHub."""
+    src = REPO / item["src"]
+    lines = src.read_text().splitlines()
+    hs = _headings(lines)
+    hit = [h for h in hs if h[2].startswith(item["heading"])]
+    if len(hit) != 1:
+        raise SystemExit(f"docs: heading {item['heading']!r} in {item['src']} matches {len(hit)} sections")
+    start, level, _ = hit[0]
+    end = len(lines)
+    for i, lv, _ in hs:
+        if i > start and (item.get("own") or lv <= level):
+            end = i
+            break
+    shift = 2 - level
+    body, fence = [], False
+    for line in lines[start:end]:
+        if line.lstrip().startswith("```"):
+            fence = not fence
+        elif not fence and (m := HEADING.match(line)):
+            line = "#" * max(1, min(6, len(m.group(1)) + shift)) + " " + m.group(2)
+        body.append(line)
+    if item.get("drop_heading"):
+        body = body[1:]
+    text = "\n".join(body)
+    base = Path(item["src"]).parent
+
+    def fix(m):
+        url = m.group(2)
+        if re.match(r"(https?:|mailto:|#)", url):
+            return m.group(0)
+        path = (base / url.split("#")[0]).as_posix()
+        path = re.sub(r"(^|/)\./", r"\1", path)
+        return f"{m.group(1)}({DOCS['repo_blob']}{path})"
+    text = re.sub(r"(\[[^\]]*\])\(([^)\s]+)\)", fix, text)
+    return text, item["src"]
+
+
+DOCS = json.loads((ROOT / "docs.json").read_text())
+
+
+def build_docs(post_titles):
+    """site/docs/*.html: a sidebar, the sections of each page, links back to the blog posts that explain the why."""
+    global LANG
+    LANG = "en"
+    out = OUT / "docs"
+    out.mkdir(parents=True, exist_ok=True)
+    pages = DOCS["pages"]
+    rendered, anchors = {}, {}
+    for pg in pages:
+        parts, sources = [], []
+        for item in pg["items"]:
+            text, src = extract(item)
+            parts.append(text)
+            if src not in sources:
+                sources.append(src)
+        html_, toc = render("\n\n".join(parts))
+        rendered[pg["slug"]] = (html_, toc, sources)
+        for anchor in re.findall(r'<h[23] id="([^"]+)"', html_):
+            anchors.setdefault(anchor, pg["slug"])
+
+    def relink(html_, slug):
+        def sub(m):
+            a = m.group(1)
+            if f'id="{a}"' in html_:
+                return m.group(0)
+            if a in anchors:
+                return f'href="{anchors[a]}.html#{a}"'
+            return f'href="{DOCS["repo_blob"]}README.md#{a}"'
+        return re.sub(r'href="#([^"]+)"', sub, html_)
+
+    def sidebar(current):
+        lis = "".join(f'<li{" class=cur" if p["slug"] == current else ""}><a href="{p["slug"]}.html">{html.escape(p["title"])}</a></li>'
+                      for p in pages)
+        return f'<nav class="side"><details><summary>{UI["en"]["pages"]}</summary><ul>{lis}</ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav>'
+
+    def related(pg):
+        links = "".join(f'<li><a href="../posts/{s}.html">{html.escape(post_titles[s])}</a></li>' for s in pg["posts"])
+        return f'<aside class="related"><h2>{UI["en"]["related"]}</h2><ul>{links}</ul></aside>' if links else ""
+
+    intro, _ = render(extract(DOCS["intro"])[0])
+    intro = relink(intro, "")
+    cards = "".join(f'<li><a href="{p["slug"]}.html"><span class="pt">{html.escape(p["title"])}</span></a><p>{html.escape(p["summary"])}</p></li>'
+                    for p in pages)
+    body = (f'<div class="docs">{sidebar("")}<article class="post"><h1>QuantForge docs</h1>{intro}'
+            f'<p class="lede">The reference material of the repository, assembled from <code>README.md</code>, '
+            f'<code>python/quantforge/PIPELINE.md</code> and <code>CHANGELOG.md</code> every time the site is built. '
+            f'The docs are in English; the blog is also in Vietnamese.</p><ol class="posts">{cards}</ol></article></div>')
+    S = SITE["en"]
+    other = "../vi/index.html"
+    (out / "index.html").write_text(page("Docs - " + S["title"], "QuantForge documentation", body, "../", "docs/index.html", other_href=other))
+    for n, pg in enumerate(pages):
+        html_, toc, sources = rendered[pg["slug"]]
+        prev = f'<a href="{pages[n - 1]["slug"]}.html">&larr; {html.escape(pages[n - 1]["title"])}</a>' if n else "<span></span>"
+        nxt = f'<a href="{pages[n + 1]["slug"]}.html">{html.escape(pages[n + 1]["title"])} &rarr;</a>' if n + 1 < len(pages) else "<span></span>"
+        src = ", ".join(f'<a href="{DOCS["repo_blob"]}{s}">{html.escape(s)}</a>' for s in sources)
+        article = (f'<article class="post"><h1>{html.escape(pg["title"])}</h1><p class="lede">{html.escape(pg["summary"])}</p>'
+                   f'<p class="meta">{UI["en"]["source"]} {src}</p>'
+                   f'<details class="toc"><summary>{UI["en"]["contents"]}</summary>{toc}</details>{relink(html_, pg["slug"])}'
+                   f'{related(pg)}<div class="pager">{prev}{nxt}</div></article>')
+        (out / f'{pg["slug"]}.html').write_text(
+            page(pg["title"] + " - Docs - " + S["title"], pg["summary"], f'<div class="docs">{sidebar(pg["slug"])}{article}</div>',
+                 "../", f'docs/{pg["slug"]}.html', other_href=other))
+    return len(pages)
+
+
 def main():
     if OUT.exists():
         shutil.rmtree(OUT)
@@ -255,8 +378,10 @@ def main():
     shutil.copytree(ROOT / "assets", OUT / "assets")
     n_en = build_language("en", OUT, ROOT / "content", "")
     n_vi = build_language("vi", OUT / "vi", ROOT / "content" / "vi", "../")
+    post_titles = {p.stem: parse(p)[0]["title"] for p in (ROOT / "content").glob("*.md") if p.stem != "about"}
+    n_docs = build_docs(post_titles)
     (OUT / ".nojekyll").write_text("")
-    print(f"built {n_en} English + {n_vi} Vietnamese posts -> {OUT}")
+    print(f"built {n_en} English + {n_vi} Vietnamese posts + {n_docs} docs pages -> {OUT}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Results - Docs - QuantForge Notes</title>
+<meta name="description" content="The measured numbers: GPU, date and method are in each table.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li class=cur><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Results</h1><p class="lede">The measured numbers: GPU, date and method are in each table.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#performance-snapshot">Performance snapshot</a><ul>
+<li><a href="#against-other-kernels-gemlite-bitsandbytes">Against other kernels (gemlite, bitsandbytes)</a></li>
+<li><a href="#end-to-end-against-vllm">End to end against vLLM</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</details><h2 id="performance-snapshot">Performance snapshot<a class="headerlink" href="#performance-snapshot" title="Permanent link">#</a></h2>
+<p>RTX 4050 Laptop (sm_89, 20 SMs, ~192 GB/s), f32 accumulate, group size 128 for the
+Marlin comparison. Reproduce with <code>benchmarks/compare_marlin.py</code> and
+<code>python/quantforge/benchmark.py</code>.</p>
+<p><strong>vs. Marlin</strong> (vLLM 0.25.1's hand-written W4A16 kernel; same INT4 weights and scales;
+device kernel time from the CUPTI trace, L2 flushed before every call so the weights
+come from DRAM; kernels timed in interleaved rounds after a GPU warm-up (laptop clocks drift ±30 % otherwise); QuantForge autotuned per shape;
+<a href="https://github.com/Hieu475/QuantForge/blob/main/benchmarks/marlin_rtx4050_sm89.json"><code>benchmarks/marlin_rtx4050_sm89.json</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>M × K × N</th>
+<th style="text-align: right;">Marlin (µs)</th>
+<th style="text-align: right;">QuantForge (µs)</th>
+<th style="text-align: right;">cuBLAS fp16 (µs, 4× the weight bytes)</th>
+<th style="text-align: right;">QuantForge / Marlin speed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 × 4096 × 4096</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">180.9</td>
+<td style="text-align: right;">0.99×</td>
+</tr>
+<tr>
+<td>4 × 4096 × 4096</td>
+<td style="text-align: right;">49.4</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">181.5</td>
+<td style="text-align: right;">0.99×</td>
+</tr>
+<tr>
+<td>16 × 4096 × 4096</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;">182.3</td>
+<td style="text-align: right;">1.01×</td>
+</tr>
+<tr>
+<td>1 × 4096 × 11008</td>
+<td style="text-align: right;">126.8</td>
+<td style="text-align: right;">135.7</td>
+<td style="text-align: right;">482.4</td>
+<td style="text-align: right;">0.93×</td>
+</tr>
+<tr>
+<td>1 × 11008 × 4096</td>
+<td style="text-align: right;">127.2</td>
+<td style="text-align: right;">131.1</td>
+<td style="text-align: right;">484.0</td>
+<td style="text-align: right;">0.97×</td>
+</tr>
+<tr>
+<td>16 × 4096 × 11008</td>
+<td style="text-align: right;">127.7</td>
+<td style="text-align: right;">135.5</td>
+<td style="text-align: right;">499.9</td>
+<td style="text-align: right;">0.94×</td>
+</tr>
+<tr>
+<td>32 × 4096 × 4096</td>
+<td style="text-align: right;">50.9</td>
+<td style="text-align: right;">58.8</td>
+<td style="text-align: right;">181.0</td>
+<td style="text-align: right;">0.87×</td>
+</tr>
+<tr>
+<td>32 × 4096 × 11008</td>
+<td style="text-align: right;">130.3</td>
+<td style="text-align: right;">149.3</td>
+<td style="text-align: right;">497.3</td>
+<td style="text-align: right;">0.87×</td>
+</tr>
+<tr>
+<td>64 × 4096 × 4096</td>
+<td style="text-align: right;">58.3</td>
+<td style="text-align: right;">87.4</td>
+<td style="text-align: right;">181.4</td>
+<td style="text-align: right;">0.67×</td>
+</tr>
+<tr>
+<td>64 × 4096 × 11008</td>
+<td style="text-align: right;">139.9</td>
+<td style="text-align: right;">200.0</td>
+<td style="text-align: right;">506.9</td>
+<td style="text-align: right;">0.70×</td>
+</tr>
+<tr>
+<td>128 × 4096 × 4096</td>
+<td style="text-align: right;">105.1</td>
+<td style="text-align: right;">152.2</td>
+<td style="text-align: right;">188.7</td>
+<td style="text-align: right;">0.69×</td>
+</tr>
+<tr>
+<td>256 × 4096 × 4096</td>
+<td style="text-align: right;">201.0</td>
+<td style="text-align: right;">263.0</td>
+<td style="text-align: right;">208.2</td>
+<td style="text-align: right;">0.76×</td>
+</tr>
+<tr>
+<td>512 × 4096 × 4096</td>
+<td style="text-align: right;">391.5</td>
+<td style="text-align: right;">461.6</td>
+<td style="text-align: right;">373.4</td>
+<td style="text-align: right;">0.85×</td>
+</tr>
+<tr>
+<td>2048 × 4096 × 4096</td>
+<td style="text-align: right;">1532.1</td>
+<td style="text-align: right;">1775.8</td>
+<td style="text-align: right;">1453.0</td>
+<td style="text-align: right;">0.86×</td>
+</tr>
+</tbody>
+</table>
+<h3 id="against-other-kernels-gemlite-bitsandbytes">Against other kernels (gemlite, bitsandbytes)<a class="headerlink" href="#against-other-kernels-gemlite-bitsandbytes" title="Permanent link">#</a></h3>
+<p>Same method as above (<code>benchmarks/compare_baselines.py</code>, <a href="https://github.com/Hieu475/QuantForge/blob/main/benchmarks/compare_baselines_rtx4050_sm89.json"><code>benchmarks/compare_baselines_rtx4050_sm89.json</code></a>),
+kernel time in µs, the fastest of the three INT4 kernels in bold. gemlite is a Triton W4A16 kernel (0.6.0, its own autotuner,
+same INT4 weights and scales); bitsandbytes uses its NF4 code book on the same fp16 matrix (a different quantiser, listed for speed
+only); cuBLAS reads the pre-dequantised fp16 weights (4× the bytes).</p>
+<table>
+<thead>
+<tr>
+<th>M × K × N</th>
+<th style="text-align: right;">QuantForge</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">gemlite (Triton)</th>
+<th style="text-align: right;">bitsandbytes NF4</th>
+<th style="text-align: right;">cuBLAS fp16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 × 4096 × 4096</td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">49.3</td>
+<td style="text-align: right;"><strong>49.3</strong></td>
+<td style="text-align: right;">55.9</td>
+<td style="text-align: right;">180.8</td>
+</tr>
+<tr>
+<td>4 × 4096 × 4096</td>
+<td style="text-align: right;">49.8</td>
+<td style="text-align: right;"><strong>49.3</strong></td>
+<td style="text-align: right;">100.0</td>
+<td style="text-align: right;">155.1</td>
+<td style="text-align: right;">181.7</td>
+</tr>
+<tr>
+<td>16 × 4096 × 4096</td>
+<td style="text-align: right;"><strong>49.8</strong></td>
+<td style="text-align: right;">50.0</td>
+<td style="text-align: right;">61.4</td>
+<td style="text-align: right;">156.8</td>
+<td style="text-align: right;">182.6</td>
+</tr>
+<tr>
+<td>32 × 4096 × 4096</td>
+<td style="text-align: right;">58.8</td>
+<td style="text-align: right;"><strong>50.9</strong></td>
+<td style="text-align: right;">71.0</td>
+<td style="text-align: right;">160.0</td>
+<td style="text-align: right;">180.9</td>
+</tr>
+<tr>
+<td>64 × 4096 × 4096</td>
+<td style="text-align: right;">87.4</td>
+<td style="text-align: right;"><strong>57.8</strong></td>
+<td style="text-align: right;">89.8</td>
+<td style="text-align: right;">194.3</td>
+<td style="text-align: right;">181.5</td>
+</tr>
+<tr>
+<td>128 × 4096 × 4096</td>
+<td style="text-align: right;">152.2</td>
+<td style="text-align: right;"><strong>104.4</strong></td>
+<td style="text-align: right;">159.2</td>
+<td style="text-align: right;">241.0</td>
+<td style="text-align: right;">188.3</td>
+</tr>
+<tr>
+<td>256 × 4096 × 4096</td>
+<td style="text-align: right;">263.0</td>
+<td style="text-align: right;"><strong>199.6</strong></td>
+<td style="text-align: right;">300.3</td>
+<td style="text-align: right;">457.6</td>
+<td style="text-align: right;">207.6</td>
+</tr>
+<tr>
+<td>512 × 4096 × 4096</td>
+<td style="text-align: right;">461.6</td>
+<td style="text-align: right;"><strong>388.9</strong></td>
+<td style="text-align: right;">529.9</td>
+<td style="text-align: right;">600.9</td>
+<td style="text-align: right;">371.1</td>
+</tr>
+<tr>
+<td>2048 × 4096 × 4096</td>
+<td style="text-align: right;">1775.8</td>
+<td style="text-align: right;"><strong>1527.5</strong></td>
+<td style="text-align: right;">2002.7</td>
+<td style="text-align: right;">1711.1</td>
+<td style="text-align: right;">1457.4</td>
+</tr>
+<tr>
+<td>1 × 4096 × 11008</td>
+<td style="text-align: right;">135.7</td>
+<td style="text-align: right;"><strong>126.8</strong></td>
+<td style="text-align: right;">129.3</td>
+<td style="text-align: right;">139.6</td>
+<td style="text-align: right;">482.4</td>
+</tr>
+<tr>
+<td>1 × 11008 × 4096</td>
+<td style="text-align: right;">131.1</td>
+<td style="text-align: right;"><strong>127.1</strong></td>
+<td style="text-align: right;">129.2</td>
+<td style="text-align: right;">146.4</td>
+<td style="text-align: right;">484.2</td>
+</tr>
+</tbody>
+</table>
+<p>QuantForge is on par with gemlite at M = 1 (49.9 / 49.3 µs), ahead of it for M = 4 … 2048 (gemlite needs 100 µs at M = 4 and
+61 µs at M = 16 where QuantForge needs 50), and 5 % behind it on the wide decode shape 1 × 4096 × 11008 (135.7 against 129.4 µs, after the wave-aware K tile described in <code>PIPELINE.md</code>; it was 149.5 µs before). Marlin is
+the fastest kernel from M = 32 up. The Triton kernel's strength is its autotuned decode path; its prefill kernel is ~15 % slower than
+QuantForge's.</p>
+<h3 id="end-to-end-against-vllm">End to end against vLLM<a class="headerlink" href="#end-to-end-against-vllm" title="Permanent link">#</a></h3>
+<p>vLLM 0.25.1 (offline engine, CUDA graphs, one request, 256 new tokens, best of 3; <code>benchmarks/vllm_e2e.py</code>) on Qwen2.5-0.5B-Instruct:
+fp16 <strong>165 tokens/s</strong>, the official GPTQ-Int4 checkpoint with Marlin kernels <strong>310 tokens/s</strong> (1.88× faster). QuantForge inside a plain
+Hugging Face model with a static cache and a CUDA graph: fp16 129, INT4 (+ INT8 head) 209 tokens/s (1.62×), 226 with
+<code>torch.compile</code> (1.75×). In absolute terms vLLM is faster, because its model implementation is fully fused (norms, rotary, residuals,
+sampling) while the Hugging Face graph launches ~1400 small kernels per step; for the GEMMs themselves the table above shows
+QuantForge on par with Marlin at batch 1. Running the QuantForge kernels <em>inside</em> vLLM (a plugin) would be the fair end-to-end
+comparison and is not done.</p>
+<p>QuantForge is 3.2–3.7× faster than an fp16 cuBLAS GEMM at decode (it moves a quarter of the bytes) and
+0.67–1.01× of Marlin. <strong>The "≥ 90 % of Marlin" goal is reached for decode (M ≤ 16): 4096 × 4096 (0.99–1.01×), 1 × 11008 × 4096 (0.97×), 1 × 4096 × 11008 (0.93×) and 16 × 4096 × 11008 (0.94×); it is not reached for M = 32 … 256 (0.67–0.87×;
+M = 64 / 128 are the worst: the kernel is limited by the Tensor Core / <code>ldmatrix</code> path at ~50 % tensor-pipe activity, not
+by DRAM, while Marlin stays memory-bound up to M = 64) and for the prefill GEMMs (0.85–0.86×)</strong>. Activations are
+re-touched after the L2 flush (they are L2-resident in a real model, written by the previous layer). At prefill sizes the
+compute-bound kernel is ~25 % slower than cuBLAS fp16 with group-wise parameters.</p>
+<blockquote>
+<p><strong>Correction (2026-11-20).</strong> Earlier versions of this README reported 38.0 µs / 1.30× Marlin for M = 1 and 4 at
+4096 × 4096 (and 0.91 / 0.94× for the wide decode shapes). That figure could not be reproduced: re-running the same
+harness on the very commit that recorded it gives 50.2 µs (0.99×). With the current method the kernel is on the DRAM
+limit: <code>ncu</code> (<code>dram__bytes_read</code>, caches flushed) shows 9.2 MB read from DRAM for the 8.65 MB of weights and scales, i.e.
+~184 GB/s at 50 µs, and a 1 GB flush instead of the 256 MB one changes neither kernel's time (50.3 µs both).
+The table above was regenerated in one run (<code>benchmarks/compare_marlin.py --autotune</code>, interleaved rounds);
+<code>benchmarks/l2_residency_check.py</code> reproduces the flush and DRAM-byte checks.</p>
+</blockquote>
+<p>Without group-wise parameters (per-tensor scale), TFLOP/s, 4096³: 36.9 (cuBLAS fp16
+43.6); 1 × 4096 × 4096 decode: ~49 µs with the weights L2-resident (the kernel is latency-bound there, 3.7× faster than cuBLAS). Numbers from a
+laptop GPU are only meaningful relative to the same machine and clock state.</p><div class="pager"><a href="vllm.html">&larr; vLLM plugin</a><a href="limitations.html">Limitations and layout &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

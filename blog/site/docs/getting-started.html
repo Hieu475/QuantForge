@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started - Docs - QuantForge Notes</title>
+<meta name="description" content="Install, build, test, and the first calls.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li class=cur><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Getting started</h1><p class="lede">Install, build, test, and the first calls.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#install-the-python-package">Install the Python package</a></li>
+<li><a href="#docker-no-toolchain-on-the-host">Docker (no toolchain on the host)</a></li>
+<li><a href="#build">Build</a></li>
+<li><a href="#test">Test</a></li>
+<li><a href="#use">Use</a></li>
+</ul>
+</div>
+</details><h2 id="install-the-python-package">Install the Python package<a class="headerlink" href="#install-the-python-package" title="Permanent link">#</a></h2>
+<pre><code class="language-bash"># 1. build the C++ tool once (see Build below), 2. install the Python part, 3. check
+pip install ./python[hf]                      # needs a CUDA build of torch; [hf] adds transformers / safetensors / pandas
+export QUANTFORGE_BUILD_DIR=$PWD/build        # the CMake build directory containing tools/quantforge-opt
+quantforge-doctor                             # GPU, nvcc / ptxas, quantforge-opt, and one small kernel against a reference
+</code></pre>
+<h2 id="docker-no-toolchain-on-the-host">Docker (no toolchain on the host)<a class="headerlink" href="#docker-no-toolchain-on-the-host" title="Permanent link">#</a></h2>
+<pre><code class="language-bash">docker build -f docker/Dockerfile -t quantforge .                    # builds quantforge-opt (LLVM 18), installs torch (CUDA 12.8) and the package
+docker build -f docker/Dockerfile --build-arg WITH_VLLM=1 -t quantforge:vllm .      # + vLLM with the `quantization=&quot;quantforge&quot;` plugin
+docker run --rm --gpus all quantforge                                # quantforge-doctor: GPU, toolchain, one kernel against a reference
+docker run --rm --gpus all -v ~/.cache/quantforge:/root/.cache/quantforge -v ~/.cache/huggingface:/root/.cache/huggingface \
+    quantforge:vllm python your_script.py                            # mount the caches: kernels compile once, models download once
+</code></pre>
+<p>Needs the NVIDIA container toolkit on the host. The image is large (9.6 GB compressed, 27 GB on disk: the CUDA toolkit is needed at run time for <code>nvcc</code> / <code>ptxas</code>, plus the CUDA wheels of
+torch). Checked on the RTX 4050: <code>quantforge-doctor</code> passes inside the container and the torch op matches a dense reference. The <code>.github/workflows/docker.yml</code> workflow builds the image
+(manual trigger; it only pushes to a registry if you ask it to).</p>
+<h2 id="build">Build<a class="headerlink" href="#build" title="Permanent link">#</a></h2>
+<p>Supported toolchain: <strong>LLVM/MLIR 18.1.x</strong> (the MLIR C++ API changes every release;
+CMake refuses other majors unless <code>-DQUANTFORGE_ALLOW_UNSUPPORTED_LLVM=ON</code>).</p>
+<pre><code class="language-bash"># Ubuntu 24.04
+sudo apt install cmake ninja-build llvm-18-dev libmlir-18-dev mlir-18-tools
+pip install lit                    # for `check-quantforge` (any python env on PATH)
+
+cmake --preset default             # RelWithDebInfo, apt LLVM 18, ./build
+cmake --build --preset default
+</code></pre>
+<p>For another LLVM 18 install pass <code>-DMLIR_DIR=&lt;prefix&gt;/lib/cmake/mlir -DLLVM_DIR=&lt;prefix&gt;/lib/cmake/llvm</code>.</p>
+<h2 id="test">Test<a class="headerlink" href="#test" title="Permanent link">#</a></h2>
+<pre><code class="language-bash">cmake --build build --target check-quantforge     # 37 FileCheck tests, CPU only
+ctest --test-dir build -L lit                     # same, via CTest
+
+# GPU end-to-end (needs an NVIDIA GPU, CUDA toolkit in /usr/local/cuda or $CUDA_HOME,
+# python with torch + pytest). Skipped automatically when unavailable.
+QUANTFORGE_BUILD_DIR=$PWD/build python -m pytest -v
+scripts/ci_gpu_preflight.sh                       # checks a (CI) machine: toolchain, CUDA, torch, RAM
+scripts/sanitize.sh                               # compute-sanitizer memcheck + racecheck (27 pipeline variants, 54 runs)
+python python/quantforge/benchmark.py --cold --group-size 128 --shape 1x4096x4096 \
+    &quot;decode=true&quot; --compare benchmarks/baseline_decode_rtx4050_sm89.json   # perf regression (--cold: DRAM weights)
+scripts/check.sh --gpu --sanitize                 # everything
+</code></pre>
+<h2 id="use">Use<a class="headerlink" href="#use" title="Permanent link">#</a></h2>
+<pre><code class="language-bash"># qf IR -&gt; LLVM dialect with embedded PTX
+build/tools/quantforge-opt in.mlir --quantforge-gpu-pipeline='chip=sm_80' -o lowered.mlir
+</code></pre>
+<pre><code class="language-python">import sys; sys.path.insert(0, &quot;python&quot;)
+from quantforge.e2e import W4A16Gemm, pack_int4
+from quantforge import quant, autotune
+
+# per-tensor scale / zero point, any shape (N even)
+kern = W4A16Gemm.build(M=100, K=70, N=90, pad=True)
+out = kern.run(act_f16, pack_int4(q_uint4), scale_f16, zero_point_i8)   # C += A @ dequant(W)
+
+# group-wise (G rows of K share a scale/zero point): scale f16[K/G, N], zero point i8[K/G, N]
+kern = W4A16Gemm.build(M=1, K=4096, N=4096, group_size=128, decode=True, pad=True)
+out = kern.run(act, packed, scale, zero)                  # bias=/residual= are fused as accumulator init
+
+# checkpoints: AWQ / GPTQ int32 tensors -&gt; QuantForge layout
+packed, scale, zero = quant.from_awq(qweight, qzeros, scales)
+packed, scale, zero = quant.from_gptq(qweight, qzeros, scales, g_idx)
+
+# INT8 weights (W8A16): packed_w is a plain int8 [K, N] tensor
+kern = W4A16Gemm.build(M=128, K=4096, N=4096, bits=8, group_size=128)
+
+# fused gated MLP: one GEMM for gate+up, silu(x@Wg) * (x@Wu) written directly
+w_gu = quant.interleave_gate_up((packed_g, scale_g, zero_g), (packed_u, scale_u, zero_u))
+kern = W4A16Gemm.build(M=1, K=4096, N=2 * 11008, group_size=128, decode=True, pad=True, epilogue=&quot;swiglu&quot;)
+hidden = kern.run(act, *w_gu)                              # [1, 11008]
+
+# fused activation on the accumulator: relu | silu | gelu (f32 accumulator)
+kern = W4A16Gemm.build(M=1, K=4096, N=11008, group_size=128, decode=True, pad=True, epilogue=&quot;silu&quot;)
+
+# best tile configuration per (GPU, shape), measured once and cached in ~/.cache/quantforge
+kern = autotune.autotune(M=1, K=4096, N=11008, group_size=128)
+</code></pre><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/01-overview.html">QuantForge: generating INT4 / INT8 / FP8 GEMM kernels with MLIR</a></li></ul></aside><div class="pager"><span></span><a href="quantisation.html">Quantisation formats &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

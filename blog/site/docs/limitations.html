@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limitations and layout - Docs - QuantForge Notes</title>
+<meta name="description" content="What does not work yet, and where things live in the repository.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li class=cur><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Limitations and layout</h1><p class="lede">What does not work yet, and where things live in the repository.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#repository-layout">Repository layout</a></li>
+<li><a href="#contributing">Contributing</a></li>
+</ul>
+</div>
+</details><h2 id="limitations">Limitations<a class="headerlink" href="#limitations" title="Permanent link">#</a></h2>
+<ul>
+<li><strong>Speed:</strong> 0.85–1.01× Marlin for M ≤ 16 and prefill (M ≥ 512) on the RTX 4050 (decode 4096² on par, the wide decode shapes 0.93–0.97×), but only <strong>0.67–0.87× at
+  M = 32 … 256</strong> (see the table above). The gap is not DRAM, tile choice or dequantisation arithmetic (ablated:
+  1–3 %); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 75.8 µs at M = 64 (compiler
+  87, Marlin 59), see <code>PIPELINE.md</code> -- closing it needs tuning of a hand-written kernel, which is not done.
+  Also not done: stream-K / persistent scheduling and split-K (the decode grid can exceed the resident-block
+  count, <code>PIPELINE.md</code>).</li>
+<li>Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row
+  tiles (the torch op buckets M and picks them; <code>autotune</code> searches them).</li>
+<li>W4A16, W8A16 and FP8 (E4M3) weights with f16 activations (the torch op picks the kernel from the
+  weight: packed INT4 <code>[K, N/2]</code>, plain int8 <code>[K, N]</code>, or a <code>torch.float8_e4m3fn</code> <code>[K, N]</code> from
+  <code>quant.quantize_fp8</code>; 8-bit weights are group-wise only and have no fused swiglu, FP8 ignores the zero
+  point). No NF4, no activation quantization (FP8 <em>activations</em> / FP8 tensor cores are not used). Act-order GPTQ (<code>desc_act=True</code>)
+  works through <code>quant.from_gptq_act_order</code> (rows permuted offline, <code>perm=</code> in <code>w4a16_linear</code>
+  gathers the activations: one extra small kernel per call).
+  Zero points are stored unpacked (<code>int8 [K/G, N]</code>); AWQ / GPTQ checkpoints are repacked
+  offline in Python (<code>quantforge.quant</code>). Besides round-trip tests against independent packers,
+  real 4-bit checkpoints (Qwen2.5-0.5B-Instruct AWQ and GPTQ-Int4, group size 128, layers of
+  shape 896 → 4864, 4864 → 896, 896 → 128, 896 → 896) are run through the kernels and compared
+  with vLLM's AWQ dequantisation and an f32 reference built from the GPTQ file format
+  (<code>test/E2E/test_real_checkpoints.py</code>: downloads a few MB with HTTP Range requests, skips offline).
+  Real checkpoints are covered for <code>desc_act=False</code> and <code>desc_act=True</code> GPTQ, <code>zero_point=True</code> AWQ (GEMM version) and
+  FP8-dynamic (weights only: 0.55 % of its bf16 scales are subnormal in f16).</li>
+<li>Epilogue: bias and residual are fused by initializing the accumulator
+  (<code>run(bias=, residual=)</code>); <code>relu</code> / <code>silu</code> / <code>gelu</code> (tanh form) are applied to the f32
+  accumulator before the store (<code>build(epilogue="silu")</code>, <code>activation=</code> in the torch op), i.e.
+  <code>act(bias + A @ W)</code>. A gated MLP is one GEMM: <code>quant.interleave_gate_up</code> interleaves the gate and
+  up weights by column and <code>epilogue="swiglu"</code> stores <code>silu(x @ Wg) * (x @ Wu)</code> (<code>activation="swiglu"</code>
+  in the op, output half as wide, no bias). <code>accumulate=False</code> makes any kernel write <code>C = A @ W</code>
+  without reading C. Not fused: gelu-gated variants, residual after the activation, quantised output.</li>
+<li>Tile-aligned static shapes in the compiler; other shapes work through zero-padding
+  in the Python harness. The degenerate decode case of a single block (N = 64) is not
+  fused into one kernel (correct, but two launches).</li>
+<li>NVIDIA sm_80+ only (PTX is JIT-compiled by the driver); no Hopper <code>wgmma</code>/TMA.</li>
+<li>The scalar FMA fallback (<code>tensor-core=false</code>) is correct but ~10× slower; LLVM 18's
+  NVPTX backend miscompiles one variant of it (documented in <code>PIPELINE.md</code>).</li>
+<li>Kernels are PTX loaded through a small CUDA driver shim (<code>runtime/mgpu_cuda_runtime.c</code>):
+  the JIT-compiled module is cached and launches go on PyTorch's current stream,
+  asynchronously like any other op (host cost ~45–50 µs per call from Python for a
+  4096 × 4096 decode GEMM, kernel ~50 µs; Marlin's launch is ~20–25 µs wall). The torch op's hot path is C++
+  (no interpreter per call); the Python <code>W4A16Gemm.run</code> still costs ~45 µs. The benchmark tables report device kernel time.</li>
+</ul>
+<h2 id="repository-layout">Repository layout<a class="headerlink" href="#repository-layout" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>path</th>
+<th>content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>include/QuantForge</code>, <code>lib/Dialect</code></td>
+<td>the <code>qf</code> dialect (<code>qf.unpack</code>, <code>qf.dequant</code> with per-tensor / group-wise parameters)</td>
+</tr>
+<tr>
+<td><code>lib/Transforms</code></td>
+<td>passes + <code>--quantforge-gpu-pipeline</code> (<code>GPUPipeline.cpp</code>)</td>
+</tr>
+<tr>
+<td><code>tools/quantforge-opt</code></td>
+<td><code>mlir-opt</code>-style driver (all upstream passes + QuantForge's)</td>
+</tr>
+<tr>
+<td><code>python/quantforge</code></td>
+<td><code>e2e.py</code> (compile + run harness), <code>quant.py</code> (group-wise quantization, AWQ/GPTQ repack), <code>autotune.py</code>, <code>benchmark.py</code>, <code>smoke.py</code>, CUDA runtime shim</td>
+</tr>
+<tr>
+<td><code>test/Transforms</code>, <code>test/Dialect</code></td>
+<td>lit/FileCheck tests</td>
+</tr>
+<tr>
+<td><code>test/E2E</code></td>
+<td>GPU tests: compile → run → compare with PyTorch</td>
+</tr>
+<tr>
+<td><code>benchmarks/</code></td>
+<td>recorded baselines (JSON, with environment) and <code>compare_marlin.py</code></td>
+</tr>
+<tr>
+<td><code>scripts/</code></td>
+<td><code>check.sh</code>, <code>sanitize.sh</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="contributing">Contributing<a class="headerlink" href="#contributing" title="Permanent link">#</a></h2>
+<p>See <a href="https://github.com/Hieu475/QuantForge/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p><div class="pager"><a href="results.html">&larr; Results</a><a href="changelog.html">Changelog &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

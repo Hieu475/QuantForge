@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernels and measurements - Docs - QuantForge Notes</title>
+<meta name="description" content="What limits decode, small batch and prefill, with the numbers.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li class=cur><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Kernels and measurements</h1><p class="lede">What limits decode, small batch and prefill, with the numbers.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/python/quantforge/PIPELINE.md">python/quantforge/PIPELINE.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#performance-rtx-4050-laptop-sm_89-f32-accumulate-best-of-n">Performance (RTX 4050 Laptop, sm_89, f32 accumulate, best of N)</a></li>
+<li><a href="#measured-against-marlin">Measured against Marlin</a></li>
+<li><a href="#what-limits-the-decode-kernel">What limits the decode kernel</a></li>
+<li><a href="#decode-m-16">Decode (M ≤ 16)</a></li>
+<li><a href="#small-batch-16-m-256">Small batch (16 &lt; M ≤ 256)</a></li>
+<li><a href="#prefill-m-256">Prefill (M ≥ 256)</a></li>
+<li><a href="#fp8-e4m3-weights">FP8 (E4M3) weights</a></li>
+<li><a href="#wave-aware-k-tile-for-wide-decode-layers-2026-11-20">Wave-aware K tile for wide decode layers (2026-11-20)</a></li>
+<li><a href="#split-k-split-ks-experimental-off-by-default">Split-K (split-k=S, experimental, off by default)</a></li>
+<li><a href="#profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050">Profile of a 7B decode step (Mistral-7B-Instruct, RTX 4050)</a></li>
+</ul>
+</div>
+</details><h2 id="performance-rtx-4050-laptop-sm_89-f32-accumulate-best-of-n">Performance (RTX 4050 Laptop, sm_89, f32 accumulate, best of N)<a class="headerlink" href="#performance-rtx-4050-laptop-sm_89-f32-accumulate-best-of-n" title="Permanent link">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>size</th>
+<th>default</th>
+<th><code>smem-stages=1</code></th>
+<th>no cp.async / vector copy</th>
+<th>FMA (<code>tensor-core=false</code>)</th>
+<th>cuBLAS fp16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1024³</td>
+<td>6.8</td>
+<td>6.8</td>
+<td>5.7</td>
+<td>1.2</td>
+<td>21.0</td>
+</tr>
+<tr>
+<td>2048³</td>
+<td>17.5</td>
+<td>16.6</td>
+<td>13.4</td>
+<td>1.9</td>
+<td>25.1</td>
+</tr>
+<tr>
+<td>4096³</td>
+<td>23.5</td>
+<td>21.8</td>
+<td>16.2</td>
+<td>2.1</td>
+<td>25.5</td>
+</tr>
+</tbody>
+</table>
+<p>TFLOP/s. With an f16 accumulator (<code>QF_ACC=f16</code>) 4096³ reaches ~38 TFLOP/s. The
+INT4 weights are read packed from HBM; cuBLAS reads pre-dequantised fp16.</p>
+<p>What got the speed (each measured, 2048³): one thread per block → 128 threads
+(×20), constants sunk into the kernel instead of passed as arguments (PTX
+926 → 538 lines, <code>div.u64</code> gone), 64×64 accumulator kept in registers across
+the K loop (×3.4), vector/<code>cp.async</code> tile copies (×1.2–1.3), double buffering
+(×1.05–1.08 at ≥2048).</p>
+<h2 id="measured-against-marlin">Measured against Marlin<a class="headerlink" href="#measured-against-marlin" title="Permanent link">#</a></h2>
+<p>See README.md / <code>benchmarks/compare_marlin.py</code>: 0.7–0.9× Marlin's speed on the RTX 4050
+(group size 128), 2–2.5× faster than a pre-dequantised fp16 cuBLAS GEMM at decode.
+The vectorised scale / zero-point / packed-weight loads (<code>vectorize-loads</code>) took the
+group-wise decode kernel from 118 to 83 µs (1 × 4096 × 4096, warm L2) and the group-wise
+4096³ GEMM from 25.7 to 33.4 TFLOP/s.</p>
+<h2 id="what-limits-the-decode-kernel">What limits the decode kernel<a class="headerlink" href="#what-limits-the-decode-kernel" title="Permanent link">#</a></h2>
+<p>Measured with <code>ncu</code> and a micro-kernel that only reads the packed weights (RTX 4050, 22.5 MB):</p>
+<ul>
+<li>The read ceiling is ~183 GB/s. 64-byte row segments of the row-major <code>[K, N/2]</code> layout reach it
+  as soon as a few loads are in flight; <strong>32-byte segments (<code>block-tile-n=64</code>) drop to ~75 GB/s</strong>
+  unless the tile is stored contiguously (183 GB/s) — the case for repacking the weights.</li>
+<li>The kernel is <em>instruction-bound before it is latency-bound</em>: at 183 GB/s there are only ~10
+  thread-instructions per weight to spend. A scalar per-weight <code>I2F</code> (1 per weight, ~7.7
+  instructions per weight in total) was the dominant cost, which is why deeper load pipelining
+  (<code>prefetch-distance</code> ≥ 2), 2-stage buffering, <code>sink-dequant-stores</code> and split-K did nothing
+  on their own.</li>
+<li>Regression found by that analysis: after <code>GroupRowOfTile</code> started folding the group row of a
+  K tile (tile-k &gt; 64 previously never matched), the 8 per-item scale / zero-point scalar loads
+  became identical and only the first was vectorised, so <code>quantforge-vectorize-dequant</code> stopped
+  matching 7 of 8 items. Fixing it (all duplicate loads are replaced) restored the packed dequantisation.
+  <code>test/Transforms/gpu_pipeline_groupwise.mlir</code> now checks that no <code>cvt.rn.f16</code> is left in the PTX.
+  (An earlier version of this note quoted 53 → 38 µs for that fix and "faster than Marlin"; those timings came from
+  development runs that are not reproducible: the same kernels measure 50 µs cold, on par with Marlin's 49.6 µs, see
+  the ablation below.)</li>
+<li>
+<p><strong>Ablation of the decode kernel, cold L2, 1 × 4096 × 4096 (2026-11-20):</strong> all passes 50 µs; scalar dequantisation
+  (<code>vectorize-dequant=false</code>) 58 µs (+16 %); no look-ahead (<code>prefetch-distance=0</code>) 61 µs (+22 %); scalar scale / zero-point /
+  weight loads (<code>vectorize-loads=false</code>) 156 µs (3.1×). With the weights L2-resident (no flush) the full kernel is 49 µs:
+  it is latency-bound, not bandwidth-bound, at this size.</p>
+</li>
+<li>
+<p><strong>Wave quantization.</strong> Effective bandwidth by N (K = 4096, <code>block-tile-n=128</code>): 183.6 GB/s at
+  N = 8192 (64 blocks), 169 at N = 10240 (80 blocks = 4 resident blocks × 20 SMs), ~151 for every
+  N whose grid exceeds the resident-block count (86, 96, 112 blocks): the tail wave runs with
+  little parallelism. A smaller K tile (<code>block-tile-k=64</code>: less shared memory per block) together
+  with <code>prefetch-distance=1</code> (which keeps the bytes in flight) moved 1 × 4096 × 11008 from
+  153 to 140 µs; the autotuner now tries it.</p>
+</li>
+<li>Benchmark pitfall: with the L2 flushed, a harness that happens to copy the activations (the
+  padding path for M &lt; 16) hands the kernel hot A while M = 16 gets cold A (an earlier note quoted 63 vs 38 µs on the
+  same kernel; with the current harness M = 1, 4 and 16 all measure 50 µs). <code>compare_marlin.py</code> now re-touches the activations after the flush for every
+  kernel.</li>
+</ul>
+<p>Untried: stream-K / persistent scheduling for the tail wave. Marlin-style offline repacking (contiguous 16-byte-per-thread
+reads, dequantisation straight into the MMA fragment layout, no shared-memory round trip for B) was only prototyped by
+hand in CUDA, see "Small batch" below.</p>
+<h2 id="decode-m-16">Decode (M ≤ 16)<a class="headerlink" href="#decode-m-16" title="Permanent link">#</a></h2>
+<p><code>decode=true</code> keeps one 16-row tile per block and spreads the N dimension over
+blocks (64 columns each), so a single read of the INT4 weights is the whole cost:
+the kernel is bandwidth-bound. <code>python/quantforge/autotune.py</code> searches tile /
+stage options per shape and caches the winner. Split-K was not needed for the
+shapes measured (4096 × 4096..11008); K ≫ N (e.g. 11008 × 4096) leaves only 64
+blocks and is the case where it would help.</p>
+<h2 id="small-batch-16-m-256">Small batch (16 &lt; M ≤ 256)<a class="headerlink" href="#small-batch-16-m-256" title="Permanent link">#</a></h2>
+<p>Measured with <code>compare_marlin.py --autotune</code> (RTX 4050, cold weights): M = 32 0.88x, 64 0.67x, 128 0.69x, 256 0.76x
+of Marlin at 4096 x 4096. A sweep over block tile M (16 / 32 / 64 / 128), warp tile M / N, K tile, stages and look-ahead
+found the best skinny schedules: 32 rows <code>block-tile-m=32 warp-tile-n=32 block-tile-n=128 block-tile-k=128</code> (58.6 us, the
+earlier default 68.6 us), 64 rows <code>block-tile-m=64 warp-tile-m=32 warp-tile-n=64 block-tile-k=64 prefetch-distance=1</code>
+(87 us, was 97 us); they are the <code>torch_ops</code> defaults (a 32-row bucket was added) and the autotune candidates (the tune
+cache key now carries a candidates version). 16-row block tiles (more blocks, 4x the weight traffic) are 30 % slower,
+and more resident blocks do not help (64 x 1024 x 16384 with 256 blocks takes as long as 64 x 4096 x 4096 with 64): at
+M = 64 <code>ncu</code> shows the Tensor pipe 51 % active, issue slots 36 %, DRAM 52 %, stalls spread over <code>mio_throttle</code>,
+<code>math_pipe_throttle</code>, <code>wait</code>, <code>long_scoreboard</code>, <code>barrier</code> (1.0-1.4 each): the kernel is bound by the shared-memory /
+<code>ldmatrix</code> / MMA issue path, not by the weight stream -- A Marlin-style nibble layout (pair nibble p with p + 4 so that one SHF + one LOP3 unpacks a pair, ~7 instead of ~16
+integer ops per 8 weights; dequantisation is ~60 % of the executed instructions at M = 64) was ablated by emitting
+it with the wrong (but timed) layout: only 3 % at M = 64, 2.6 % at 512 and 1.2 % at 2048 x 4096 x 4096, so the
+integer work of the dequantisation is not what limits these kernels. Marlin keeps B in registers (dequantised straight into the MMA
+fragments), which is the repacking work listed under "Untried".</p>
+<p><strong>Prototype of that design</strong> (<code>benchmarks/proto/bir_w4a16.cu</code>, hand-written CUDA, verified against an f32
+reference, RTX 4050, cold weights, 4096 x 4096, group 128): offline repack so that each thread loads 16 B = its
+B fragments of a 64-column strip per k16 step, dequantisation (lop3 + sub.f16x2 + mul.f16x2) straight into the
+<code>mma.m16n8k16</code> operands, A through cp.async + ldmatrix, K slices accumulated with atomics. Best of a sweep over
+warps per block (2 / 4 / 8), K slices (1-8), A stages (2-4) and B prefetch distance (2-8): <strong>M = 32: 57.3 us, M = 64:
+75.8 us</strong> -- against the compiler's 58 / 87 us and Marlin's 51 / 59 us. So keeping B in registers is worth ~13 % at
+M = 64 and nothing at M = 32 in a straightforward implementation (254 registers, one warp per scheduler, Tensor-pipe
+bound at ~60 % of its 47 us floor); closing the rest of the gap to Marlin is occupancy / scheduling tuning of a
+hand-written kernel, not something a rewrite of the MLIR smem path would deliver by itself. Not pursued.. M = 128 / 256 sweeps (64 / 128-row tiles, warp tiles up to
+64 x 64) improve only 3 %.</p>
+<h2 id="prefill-m-256">Prefill (M ≥ 256)<a class="headerlink" href="#prefill-m-256" title="Permanent link">#</a></h2>
+<p><code>ncu</code> on 512 × 4096 × 4096 (128 × 128 block tiles): Tensor Core pipe 70 % active, dominant stall
+<code>math_pipe_throttle</code>, and a grid of 128 blocks for 60 resident slots (3 blocks / SM, limited by 167
+registers and shared memory): 2.13 waves run as 3 (71 % at best), the same wave quantization as in
+decode. 64 × 128 block tiles with a 64-wide K tile double the block count: 491 → 457 µs
+(0.79× → 0.85× Marlin); at M = 2048 the 128 × 128 tile stays best. The autotuner tries both and its
+cache now keys M in finer buckets (≤ 16, 32, …, 4096). Large weights (K x N &gt;= 2<strong>25) at M &gt;= 512 lose ~20 % throughput with the default
+128 x 128 x 32, 2-stage schedule (31 vs 38 TFLOP/s at 2048 x 4096 x 11008 / 4096 x 14336); a 3-stage pipeline
+(<code>block-tile-k=32 smem-stages=3</code>) is 8-12 % faster there (and 4 % slower at 4096 x 4096, 10 % slower at
+256 x 11008 x 4096): <code>torch_ops._prefill_opts</code> uses it for M &gt;= 512 and K x N &gt;= 2</strong>25, the autotuner has
+it as a candidate. <code>prefetch-distance=1</code> does nothing for prefill (0.464 vs 0.467 ms at 512 x 4096 x 4096), and
+64 x 64 / 128 x 64 block tiles, 4 stages and 64-deep K tiles are all slower. The cause is L2 locality of the
+plain 2-D grid: <code>block-swizzle=16</code> gives the same gain on the large weights (2048 x 4096 x 11008: 5.80 -&gt; 5.19 ms, vs
+5.14 with 3 stages; not additive) and costs 8-14 % at 4096 x 4096. Decode: wider block tiles to fit the grid in one
+wave (<code>block-tile-n=256</code>, 43 blocks for N = 11008) do not help (1 x 4096 x 11008: 149 -&gt; 169 us; 1 x 11008 x 4096:
+132 -&gt; 129 us, noise level), 192-wide tiles are 2-4x slower. ncu at 2048 x 4096 x 4096 (default schedule, block 32 x 16 threads = 16 warps): Tensor pipe 79 % of peak
+active, 16.8 M HMMA of 74 M warp instructions (23 %), issue slots 22 % busy, 1 resident block per SM (512 threads x
+&lt;= 128 registers) -- the dequantisation is already the packed f16x2 form (no I2F), so the instruction count is
+not the problem; what is left is barrier-synchronised phases of a single block per SM (all 16 warps dequantise,
+then all multiply), i.e. at most ~1.2x of headroom (79 % -&gt; ~95 % tensor activity), consistent with Marlin /
+cuBLAS at 0.89 / 0.84 of our time. Remaining gap to cuBLAS / Marlin: MMA issue
+gaps between the dequantisation and the HMMA stream (no software pipelining of the two).</p>
+<h2 id="fp8-e4m3-weights">FP8 (E4M3) weights<a class="headerlink" href="#fp8-e4m3-weights" title="Permanent link">#</a></h2>
+<p><code>qf.dequant %w, %scale, %zp {fp8}</code> reads the i8 tensor as E4M3 bit patterns: the 7 magnitude bits shifted left
+by 7 are an f16 whose exponent / mantissa fields are the E4M3 ones, i.e. exactly 2^-8 times the FP8 value
+(subnormals too; LLVM 18's NVPTX has no e4m3 type or <code>cvt</code> and none is needed); the sign bit moves to bit 15;
+<code>x 256</code> is exact (|w| &lt;= 448) and the group scale is the one rounding. <code>zero_point</code> is not read (its loads
+are dead). <code>W4A16Gemm.build(bits=8, fp8=True)</code>; the torch op selects it from a <code>float8_e4m3fn</code> weight.
+<code>quantforge-vectorize-dequant</code> recognises the tree and emits the packed form (bytes spread over the two halves of
+an i32, shifts / masks on both halves at once, two f16x2 multiplies; bit-identical to the scalar tree, guarded by
+<code>gpu_pipeline_fp8.mlir</code>: no <code>shl.b16</code> left, the scalar form has 128 of them in the decode kernel). Speed: decode
+1 x 4096 x 4096 99 vs 101 us for int8, 1 x 4096 x 11008 271 vs 272 us, prefill 512 x 4096 x 4096 4 % slower
+(584 vs 564 us); whole model (Qwen2.5-0.5B, RTN group 128, <code>hf_quantize_and_run.py --weights fp8</code>): ppl 20.10
+(int8 19.91, fp16 19.93), CUDA-graph decode 165.5 tok/s (int8 165, fp16 129; the scalar tree gave 155). FP8 and INT8
+cost the same; INT4 is still the speed format (~220 tok/s with an INT8 head).</p>
+<h2 id="wave-aware-k-tile-for-wide-decode-layers-2026-11-20">Wave-aware K tile for wide decode layers (2026-11-20)<a class="headerlink" href="#wave-aware-k-tile-for-wide-decode-layers-2026-11-20" title="Permanent link">#</a></h2>
+<p>Sweep of N at K = 4096 (cold L2, <code>block-tile-n=128</code>, <code>prefetch-distance=1</code>): the 128-deep K tile holds 80 resident blocks on the
+RTX 4050, and for 81 to 96 column blocks (N = 10240 .. 12288) the 32-deep tile (all blocks resident, one wave) is 8-12 % faster
+(N = 11008: 136 against 150 us); at 104 blocks and more the deep tile wins again. <code>_decode_opts</code> uses bk = 32 for
+10240 &lt;= N &lt;= 12288, 128 for N &gt;= 8192 otherwise, 64 below; the autotuner has bk = 32 candidates (candidates version 3).
+1 x 4096 x 11008: 149.5 -&gt; 135.7 us (0.93 of Marlin), 16 x 4096 x 11008: 149.2 -&gt; 135.5 us (0.94).</p>
+<h2 id="split-k-split-ks-experimental-off-by-default">Split-K (<code>split-k=S</code>, experimental, off by default)<a class="headerlink" href="#split-k-split-ks-experimental-off-by-default" title="Permanent link">#</a></h2>
+<p><code>quantforge-tiling{split-k=S}</code> first cuts the K reduction with <code>linalg::tileReductionUsingForall</code> (<code>numThreads = [0, 0, S]</code>): a
+<code>scf.forall (z)</code> whose body is an ordinary <code>[M, K/S] x [K/S, N]</code> GEMM, writing into a partial-result tensor, and a <code>linalg.generic</code> that sums
+the S partial results. The block tiling then runs inside it. <code>mergeSplitKForall</code> (TilingPass.cpp) folds the nested foralls into one
+<code>scf.forall (m, n, z)</code> so that <code>quantforge-forall-to-gpu</code> sees a 3-D grid (<code>quantforge-gpu-mapping</code> gives it <code>[y, x, z]</code>), and changes three things:</p>
+<ul>
+<li>the partial buffer is <code>P[S, M, N]</code>, not <code>[M, N, S]</code>: the tile of a block must be contiguous, otherwise <code>convert-vector-to-gpu</code> does not recognise the accumulator
+  load and the contraction stays a <code>vector.contract</code> that cannot be lowered;</li>
+<li>blocks read and write their own tile <code>P[z, m, n]</code> directly (a whole-slice view <code>P[z]</code> makes bufferization copy the full <code>[M, N]</code> slice per block, with a device <code>malloc</code>);</li>
+<li>the zero fill of <code>P</code> is dropped when the kernel overwrites its output (<code>split-k-init=false</code>, set by the pipeline for <code>accumulate=false</code>): a fill is vectorised into a
+  host-side <code>vector&lt;M x N x S x f32&gt;</code> otherwise. The reduce <code>linalg.generic</code> is excluded from vectorisation (<code>quantforge.no_vectorize</code>) and becomes a second kernel.</li>
+</ul>
+<p>Constraints: <code>K / S</code> must be a multiple of <code>block-tile-k</code> and of the group size. Result: correct (<code>test/Transforms/gpu_pipeline_split_k.mlir</code>, <code>test/E2E/test_split_k.py</code>)
+but 14-23 % faster only for long-K, narrow-N layers at 32 rows, and slower for most shapes at 64 rows (second kernel, <code>S x M x N</code> extra floats, a device allocation per call that
+would break CUDA-graph capture). A useful version would reduce inside the kernel (atomics / semaphore) and take the scratch as an argument; see the blog post for the numbers.</p>
+<h2 id="profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050">Profile of a 7B decode step (Mistral-7B-Instruct, RTX 4050)<a class="headerlink" href="#profile-of-a-7b-decode-step-mistral-7b-instruct-rtx-4050" title="Permanent link">#</a></h2>
+<p><code>torch.profiler</code> + the Chrome trace (kernel name, grid, duration) of one batch-1 decode step: grid 224
+= the fused gate/up GEMM (N = 28672, 32 calls), 32 = o_proj and down_proj (alternating 54 / 180 us), 48 =
+the fused q/k/v. Per call the kernels reach 165-175 GB/s when measured alone and ~150 GB/s in the model; the
+step is 22 ms of ideal weight traffic, 29 ms measured. The default K tile (64) was the main loss for the
+wide layers (gate/up 447 us vs 364 us with 128, via the torch op); <code>torch_ops._decode_opts</code> picks the
+tile by N. In the model the large kernel runs ~8 % slower than alone (385-395 us vs 353-364 us) and shows
+rare 0.5-1.4 ms outliers (another process using the GPU), not clock throttling (sm clock 2565 MHz, no
+throttle flags during the run). Remaining: fp16 <code>lm_head</code> (7 % of the step). <code>hf_quantize_and_run.py --quant-head GROUP</code>
+RTN-quantises it (Qwen2.5-0.5B-Instruct, RTN decoder, wikitext-2 8 x 512; fp16 head: ppl 24.09, CUDA-graph
+decode 184 tok/s): group 128 -&gt; ppl 26.29, 223 tok/s; group 64 -&gt; 25.91, 221; group 32 -&gt; 25.19, 220. So
+the speed-up is +20 % for any group, and a smaller group only buys back part of the quality (the tied
+head is also the embedding table, which RTN handles badly); kernel == dequantised reference in every case
+(ppl within 0.002, 48/48 tokens). An INT8 head (<code>--quant-head 128 --head-bits 8</code>; the torch op takes a plain int8 [K, N]
+weight and picks the W8A16 kernel from <code>packed.shape[1] == scale.shape[1]</code>) is the lossless route:
+ppl 24.08 with group 128 (fp16 head 24.09), 214 tok/s (+16 %); group 32: 24.09, 209 tok/s, Mistral-7B-Instruct-v0.3 (NF4 -&gt; INT4, <code>hf_bnb_to_quantforge.py --quant-head 128 --head-bits 8</code>, back to
+back runs): ppl 8.507 vs 8.506, 35.3 vs 34.4 tok/s (HF generate), 34.9 vs 34.2 (graph) = +2-3 %, as predicted
+by 134 MB / 160 GB/s ~ 0.8 ms of a 28 ms step, and 0.27 GB less VRAM (4.07 GB), the 1400 unfused HF kernels (10 %).</p><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/02-decode-instruction-bound.html">What makes a decode kernel fast: an ablation, and an erratum about a too-good figure</a></li><li><a href="../posts/04-mid-batch-postmortem.html">Why are batches of 32 to 256 slower than Marlin? A post-mortem with a hand-written CUDA prototype</a></li></ul></aside><div class="pager"><a href="pipeline.html">&larr; Compiler pipeline</a><a href="int8-w4a8.html">INT8 and W4A8 GEMM &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

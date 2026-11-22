@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quantisation formats - Docs - QuantForge Notes</title>
+<meta name="description" content="INT4, INT8, W8A8, GPTQ and the FP8 negative result.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li class=cur><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Quantisation formats</h1><p class="lede">INT4, INT8, W8A8, GPTQ and the FP8 negative result.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/README.md">README.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#quantise-a-whole-model">Quantise a whole model</a></li>
+<li><a href="#better-4-bit-quality-gptq-in-the-library">Better 4-bit quality: GPTQ in the library</a></li>
+<li><a href="#int8-w8a8-the-int8-tensor-cores-20x-in-hardware-lost-around-the-gemm">INT8 W8A8 (the INT8 tensor cores: 2.0x in hardware, lost around the GEMM)</a></li>
+<li><a href="#fp8-w8a8-on-the-ada-fp8-tensor-cores-a-negative-result-for-now">FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)</a></li>
+</ul>
+</div>
+</details><h2 id="quantise-a-whole-model">Quantise a whole model<a class="headerlink" href="#quantise-a-whole-model" title="Permanent link">#</a></h2>
+<pre><code class="language-python">import torch, quantforge.nn as qnn
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-1.5B-Instruct&quot;, dtype=torch.float16)
+stats = qnn.quantize_model(model, fmt=&quot;int4&quot;, group_size=128)   # int4 | int8 | fp8, RTN, layer by layer on the GPU
+qnn.quantize_model(model, &quot;int8&quot;, only=(&quot;lm_head&quot;,), fuse=False)  # optional: a lossless INT8 head (+2-16 % decode)
+out = model.generate(ids.cuda(), max_new_tokens=64)             # the Linears are QuantLinear modules now
+</code></pre>
+<p><code>quantize_model</code> replaces every <code>nn.Linear</code> (the <code>lm_head</code> stays dense unless asked) with
+<code>quantforge.nn.QuantLinear</code>, fuses q / k / v into one GEMM and a SiLU-gated MLP into gate + up (swiglu
+epilogue) for Llama / Qwen / Mistral style blocks, and works under <code>torch.compile</code> and CUDA graphs.
+Layers whose <code>in_features</code> is not a multiple of the group size fall back to 64 / 32 / 16 (else stay dense).
+<code>QuantLinear.from_quantized(packed, scale, zero, ...)</code> wraps GPTQ / AWQ tensors converted with <code>quantforge.quant</code>.</p>
+<p>Real AWQ / GPTQ checkpoints go through <code>load_quantized_checkpoint</code> (4-bit, group-wise; <code>desc_act</code> act-order GPTQ is
+handled with a row permutation, <code>zeros_offset=0</code> for <code>gptq_v2</code>):</p>
+<pre><code class="language-python">model = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;, dtype=torch.float16)   # the architecture
+qnn.load_quantized_checkpoint(model, &quot;Qwen2.5-0.5B-Instruct-GPTQ-Int4/model.safetensors&quot;, method=&quot;gptq&quot;)
+</code></pre>
+<p>The embeddings and norms are copied from the checkpoint as well (AWQ folds its activation scales into the norms, so
+the dense base model's norms are <em>not</em> the right ones). Checked against a dense twin (same dequantised weights in
+<code>nn.Linear</code>) with <code>benchmarks/hf_load_checkpoint.py</code>, wikitext-2 16 x 512: Qwen2.5-0.5B GPTQ-Int4 ppl 26.336
+vs 26.335, 59/59 greedy tokens identical, 182 tok/s CUDA-graph decode; AWQ ppl 26.689 vs 26.689, 59/59, 184 tok/s;
+<strong>TinyLlama-1.1B-Chat GPTQ with <code>desc_act=True</code></strong> (TheBloke; all 154 layers act-ordered) ppl 17.259 vs 17.259, 60/60 greedy tokens;
+<strong>a real FP8 checkpoint</strong> (<code>RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic</code>, <code>method="fp8"</code>, per-channel scales expanded to group 128)
+ppl 22.543 vs 22.543 for its twin and 22.441 for the fp16 base model (greedy decoding diverges after 28 of 59 tokens: near-ties
+flip under the different fp16 rounding of the twin's matmul; the logits agree to 99.4 % top-1).
+Example with perplexity and decode speed: <code>benchmarks/hf_quantize_model.py</code> (RTN INT4, group 128, INT8 head). Perplexity on the
+<strong>whole</strong> Wikitext-2 test split (the Phi row: first 8 windows only, marked *); decode speed is the mean of 7 interleaved CUDA-graph
+runs in one session on the 6 GB RTX 4050 (<code>benchmarks/decode_repeat.py</code>, spread in the table below):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th>fp16</th>
+<th>INT4 + INT8 head</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B-Instruct</td>
+<td>ppl 18.79, 120 tok/s</td>
+<td>22.91, 197 tok/s</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B-Instruct</td>
+<td>12.66, 48 tok/s (3.1 GB)</td>
+<td>14.30, 91 tok/s (1.5 GB)</td>
+</tr>
+<tr>
+<td>Qwen2.5-3B-Instruct</td>
+<td>does not fit in 6 GB</td>
+<td>13.13, ~61 tok/s (2.5 GB; speed from an earlier session)</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B-Instruct</td>
+<td>17.91, 63 tok/s (2.5 GB)</td>
+<td>22.28, 132 tok/s (1.3 GB)</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct</td>
+<td>17.24, 57 tok/s (3.0 GB)</td>
+<td>19.02, 129 tok/s (1.2 GB)</td>
+</tr>
+<tr>
+<td>Phi-3.5-mini-instruct (3.8B)</td>
+<td>does not fit in 6 GB</td>
+<td>9.62 *, 2.2 GB (gate_up_proj fused into swiglu; CUDA-graph capture fails inside HF's LongRoPE)</td>
+</tr>
+</tbody>
+</table>
+<p><code>--compile</code> (<code>torch.compile</code> of the quantised model before the CUDA-graph capture, which fuses HF's norm / rotary /
+elementwise kernels) adds ~10 % on the 0.5B model (206 -&gt; 226 tok/s, 86 of 96 greedy tokens identical: fp16 rounding
+differs), 4 % on Qwen2.5-1.5B (97 -&gt; 101) and 3 % on Llama-3.2-1B (142 -&gt; 146); the share of those kernels shrinks as
+the GEMMs grow.</p>
+<p>(RTN INT4 costs 2-4 perplexity points on these models; quantise with GPTQ / AWQ and wrap the result with
+<code>QuantLinear.from_quantized</code> for a better quality.) Layers are quantised in row chunks, so the 150k-row
+<code>lm_head</code> of a 3B model needs no fp32 copy of itself on the GPU.</p>
+<h2 id="better-4-bit-quality-gptq-in-the-library">Better 4-bit quality: GPTQ in the library<a class="headerlink" href="#better-4-bit-quality-gptq-in-the-library" title="Permanent link">#</a></h2>
+<pre><code class="language-python">import quantforge.gptq as qgptq
+calib = qgptq.calibration_ids(tokenizer, train_text, nsamples=128, seqlen=512)    # [128, 512] token ids
+qgptq.quantize_model_gptq(model, calib, group_size=128)                          # INT4, replaces RTN
+qnn.quantize_model(model, &quot;int8&quot;, only=(&quot;lm_head&quot;,), fuse=False)                  # lossless INT8 head
+</code></pre>
+<p>Sequential GPTQ (Hessian of every Linear input from the already quantised blocks, column-wise error compensation
+through the Cholesky factor of H^-1, scales rounded to f16 before the error is propagated, calibration token norms capped at
+10x the median, see below). 49 s for Qwen2.5-0.5B, ~150 s for 1.5B, 300 s for 3B on the RTX 4050. Wikitext-2 perplexity on the
+<strong>whole test split</strong> (564-584 windows of 512 tokens; calibration: 128 x 512 tokens from the first 20 000 rows of the <em>train</em> split;
+INT8 head; <code>benchmarks/hf_gptq.py --nseq 0 --fp16</code>):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">RTN INT4</th>
+<th style="text-align: right;">GPTQ INT4</th>
+<th style="text-align: right;">share of the RTN loss recovered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B-Instruct</td>
+<td style="text-align: right;">18.79</td>
+<td style="text-align: right;">22.91</td>
+<td style="text-align: right;"><strong>20.45</strong></td>
+<td style="text-align: right;">60 %</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B-Instruct</td>
+<td style="text-align: right;">12.66</td>
+<td style="text-align: right;">14.30</td>
+<td style="text-align: right;"><strong>13.38</strong></td>
+<td style="text-align: right;">56 %</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B-Instruct</td>
+<td style="text-align: right;">17.91</td>
+<td style="text-align: right;">22.28</td>
+<td style="text-align: right;"><strong>20.21</strong></td>
+<td style="text-align: right;">47 %</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct</td>
+<td style="text-align: right;">17.24</td>
+<td style="text-align: right;">19.02</td>
+<td style="text-align: right;"><strong>18.13</strong></td>
+<td style="text-align: right;">50 %</td>
+</tr>
+<tr>
+<td>Qwen2.5-3B-Instruct (no fp16 reference: does not fit)</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;">13.13</td>
+<td style="text-align: right;"><strong>12.06</strong></td>
+<td style="text-align: right;">-</td>
+</tr>
+</tbody>
+</table>
+<p>The speed of the kernels does not change (same layout).</p>
+<p><strong>A pitfall that the first version of this table hid.</strong> On 8 test windows GPTQ looked better than RTN everywhere; on the
+whole test split it was <em>worse than RTN on Llama-3.2-1B</em> (24.08 against 22.28) and recovered only 24 % on Qwen2.5-1.5B.
+<code>benchmarks/ppl_per_window.py</code> showed GPTQ better than RTN in 83 % of the windows but with a few windows completely broken
+(loss 9-10 per token instead of ~3), and a layer-by-layer comparison traced it to <code>layers.1.mlp.down_proj</code>: the layer that
+creates the "massive activation" of the attention-sink token (its input has a token 675x the median norm in Llama-3.2,
+790x in Qwen2.5-1.5B). That token dominates the Hessian and the error compensation then damages other tokens. Capping every
+calibration token's norm at a multiple of the median before it enters the Hessian (<code>token_clip</code>) fixes it. A cap of 30 fixed the
+whole-split perplexity (Llama 20.12) but a slow regression test on the windows that had been broken (<code>test/E2E/test_gptq_real_model.py</code>)
+showed one still broken (window 70: loss 5.9 against 3.0 for fp16); a per-window analysis of all 564 windows found no window worse than
+round-to-nearest at a cap of 10 (30: two windows, one by 2.8 nats; 5: none, but 0.2 ppl worse), so <strong>10 is the default</strong>
+(<code>token_clip=10</code>; cost: ~0.07 ppl against 30). Quantising just the massive-activation layer with RTN also fixes Llama, but <em>hurts</em>
+Qwen-0.5B, so a fixed list of layers does not work. Options that did not help consistently, hence off by default: <code>clip=True</code>
+(per-group range shrinking), <code>act_order=True</code> (the layers lose the q/k/v fusion), larger damping, more calibration windows.</p>
+<p><strong>How robust is it?</strong> (<code>benchmarks/hf_gptq.py --seed/--train</code>, <code>benchmarks/arc_eval.py</code>; whole Wikitext-2 test split, cap 10)</p>
+<table>
+<thead>
+<tr>
+<th>check</th>
+<th style="text-align: right;">Qwen2.5-0.5B</th>
+<th style="text-align: right;">Llama-3.2-1B</th>
+<th style="text-align: right;">Qwen2.5-1.5B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTN INT4</td>
+<td style="text-align: right;">22.91</td>
+<td style="text-align: right;">22.28</td>
+<td style="text-align: right;">14.30</td>
+</tr>
+<tr>
+<td>GPTQ, Wikitext-2 calibration, 3 seeds</td>
+<td style="text-align: right;">20.45 / 20.46 / 20.48 (sd 0.01)</td>
+<td style="text-align: right;">20.21 / 20.22 / 20.25 (sd 0.02)</td>
+<td style="text-align: right;">13.38 (one seed)</td>
+</tr>
+<tr>
+<td>GPTQ, calibration on a different corpus (cnn_dailymail articles)</td>
+<td style="text-align: right;">20.70</td>
+<td style="text-align: right;">20.43</td>
+<td style="text-align: right;">13.65</td>
+</tr>
+</tbody>
+</table>
+<p>The spread between calibration seeds is 0.01-0.02 (it was 0.08-0.15 with a cap of 30: the cap also stabilises the result); calibrating on
+another domain costs 0.2-0.3 points on Wikitext-2 and still beats RTN by 2 points or more (the numbers in the first row are <em>in-domain</em>).
+Zero-shot ARC accuracy of the GPTQ models (lm-evaluation-harness scoring, <code>acc</code> / <code>acc_norm</code>, %; standard error 1.0 pp on ARC-Easy, n = 2376,
+1.4 pp on ARC-Challenge, n = 1172):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th>variant</th>
+<th style="text-align: right;">ARC-Easy</th>
+<th style="text-align: right;">ARC-Challenge</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td>fp16 / RTN / GPTQ</td>
+<td style="text-align: right;">65.6 / 62.5 / 63.3 · 59.2 / 59.3 / 60.5</td>
+<td style="text-align: right;">30.7 / 31.7 / 29.4 · 33.8 / 32.3 / 33.0</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td>fp16 / RTN / GPTQ</td>
+<td style="text-align: right;">69.0 / 64.3 / 66.4 · 63.8 / 60.4 / 62.5</td>
+<td style="text-align: right;">34.6 / 33.5 / 33.2 · 37.9 / 35.3 / 36.9</td>
+</tr>
+<tr>
+<td>OLMo-2-1B</td>
+<td>fp16 / RTN / GPTQ</td>
+<td style="text-align: right;">71.8 / 71.2 / 70.4 · 71.0 / 68.3 / 69.5</td>
+<td style="text-align: right;">41.0 / 39.8 / 39.3 · 42.0 / 40.7 / 42.2</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td>fp16 / RTN / GPTQ</td>
+<td style="text-align: right;">76.8 / 65.6 / <strong>73.1</strong> · 76.0 / 62.3 / <strong>72.0</strong></td>
+<td style="text-align: right;">43.5 / 37.0 / <strong>40.5</strong> · 46.7 / 39.7 / <strong>44.0</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(each cell: <code>acc</code> triple, then <code>acc_norm</code> triple.) Perplexity understated the damage of round-to-nearest on Qwen2.5-1.5B: it loses 11 points on ARC-Easy
+(76.8 -&gt; 65.6) and GPTQ gets back 7.5 of them (73.1; 75.0 with a cap of 30, within about 2 standard errors); for the other three models the differences
+between the variants are mostly within the standard error, i.e. these small models lose little on ARC at INT4 either way.</p>
+<p><strong>Run-to-run spread</strong> (<code>benchmarks/decode_repeat.py</code>, <code>benchmarks/kernel_repeat.py</code>). Batch-1 CUDA-graph decode, 7 repetitions with fp16 and INT4
+(+ INT8 head) interleaved, mean +- standard deviation, one session:</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16 (tok/s)</th>
+<th style="text-align: right;">INT4 + INT8 head (tok/s)</th>
+<th style="text-align: right;">speed-up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">120.2 +- 0.6</td>
+<td style="text-align: right;">197.1 +- 1.6</td>
+<td style="text-align: right;">1.64x +- 0.02</td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">47.9 +- 2.1</td>
+<td style="text-align: right;">91.3 +- 5.4</td>
+<td style="text-align: right;">1.91x +- 0.07</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">62.5 +- 3.3</td>
+<td style="text-align: right;">132.0 +- 7.3</td>
+<td style="text-align: right;">2.11x +- 0.12</td>
+</tr>
+<tr>
+<td>OLMo-2-1B</td>
+<td style="text-align: right;">57.2 +- 2.6</td>
+<td style="text-align: right;">128.9 +- 7.7</td>
+<td style="text-align: right;">2.26x +- 0.16</td>
+</tr>
+</tbody>
+</table>
+<p>Absolute speeds drift by 5-10 % within a session and by up to 15 % between sessions (the GPU is shared with a desktop; the single numbers
+quoted elsewhere in this README come from the faster sessions), the <em>speed-up</em> is stable to about 5 %. Kernel time against Marlin, 5 independent
+invocations of <code>compare_marlin.py --autotune</code>: 1 x 4096 x 4096 ratio 0.990 +- 0.000 (Marlin 49.7 +- 0.1 us, QuantForge 50.2 +- 0.1), 1 x 4096 x 11008
+0.930 +- 0.000, 64 x 4096 x 4096 0.676 +- 0.005, 2048 x 4096 x 4096 0.842 +- 0.011 (the long prefill kernels drift by ~1.5 % with the GPU temperature,
+both kernels together).</p>
+<h2 id="int8-w8a8-the-int8-tensor-cores-20x-in-hardware-lost-around-the-gemm">INT8 W8A8 (the INT8 tensor cores: 2.0x in hardware, lost around the GEMM)<a class="headerlink" href="#int8-w8a8-the-int8-tensor-cores-20x-in-hardware-lost-around-the-gemm" title="Permanent link">#</a></h2>
+<p><code>quantize_model(model, "int8_w8a8")</code> (<code>INT8W8A8Linear</code>, cuBLASLt <code>torch._int_mm</code>, column-major B). Measured on the RTX 4050: the INT8 <code>mma</code> peaks at 88.2 TOPS against 44.1 for fp16
+(<code>benchmarks/mma_peak.cu</code>, the instruction LLVM 18 can emit, unlike FP8), cuBLASLt reaches 80-83 TOPS against 37-38 TFLOP/s (a row-major B silently falls to 24 TOPS), but whole-model prefill is
+0.90x (Qwen2.5-0.5B) and 1.07x (Llama-3.2-1B) of fp16 because the activation quantisation and the scale epilogue cost about as much as the saving; perplexity +0.33 to +0.41 on wikitext-2. A kernel generated by the
+compiler with those two fused is the open path to beat cuBLAS fp16 at prefill (about 1.8x for large layers by the arithmetic of the blog post); it is not built.</p>
+<p><strong>A compiler-generated INT8 GEMM (experimental).</strong> <code>quantforge.e2e.Int8Gemm</code> compiles <code>C[int32] = A[int8] @ Bt[int8]^T</code> through the existing pipeline onto the INT8 Tensor Cores
+(<code>mma.m16n8k32.s8</code>; options <code>thread-tile-k=32 smem-pad=16 accumulate=false</code>, <code>block-swizzle=16</code> for weights larger than the L2). Bit-exact against cuBLASLt for all 129 schedules of a sweep, 59-65 TOPS on large shapes
+(instruction peak 88, cuBLASLt 70-78) and <strong>1.1-1.7x cuBLAS fp16 on every shape tried</strong> (<code>benchmarks/int8_gemm_probe.py</code>). <code>Int8GemmDq</code> adds <code>epilogue=int8-dequant</code>: the dequantisation
+<code>y[f16] = (A @ Bt^T) * sx[m] * sw[n] + bias[n]</code> is folded into the GEMM's stores, <strong>one kernel, no int32 intermediate</strong> (bit-exact against the f32 reference; <strong>1.29-1.81x cuBLAS fp16 for the whole GEMM + dequantisation</strong>).
+<code>quantize_model(model, "int8_w8a8")</code> uses it (<code>INT8W8A8Linear</code>, per-token activation scale, per-channel weight scale): whole-model prefill of 2048 tokens is <strong>1.10x (Qwen2.5-0.5B), 1.18x (Llama-3.2-1B) and 1.20x (Qwen2.5-1.5B)</strong>
+of fp16 (the cuBLASLt route was 0.91-1.08x), wikitext-2 perplexity +0.33..0.41. The layer GEMMs are 1.46x faster; 28 % of the fp16 prefill is the element-wise ops of an eager Hugging Face model, the head stays fp16 and the activation quantisation costs 7.6 ms (profile in the blog). q/k/v and gate/up share one quantisation and one GEMM (1-3 %), and <code>silu(gate) * up</code> + the per-token quantisation of <code>down_proj</code>'s input is one compiled function (<code>_silu_mul_quantize</code>; perplexity unchanged to 0.01): 8-14 % faster than without it; the RMSNorm in front of q/k/v and gate/up also quantises its own output (one compiled function returns the fp16 output and the int8 values + scales, <code>_install_norm_quantisation</code>; 5-10 % more). Whole-model prefill of the three models: <strong>1.37x / 1.46x / 1.49x of eager fp16</strong> (90.0 / 184.6 / 239.7 ms), or <strong>1.28x / 1.34x / 1.43x of fp16 with compiled RMSNorms</strong> (84.3 / 169.6 / 229.1 ms: compiling the norms alone is worth 4-9 % for fp16 too, so that is the fairer baseline); perplexity unchanged (+0.006 at most). <code>block-swizzle=8</code> only pays for a weight larger than the L2 (2.3x there, 12-14 % slower below). It
+needed an integer extension-folding pattern in the vectorization pass, the <code>thread-tile-k</code> option, an i32-aware overwrite pass, a fix to the shared-memory promotion pass (a transposed B tile was only recognised when block N equalled
+block M: half the output or more was wrong for the other block shapes; the sweep that compared every result with cuBLASLt found it) and the new epilogue kind.</p>
+<p><strong>W4A8 (INT4 weights, INT8 activations, experimental).</strong> <code>quantize_model(model, "w4a8")</code> (<code>W4A8Linear</code>, kernel <code>quantforge.e2e.W4A8GemmDq</code>): QServe-style progressive quantisation (INT8 per channel, then INT4 per group of 128 with an
+<em>integer</em> scale and zero point), so the tensor cores get <code>(nibble - zero) * scale</code> as int8 built while the tile is staged, the accumulation is one int32 over K and the only float scale is the per-channel one of the <code>int8-dequant</code> store: one kernel,
+no compiler change (the weight is a <code>linalg.generic</code> the producer-fusion pass recomputes at the loads; <code>python/quantforge/PIPELINE.md</code>). Kernel: 1.30-1.48x cuBLAS fp16 and 1.45-2.20x the QuantForge W4A16 kernel at 2048 rows (55-63 TOPS), 6-21 % behind the INT8 kernel
+(<code>benchmarks/w4a8_gemm.py</code>). Whole-model prefill (2048 tokens, with the fused silu * up and norm quantisations below): 1.23x / 1.26x / 1.34x of fp16 with compiled norms for Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B (INT8: 1.30x / 1.33x / 1.43x; before the packed dequantisation pass 1.16x / 1.22x / 1.28x; 1.03x / 1.07x / 1.10x without the fusions) against 0.83x / 0.88x for INT4 W4A16, at INT4 quality (perplexity 23.7 / 22.1 against 22.9 / 22.3 for W4A16 RTN; 14.7 against 12.7 for fp16 on the 1.5B)
+and the smallest memory (0.47 / 1.05 / 1.19 GB against 1.01 / 2.48 / 3.10 for fp16). INT8 W8A8 is faster (1.37-1.49x of eager fp16) and closer to fp16 when the memory is affordable. On Qwen2.5-3B (about 6 GB in fp16: it does not fit this 5.6 GB card; set <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code>, fragmentation otherwise runs the benchmark out of memory) W4A8 prefill of 2048 tokens takes 356 ms in 2.07 GB against 498 ms in 2.25 GB for INT4 W4A16 (1.40x), INT8 W8A8 310 ms in 3.42 GB; wikitext-2 perplexity RTN / GPTQ: W4A8 13.47 / 12.54, INT4 W4A16 13.13 / 12.06, INT8 12.15. Prefill / large-batch format (fewer than 17 rows use a dequantised fp16 matmul); needs in/out features that are multiples of 128;
+<code>quantforge.gptq.quantize_model_gptq(model, ids, fmt="w4a8")</code> adds GPTQ (wikitext-2 perplexity, fp16 head, RTN -&gt; GPTQ: Qwen2.5-0.5B 23.7 -&gt; 21.1 (INT4 W4A16 GPTQ 20.5), Llama-3.2-1B 22.1 -&gt; 19.9 (20.2), Qwen2.5-1.5B 14.7 -&gt; 13.7 (13.4); <code>benchmarks/w4a8_gptq.py</code>; no act-order). The first version used a symmetric range and was 5 perplexity points worse than INT4: the group zero point matters (blog, update 5).</p>
+<h2 id="fp8-w8a8-on-the-ada-fp8-tensor-cores-a-negative-result-for-now">FP8 W8A8 on the Ada FP8 tensor cores (a negative result, for now)<a class="headerlink" href="#fp8-w8a8-on-the-ada-fp8-tensor-cores-a-negative-result-for-now" title="Permanent link">#</a></h2>
+<p><code>quantize_model(model, "fp8_w8a8")</code> replaces the Linears with <code>FP8W8A8Linear</code>: FP8 E4M3 weights <em>and</em> activations (per-output-channel weight scale, dynamic per-token
+activation scale) through <code>torch._scaled_mm</code> (cuBLASLt) on the FP8 tensor cores of sm_89, which are 1.9-2.1x faster than the fp16 ones for a bare GEMM on this card
+(72-77 against 37-38 TFLOP/s sustained; an earlier version of this document said 1.8-2.6x from an fp16 baseline measured before the GPU reached its sustained clocks). It is <strong>not</strong> generated by the QuantForge compiler (LLVM 18 cannot emit the FP8 <code>mma</code>). Quality is good
+(Qwen2.5-0.5B wikitext-2 perplexity 19.10 against 18.79 for fp16 and 22.91 for INT4 RTN; Llama-3.2-1B 18.13 against 17.91), but the <strong>speed is not</strong>: whole-model
+prefill of Qwen2.5-0.5B takes 117 ms for 1 x 2048 tokens against 108 ms in fp16 (0.92x; per-tensor scales: 103 ms, but 326 against 214 ms for 8 x 512), because the quantise /
+rescale passes around the GEMM cost as much as the GEMM saves at these layer sizes (<code>benchmarks/hf_fp8_w8a8.py</code>). Per layer the speed ranges from 0.35x to 1.5x of fp16
+depending on the shape. A speed-up would need the activation quantisation and the scale epilogue fused into the GEMM (a compiler job). Use it for the 2x smaller weights
+and the quality, not for speed.</p><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/05-gptq-and-checkpoints.html">Better 4-bit quality with GPTQ, loading real AWQ / GPTQ checkpoints, and a few traps</a></li><li><a href="../posts/07-fp8-tensor-cores.html">FP8 tensor cores on a laptop GPU: twice the speed on paper, no speed-up in a model</a></li></ul></aside><div class="pager"><a href="getting-started.html">&larr; Getting started</a><a href="pipeline.html">Compiler pipeline &rarr;</a></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

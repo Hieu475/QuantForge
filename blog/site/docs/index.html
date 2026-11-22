@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs - QuantForge Notes</title>
+<meta name="description" content="QuantForge documentation">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>QuantForge docs</h1><p>An MLIR-based generator of GPU kernels for <strong>weight-only quantized (W4A16) matrix
+multiplication</strong> — the INT4-weights × FP16-activations GEMM that dominates LLM
+inference. QuantForge lowers</p>
+<pre><code class="language-mlir">%w  = qf.unpack  %packed : tensor&lt;KxN/2xi8&gt; -&gt; tensor&lt;KxNxi8&gt;      // 2 INT4 per byte
+%wf = qf.dequant %w, %scale, %zp : ... -&gt; tensor&lt;KxNxf16&gt;
+%c  = linalg.matmul ins(%act, %wf) outs(%acc)
+</code></pre>
+<p>to a single PTX kernel that reads the <strong>packed</strong> weights from HBM, dequantizes
+them while staging tiles into shared memory, and feeds Tensor Cores
+(<code>mma.sync.m16n8k16</code> + <code>ldmatrix</code>), with <code>cp.async</code> + double buffering.</p>
+<blockquote>
+<p><strong>Status: research prototype (v0.0.x).</strong> W4A16 and W8A16 GEMM with per-tensor
+<strong>or group-wise</strong> scale / zero point (AWQ / GPTQ checkpoints can be repacked),
+a skinny-M <strong>decode</strong> schedule, an autotuner; static tile-aligned shapes in the
+compiler, NVIDIA sm_80+. See <a href="limitations.html#limitations">Limitations</a>.</p>
+</blockquote><p class="lede">The reference material of the repository, assembled from <code>README.md</code>, <code>python/quantforge/PIPELINE.md</code> and <code>CHANGELOG.md</code> every time the site is built. The docs are in English; the blog is also in Vietnamese.</p><ol class="posts"><li><a href="getting-started.html"><span class="pt">Getting started</span></a><p>Install, build, test, and the first calls.</p></li><li><a href="quantisation.html"><span class="pt">Quantisation formats</span></a><p>INT4, INT8, W8A8, GPTQ and the FP8 negative result.</p></li><li><a href="pipeline.html"><span class="pt">Compiler pipeline</span></a><p>The gpu pipeline: stages, options and constraints.</p></li><li><a href="kernels.html"><span class="pt">Kernels and measurements</span></a><p>What limits decode, small batch and prefill, with the numbers.</p></li><li><a href="int8-w4a8.html"><span class="pt">INT8 and W4A8 GEMM</span></a><p>Integer tensor cores: the int8-dequant epilogue and packed W4A8 dequantisation.</p></li><li><a href="runtime.html"><span class="pt">Runtime and PyTorch op</span></a><p>Host side, compile cache, row buckets and the launches around the GEMM.</p></li><li><a href="vllm.html"><span class="pt">vLLM plugin</span></a><p>INT4 and W4A8 inside vLLM: methods, env variables, checkpoints, results.</p></li><li><a href="results.html"><span class="pt">Results</span></a><p>The measured numbers: GPU, date and method are in each table.</p></li><li><a href="limitations.html"><span class="pt">Limitations and layout</span></a><p>What does not work yet, and where things live in the repository.</p></li><li><a href="changelog.html"><span class="pt">Changelog</span></a><p>Release notes.</p></li></ol></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

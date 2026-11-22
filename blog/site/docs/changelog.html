@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog - Docs - QuantForge Notes</title>
+<meta name="description" content="Release notes.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/index.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<div class="docs"><nav class="side"><details><summary>Documentation</summary><ul><li><a href="getting-started.html">Getting started</a></li><li><a href="quantisation.html">Quantisation formats</a></li><li><a href="pipeline.html">Compiler pipeline</a></li><li><a href="kernels.html">Kernels and measurements</a></li><li><a href="int8-w4a8.html">INT8 and W4A8 GEMM</a></li><li><a href="runtime.html">Runtime and PyTorch op</a></li><li><a href="vllm.html">vLLM plugin</a></li><li><a href="results.html">Results</a></li><li><a href="limitations.html">Limitations and layout</a></li><li class=cur><a href="changelog.html">Changelog</a></li></ul></details><script>if(innerWidth>800)document.querySelector(".side details").open=true</script></nav><article class="post"><h1>Changelog</h1><p class="lede">Release notes.</p><p class="meta">From <a href="https://github.com/Hieu475/QuantForge/blob/main/CHANGELOG.md">CHANGELOG.md</a></p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#unreleased">Unreleased</a></li>
+<li><a href="#030-2026-11-21">0.3.0 (2026-11-21)</a></li>
+<li><a href="#020-2026-11-20">0.2.0 (2026-11-20)</a></li>
+<li><a href="#010">0.1.0</a></li>
+</ul>
+</div>
+</details><h2 id="unreleased">Unreleased<a class="headerlink" href="#unreleased" title="Permanent link">#</a></h2>
+<ul>
+<li>
+<p><code>valid-rows</code> for the one-copy W4A8 decode kernel too (<code>W4A8DecodeGemm.build(valid_rows=)</code>): no padded copy at M = 1, 2, 4, 8. Compact mode decode 269 / 3928 (0.5B), 115 / 1719 (1.5B), 69 / 1029 (3B) at 1 / 16 requests, 0.82-0.91x of Marlin.</p>
+</li>
+<li>
+<p><code>valid-rows=R</code> (<code>quantforge-gpu-pipeline</code>, <code>quantforge-smem-promotion</code>, <code>quantforge-fuse-epilogue</code>): a kernel compiled for a 16-row tile serves an <code>[R, K]</code> activation tensor without a padded copy (cp.async zero-fill, stores of the missing rows skipped). The C++ op uses it for M = 1, 2, 4, 8: the unfolded INT4 layers are ONE kernel per decode call (qkv 5.4 us at M = 1, Marlin 6.4; gate / up 19.6 against 27.3 with warm weights). <code>QUANTFORGE_NO_VALID_ROWS=1</code> turns it off. vLLM decode vs Marlin: 0.5B 0.95 / 0.95 / 0.92 / 0.88, 1.5B 0.91 / 0.88 / 0.86 / 0.81 at 1 / 4 / 16 / 64 requests.</p>
+</li>
+<li>
+<p><code>epilogue=f16-store</code> (<code>quantforge-fuse-epilogue</code>, the <code>int8-dequant</code> machinery for an f32 accumulator; <code>e2e.W4A16GemmF16</code>): the INT4 GEMM writes f16 (+ f16 bias) itself. The C++ op uses it for plain GEMMs (no activation, INT4 group-wise): 2 kernels per decode call instead of 3-5 (qkv with bias 10.7 -&gt; 6.5 us, Marlin 6.4), no f32 buffer; the other layouts use <code>kfold_reduce</code> for the bias + conversion. <code>QUANTFORGE_NO_F16STORE=1</code> turns it off. vLLM, QuantForge / Marlin decode on Qwen2.5-1.5B 0.74-0.87 -&gt; 0.81-0.91, plugin prefill 20.6k -&gt; 28.0k tokens/s; the W4A8 compact decode kernel uses it too (264 / 3952 on the 0.5B).</p>
+</li>
+<li>
+<p>Checked <code>quantforge_w4a8</code> (online and checkpoint, hybrid and compact) on vLLM 0.34.0 / torch 2.14 in a separate venv: it works unchanged, 41 tests (slow ones included) pass; Qwen2.5-0.5B prefill 37370 tokens/s (Marlin 33998), decode 252 / 3911 (Marlin 300 / 4481).</p>
+</li>
+<li>
+<p>W4A8 checkpoints: <code>quantforge.w4a8_checkpoint.save_w4a8</code> (state dict of the quantised model + <code>quantization_config</code> in <code>config.json</code>), <code>benchmarks/make_w4a8_checkpoint.py</code> (GPTQ or round-to-nearest, CPU, layer by layer), and the vLLM method loads them (<code>QuantForgeW4A8Config.from_config</code> sees <code>quant_method: quantforge_w4a8</code>): Qwen2.5-3B with GPTQ weights loads in 2 s, 1.99 GiB, same speed as the online path, perplexity 12.54 against 13.47.</p>
+</li>
+<li>
+<p>W4A8: new nibble layout (<code>quant.pack_k8</code>: byte j of an 8-block holds elements j and j + 4) and a packed dequantisation pattern in <code>quantforge-vectorize-dequant</code> (32-bit word multiply by the scale + SWAR per-byte subtract of the zero point for the int8 prefill tile; <code>f16x2</code> magic numbers for the f16 decode tile; FileCheck <code>vectorize_dequant_w4a8.mlir</code>). Kernel 1.30-1.48x cuBLAS fp16 (was 1.19-1.40x), 55-63 TOPS; whole-model prefill vs fp16 with compiled norms 1.23x / 1.26x / 1.34x (was 1.16x / 1.22x / 1.28x). vLLM compact mode: prefill 36948 / 13273 / 6678 tokens/s on Qwen2.5-0.5B / 1.5B / 3B (1.12x / 1.15x / 1.15x of Marlin), decode 0.80-0.90x of Marlin. Breaking: W4A8 tensors made with the previous layout are not readable.</p>
+</li>
+<li>
+<p>vLLM W4A8: the fp16 weights of the layers to quantise are created on the CPU and moved to the GPU one module at a time by vLLM's <code>device_loading_context</code> while they are quantised, so a model larger than the GPU in fp16 loads: Qwen2.5-3B on the 5.6 GB card, compact mode, 2.01 GiB, prefill 6308 tokens/s (Marlin 5782), decode 61 / 935 at 1 / 16 requests (Marlin 81 / 1201). <code>QUANTFORGE_W4A8_LOAD_ON_CPU=0</code> turns it off.</p>
+</li>
+<li>
+<p>vLLM W4A8: <code>QUANTFORGE_W4A8_DECODE=compact</code> keeps one copy of the nibbles (<code>e2e.W4A8DecodeGemm</code>: the decode reads the W4A8 layout through a fused producer, 1.1-1.7x slower than the W4A16 decode kernel): weights 1.13 GiB instead of 2.04 GiB (Qwen2.5-1.5B), decode 10-17 % lower at 1 request, 2-10 % at 16, prefill unchanged. <code>w4a8_hybrid</code> got a <code>scale_nk</code> argument. <code>benchmarks/w4a8_decode_layout.py</code>.</p>
+</li>
+<li>
+<p>vLLM: <code>quantization="quantforge_w4a8"</code> (<code>QuantForgeW4A8Config</code> / <code>QuantForgeW4A8Method</code>, <code>quantforge.w4a8_op</code>, op <code>quantforge::w4a8_hybrid</code>): an ordinary fp16 checkpoint is quantised to W4A8 online; above 16 rows the W4A8 kernel, below it the W4A16 decode kernels, from the same weight (weights kept in both layouts). vLLM 0.25.1, Qwen2.5-0.5B: prefill 33.3k tokens/s (fp16 31.8k, Marlin 32.9k, quantforge W4A16 20.6k), decode 257 / 3583 at 1 / 16 requests (Marlin 297 / 4230); 1.5B prefill 12.0k vs 11.5k Marlin. <code>benchmarks/vllm_prefill.py</code>, <code>test/E2E/test_w4a8_op.py</code>.</p>
+</li>
+<li>
+<p>Measured on Qwen2.5-3B (fp16 does not fit the 5.6 GB card): W4A8 prefill 356 ms / 2.07 GB, INT4 W4A16 498 ms / 2.25 GB, INT8 W8A8 310 ms / 3.42 GB; perplexity RTN / GPTQ W4A8 13.47 / 12.54, W4A16 13.13 / 12.06, INT8 12.15. <code>benchmarks/hf_fp8_w8a8.py</code> variant <code>int4_fphead</code>.</p>
+</li>
+<li>
+<p>INT8 W8A8 and W4A8: the RMSNorm in front of the shared q/k/v and gate/up layers quantises its own output (<code>_rmsnorm_quantize</code>, installed by <code>_fuse_int8(fuse_norm=True)</code>, matched on the identity of the tensor the norm returned): 5-10 % faster whole-model prefill. Against fp16 with compiled RMSNorms: INT8 1.28x / 1.34x / 1.43x, W4A8 1.16x / 1.22x / 1.28x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B); against eager fp16 1.37x / 1.46x / 1.49x and 1.24x / 1.33x / 1.34x. Perplexity unchanged.</p>
+</li>
+<li>
+<p>INT8 W8A8 and W4A8: <code>silu(gate) * up</code> and the per-token INT8 quantisation of the <code>down_proj</code> input are one compiled function (<code>_silu_mul_quantize</code>, installed on the MLP by <code>_fuse_int8</code>; <code>fuse_activation=False</code> turns it off): whole-model prefill 8-14 % faster than without it, INT8 1.22x / 1.28x / 1.36x of fp16, W4A8 1.21x / 1.16x / 1.24x (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), perplexity unchanged (+0.002..0.012).</p>
+</li>
+<li>
+<p>W4A8 kernel: the weight producer reads the packed byte / scale / zero point with <code>tensor.extract</code> and unsigned index arithmetic instead of affine <code>floordiv</code> maps, so the loads vectorise (<code>ld.global.u32</code>): kernel 1.19-1.40x cuBLAS fp16 (was 1.11-1.26x), 50-58 TOPS; whole-model prefill 1.03x / 1.07x / 1.10x of fp16 (was 1.01x / 1.07x / 1.04x).</p>
+</li>
+<li>
+<p>GPTQ for W4A8: <code>quantforge.gptq.gptq_quantize_weight_w4a8</code>, <code>quantize_model_gptq(..., fmt="w4a8")</code>, <code>quant.w4a8_group_params</code> (shared by RTN and GPTQ): perplexity 23.7 -&gt; 21.1 / 22.1 -&gt; 19.9 / 14.7 -&gt; 13.7 (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B), within 0.6 of INT4 W4A16 GPTQ. <code>benchmarks/w4a8_gptq.py</code>.</p>
+</li>
+<li>
+<p>W4A8: <code>quantize_model(model, "w4a8")</code> / <code>W4A8Linear</code> / <code>quantforge.e2e.W4A8GemmDq</code> / <code>quantforge.quant.w4a8_quantize</code>: INT4 weights (progressive quantisation: INT8 per channel, INT4 per group of 128 with an integer scale and zero point) and INT8 activations in ONE kernel,
+  the int8 weight built by a <code>linalg.generic</code> producer fused into the tile loads (no compiler change). Kernel 1.11-1.26x cuBLAS fp16, 1.37-1.87x QF W4A16; whole-model prefill 1.01x / 1.07x / 1.04x of fp16 (Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B) at INT4 quality, 2-2.6x less weight memory
+  than fp16. <code>benchmarks/w4a8_gemm.py</code>, <code>benchmarks/hf_fp8_w8a8.py</code> variant <code>w4a8</code>; <code>INT8W8A8Linear</code> gained <code>concat</code> / <code>_build_kernel</code> / <code>_launch</code> hooks (shared-input fusion works for both).</p>
+</li>
+<li>
+<p><code>epilogue=int8-dequant</code> (<code>quantforge-fuse-epilogue</code>) and <code>quantforge.e2e.Int8GemmDq</code>: INT8 GEMM + <code>* sx[m] * sw[n] + bias[n]</code> -&gt; f16 in ONE kernel with no int32 intermediate (1.29-1.81x cuBLAS fp16 for GEMM + dequantisation).
+  <code>INT8W8A8Linear</code> uses it by default (<code>backend="quantforge"</code>, <code>quantize_model(..., int8_backend=)</code>): whole-model prefill 1.10x / 1.18x / 1.20x of fp16 for Qwen2.5-0.5B / Llama-3.2-1B / Qwen2.5-1.5B (cuBLASLt route: 0.91-1.08x). q/k/v and gate/up share one activation quantisation and one GEMM (<code>_Int8Shared</code>, 1-3 %); <code>int8_gemm_swizzle</code>: block rastering only for weights larger than the L2.</p>
+</li>
+<li>
+<p>Experimental compiler-generated INT8 GEMM (<code>quantforge.e2e.Int8Gemm</code>, <code>benchmarks/int8_gemm_probe.py</code>): <code>mma.m16n8k32.s8</code> through the existing pipeline, bit-exact for 129 schedules, 59-65 TOPS on large shapes, 1.1-1.7x cuBLAS fp16.
+  Compiler: <code>arith.extsi</code> operands are folded into <code>vector.contract</code> (vectorization pass), new <code>thread-tile-k</code> pipeline option, <code>quantforge-overwrite-output</code> handles i32 accumulators; <code>quantforge-smem-promotion</code> recognises a transposed-B tile <code>[N-tile x K]</code> (48 of 180 block/warp combinations of the int8 GEMM gave wrong results before).</p>
+</li>
+<li>
+<p><code>INT8W8A8Linear</code> / <code>quantize_model(fmt="int8_w8a8")</code> (cuBLASLt <code>_int_mm</code>) and <code>benchmarks/mma_peak.cu</code>: INT8 <code>mma</code> is 2.00x fp16 in hardware (88.2 vs 44.1 TOPS), 80-83 TOPS through cuBLASLt with a column-major B, but 0.90-1.07x of fp16
+  for whole-model prefill; perplexity +0.33..0.41. Corrected the FP8 vs fp16 GEMM ratio to 1.9-2.1x (the fp16 baseline had been measured before the GPU reached its sustained clocks).</p>
+</li>
+<li>
+<p>Experimental <code>split-k=S</code> pipeline option (<code>quantforge-tiling{split-k=S}</code>, <code>quantforge-gpu-pipeline</code>): the K reduction cut over a third grid axis with partial results and a reduce kernel. Correct (FileCheck + numerical tests)
+  but off by default: faster only for long-K, narrow-N layers at 32 rows (14-23 %), slower for most shapes at 64 rows, behind K-folding at 16 rows. Results and diagnosis (<code>ncu</code>: Marlin uses 20 persistent blocks) in the blog and README.</p>
+</li>
+<li>
+<p>32 / 64-row schedules: 32 / 64-column blocks for N &lt;= 2048 (11-52 % faster at kernel level); <code>benchmarks/sweep_skinny_blocks.py</code>. K-fold: the epilogue (sum of the diagonal blocks + bias + f16) is one CUDA kernel
+  in the C++ runtime (<code>kfold_reduce.cu</code>, op <code>w4a16_gemm_kfold</code>), 3 kernels per folded call instead of 5-7. vLLM, QuantForge / Marlin: Qwen2.5-0.5B 0.87-0.96, 1.5B 0.74-0.87 at 1-64 requests.</p>
+</li>
+<li>
+<p>A failed build of the C++ runtime now says why in its warning (it used to be cut to the compiler command).</p>
+</li>
+<li>
+<p><code>docker/Dockerfile</code>: image with the compiler, torch and the package (optionally vLLM); <code>quantforge-doctor</code> and the torch op verified inside it with <code>--gpus all</code>.</p>
+</li>
+<li>vLLM plugin works on vLLM 0.24.0, 0.25.1 and 0.34.0 (fixes for 0.34: <code>use_batch_invariant</code>, the new <code>is_layer_skipped</code> keyword); the slow generation test now fails, instead of skipping, when only the plugin fails.</li>
+<li>vLLM plugin: needs vLLM &gt;= 0.24 (the <code>auto_gptq</code> / <code>auto_awq</code> classes it extends are in 0.24-0.34.0 and absent before); with an older or missing vLLM it now warns once
+  instead of registering nothing silently.</li>
+</ul>
+<h2 id="030-2026-11-21">0.3.0 (2026-11-21)<a class="headerlink" href="#030-2026-11-21" title="Permanent link">#</a></h2>
+<ul>
+<li>
+<p>The op processes inputs of more than 2048 rows in chunks (bounded f32 temporary: Qwen2.5-3B could not start under vLLM on a 6 GB card because of the 8192-token profiling pass). <code>QUANTFORGE_KFOLD_BUDGET_MB</code> caps the extra memory of K-folding.
+  Checked in vLLM: TinyLlama-1.1B act-order GPTQ (0.76-0.91 of Marlin), Qwen2.5-3B (0.87-0.88).</p>
+</li>
+<li>
+<p>vLLM plugin reads GPTQ 8-bit (<code>quant.from_gptq8</code>, act-order included) and AWQ 4-bit checkpoints; Qwen2.5-0.5B throughput vs the matching Marlin method: AWQ 0.81-0.89, GPTQ-Int8 0.85-0.93.</p>
+</li>
+<li>
+<p>Width-aware default schedules: <code>_decode_opts</code> (32 / 64-column blocks for N &lt;= 2048) and <code>_skinny_opts</code> (17..64 rows, shape dependent); <code>torch_ops.default_opts</code>
+  is shared with <code>benchmarks/compare_marlin.py</code> (its non-autotuned mode used an empty schedule for M &gt; 16, not the op's). vLLM, QuantForge / Marlin: 0.80-0.88 at 1-16 requests, 0.73-0.80 at 64.</p>
+</li>
+<li>
+<p><code>quantforge.kfold</code>: K-folding for long-K, narrow-N decode layers (<code>QuantLinear.enable_kfold()</code>, <code>nn.enable_kfold(model)</code>, <code>kfold=</code> in <code>quantize_model</code> / <code>load_quantized_checkpoint</code>,
+  on by default in the vLLM plugin): +9 % (Qwen2.5-0.5B) / +15 % (1.5B) vLLM throughput at 1-4 requests, ~0.85x of Marlin there.</p>
+</li>
+<li>
+<p>vLLM plugin (<code>quantization="quantforge"</code>, entry point <code>vllm.general_plugins</code>): GPTQ 4-bit checkpoints on the QuantForge kernels; 70-80 % of Marlin's
+  throughput on Qwen2.5-0.5B / 1.5B. <code>FP8W8A8Linear</code> / <code>quantize_model(fmt="fp8_w8a8")</code> (cuBLASLt FP8 tensor cores; quality good, no whole-model speed-up).</p>
+</li>
+<li>
+<p>GPTQ: calibration token norms are capped at 10x the median in the Hessian (<code>token_clip=10</code>), which removes a failure on models
+  with a massive-activation layer (Llama-3.2-1B: GPTQ was worse than RTN on the whole Wikitext-2 test split, 24.08 against 22.28;
+  now 20.21). A slow regression test (<code>test/E2E/test_gptq_real_model.py</code>, <code>QUANTFORGE_SLOW_TESTS=1</code>) guards the broken windows.</p>
+</li>
+<li>Decode: K tile 32 for 10240 &lt;= N &lt;= 12288 (1 x 4096 x 11008: 149.5 -&gt; 135.7 us, 0.93x Marlin); autotune candidates version 3.</li>
+<li>Benchmarks: <code>arc_eval.py</code>, <code>decode_repeat.py</code>, <code>kernel_repeat.py</code>, <code>ppl_per_window.py</code>; the comparison JSON is now
+  <code>compare_baselines_rtx4050_sm89.json</code>.</li>
+</ul>
+<h2 id="020-2026-11-20">0.2.0 (2026-11-20)<a class="headerlink" href="#020-2026-11-20" title="Permanent link">#</a></h2>
+<ul>
+<li><code>quantforge.nn</code>: <code>QuantLinear</code>, <code>quantize_model</code> (INT4 / INT8 / FP8, RTN), fused q/k/v and SiLU-gated MLP
+  (also Phi-3's stacked <code>gate_up_proj</code>), <code>load_quantized_checkpoint</code> for AWQ / GPTQ files (incl. act-order).</li>
+<li><code>quantforge.gptq</code>: sequential GPTQ producing the kernel layouts.</li>
+<li>FP8 (E4M3) weights (<code>qf.dequant {fp8}</code>, packed f16x2 dequantisation), W8A16 in the torch op.</li>
+<li>Prefill 3-stage schedule for large weights, 32- / 64-row skinny schedules, autotune cache versioning.</li>
+<li><code>quantforge-doctor</code>, <code>pyproject.toml</code> (installable), benchmarks: <code>compare_baselines.py</code> (gemlite, bitsandbytes),
+  <code>l2_residency_check.py</code>, <code>hf_gptq.py</code>, <code>hf_load_checkpoint.py</code>, <code>vllm_e2e.py</code>.</li>
+<li><strong>Correction:</strong> the decode speed against Marlin at 4096 x 4096 is 0.99-1.01x, not the 1.30x reported before (the
+  figure did not reproduce); the Marlin table was regenerated in one run.</li>
+</ul>
+<h2 id="010">0.1.0<a class="headerlink" href="#010" title="Permanent link">#</a></h2>
+<ul>
+<li>First end-to-end W4A16 pipeline (qf IR -&gt; PTX), torch op, AWQ / GPTQ repacking, autotuner.</li>
+</ul><div class="pager"><a href="limitations.html">&larr; Limitations and layout</a><span></span></div></article></div>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

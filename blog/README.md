@@ -13,6 +13,13 @@ python blog/build.py          # writes blog/site/ ; open blog/site/index.html in
 * Site title, author and the GitHub link live in `site.json` (leave `github_url` empty to hide the link).
 * `site/` is the complete output (it also contains `.nojekyll`, so GitHub Pages serves it as is).
 
+## Docs (`/docs/`)
+
+`docs.json` lists the documentation pages and, for each, the sections (by heading) of `README.md`,
+`python/quantforge/PIPELINE.md` and `CHANGELOG.md` it is made of. `build.py` extracts them (fence-aware, headings
+shifted, relative links pointed at GitHub, an unknown heading is a build error), so the reference text lives in one
+place only. Add a page or a section by editing `docs.json`. The docs are English only; the blog has both languages.
+
 ## Publishing on GitHub Pages
 
 Option A, a personal site at `https://<user>.github.io/`:
