@@ -131,7 +131,12 @@ struct FuseEpiloguePass
   /// f16-store (fMode): the same machinery for a GEMM with an f32 accumulator: y = f16(c + bias[n]) -- the f32 -> f16 conversion (and the bias
   /// add) of a plain W4A16 GEMM folded into its stores, so that the call is ONE kernel with no f32 buffer. Tags: quantforge.int8_bias
   /// (f16 or f32, optional) and quantforge.int8_out.
-  void runInt8Dequant(bool fMode = false) {
+  /// atomic-add (atomic mode, implies fMode): the GEMM is split along K (`split-k=S`): every block of the K grid axis holds a partial
+  /// result [m, n] in the partial buffer P[z, m, n]. Instead of storing it there (and running a second kernel that adds the S slices), each
+  /// accumulator pair is added with red.global.add.f32 to the f32 output argument (tagged quantforge.int8_out, initialised by the caller: zeros,
+  /// or a value to accumulate onto). P, its allocation and the reduce kernel disappear: one kernel, no scratch buffer (so it can be captured
+  /// in a CUDA graph). The summation order across the K slices is not deterministic (float rounding differs by ~1 ulp from run to run).
+  void runInt8Dequant(bool fMode = false, bool atomic = false) {
     func::FuncOp func = getOperation();
     Value sx, sw, bias, out;
     for (unsigned i = 0; i < func.getNumArguments(); ++i) {
@@ -139,6 +144,13 @@ struct FuseEpiloguePass
       if (func.getArgAttr(i, "quantforge.int8_col_scale")) sw = func.getArgument(i);
       if (func.getArgAttr(i, "quantforge.int8_bias")) bias = func.getArgument(i);
       if (func.getArgAttr(i, "quantforge.int8_out")) out = func.getArgument(i);
+    }
+    if (atomic) {
+      auto ot = out ? dyn_cast<MemRefType>(out.getType()) : MemRefType();
+      if (!ot || ot.getRank() != 2 || !ot.getElementType().isF32()) {
+        func.emitError("epilogue=atomic-add needs a function argument tagged quantforge.int8_out that is a rank-2 f32 memref");
+        return signalPassFailure();
+      }
     }
     if (!out || (!fMode && (!sx || !sw))) {
       func.emitError("epilogue=int8-dequant / f16-store needs function arguments tagged quantforge.int8_row_scale, "
@@ -178,8 +190,20 @@ struct FuseEpiloguePass
             sv.emitError("int8-dequant epilogue needs unit strides");
             return signalPassFailure();
           }
-        row = b.create<arith::AddIOp>(loc, row, getValueOrCreateConstantIndexOp(b, loc, offs[0]));
-        col = b.create<arith::AddIOp>(loc, col, getValueOrCreateConstantIndexOp(b, loc, offs[1]));
+        // A rank-reducing subview (the tile P[z, m0:m0+16, n0:n0+64] of the split-K partial buffer, seen as a [16, 64] view) drops unit
+        // dimensions: the offsets of the kept dimensions are the row / column offsets, the dropped one (z) selects a slice that all
+        // slices of the atomic epilogue share.
+        llvm::SmallBitVector dropped = sv.getDroppedDims();
+        SmallVector<OpFoldResult> kept;
+        for (unsigned d = 0; d < offs.size(); ++d)
+          if (!dropped[d])
+            kept.push_back(offs[d]);
+        if (kept.size() != 2 || (dropped.any() && !atomic)) {
+          sv.emitError("int8-dequant / f16-store epilogue needs rank-2 subviews of the output");
+          return signalPassFailure();
+        }
+        row = b.create<arith::AddIOp>(loc, row, getValueOrCreateConstantIndexOp(b, loc, kept[0]));
+        col = b.create<arith::AddIOp>(loc, col, getValueOrCreateConstantIndexOp(b, loc, kept[1]));
         memref = sv.getSource();
       }
       if (cRoot && cRoot != memref) {
@@ -189,6 +213,31 @@ struct FuseEpiloguePass
       cRoot = memref;
       Type f32 = b.getF32Type(), f16 = b.getF16Type();
       Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+      if (atomic) {
+        auto outTy = cast<MemRefType>(out.getType());
+        Type i64 = b.getI64Type();
+        Value baseIdx = b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, out);
+        Value ld = b.create<arith::ConstantIndexOp>(loc, outTy.getDimSize(1));
+        Value four = b.create<arith::ConstantIndexOp>(loc, 4);
+        if (validRows > 0) {
+          Value inside = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row,
+                                                 b.create<arith::ConstantIndexOp>(loc, validRows));
+          auto guard = b.create<scf::IfOp>(loc, inside, /*withElseRegion=*/false);
+          b.setInsertionPointToStart(guard.thenBlock());
+        }
+        for (int64_t k = 0; k < 2; ++k) {
+          Value ck = k ? b.create<arith::AddIOp>(loc, col, one).getResult() : col;
+          Value e = b.create<vector::ExtractOp>(loc, st.getValueToStore(), ArrayRef<int64_t>{k});
+          Value off = b.create<arith::MulIOp>(loc, b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, row, ld), ck), four);
+          Value addr = b.create<arith::IndexCastOp>(loc, i64, b.create<arith::AddIOp>(loc, baseIdx, off));
+          b.create<LLVM::InlineAsmOp>(loc, /*resultTypes=*/TypeRange{}, /*operands=*/ValueRange{addr, e},
+                                      "red.global.add.f32 [$0], $1;", "l,f", /*has_side_effects=*/true, /*is_align_stack=*/false,
+                                      LLVM::AsmDialectAttr::get(b.getContext(), LLVM::AsmDialect::AD_ATT),
+                                      /*operand_attrs=*/ArrayAttr());
+        }
+        st->erase();
+        continue;
+      }
       Value rs = fMode ? Value() : b.create<memref::LoadOp>(loc, sx, ValueRange{row});
       Value res = b.create<arith::ConstantOp>(loc, DenseElementsAttr::get(VectorType::get({2}, f16), b.getF16FloatAttr(0.0f)));
       for (int64_t k = 0; k < 2; ++k) {
@@ -297,15 +346,17 @@ struct FuseEpiloguePass
   void runOnOperation() override {
     if (kind == "none" || kind.empty())
       return;
-    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu" && kind != "int8-dequant" && kind != "f16-store") {
+    if (kind != "relu" && kind != "silu" && kind != "gelu" && kind != "swiglu" && kind != "int8-dequant" && kind != "f16-store" && kind != "atomic-add") {
       getOperation().emitError("quantforge-fuse-epilogue: unknown kind '")
-          << kind << "' (relu | silu | gelu | swiglu | int8-dequant | f16-store)";
+          << kind << "' (relu | silu | gelu | swiglu | int8-dequant | f16-store | atomic-add)";
       return signalPassFailure();
     }
     if (kind == "int8-dequant")
       return runInt8Dequant();
     if (kind == "f16-store")
       return runInt8Dequant(true);
+    if (kind == "atomic-add")
+      return runInt8Dequant(true, true);
     SmallVector<Operation *> stores;
     getOperation().walk([&](gpu::LaunchOp launch) {
       launch.walk([&](Operation *op) {

@@ -106,6 +106,11 @@ inline Desc2 describe(const at::Tensor &t) {
 
 inline bool aligned16(const at::Tensor &t) { return (reinterpret_cast<uintptr_t>(t.data_ptr()) & 15) == 0; }
 
+inline bool cpp_no_atomic() {
+  static const bool off = std::getenv("QUANTFORGE_NO_ATOMIC") != nullptr;
+  return off;
+}
+
 inline bool cpp_no_f16store() {
   static const bool off = std::getenv("QUANTFORGE_NO_F16STORE") != nullptr;
   return off;
@@ -172,6 +177,25 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
   if (!k.hot || !aligned16(x2) || !aligned16(pk) || !aligned16(scale) || !aligned16(zero) ||
       !pk.is_contiguous() || !scale.is_contiguous() || !zero.is_contiguous())
     return call_fallback(x, packed, scale, zero, group_size, bias, activation);
+
+  // Long-K narrow-N layers (down_proj, o_proj), 1..16 rows: K split over blocks that add their partial results atomically to a zeroed f32 buffer
+  // (atomic_plan.py decides per shape; not hot = keep the plain kernel), then one kernel converts to f16 (+ bias). No weight copy, any row count.
+  if (post && bits == 4 && group_size > 0 && M <= 16 && !cpp_no_atomic()) {
+    Kernel ka = lookup(M, K, N, group_size, x.device().index(), "atomic", true, 4);
+    if (ka.hot && ka.fn) {
+      at::Tensor act = (ka.Mp == M) ? x2 : padded_activations(x2, ka.Mp);
+      at::Tensor acc = at::zeros({16, N}, x.options().dtype(at::kFloat));
+      Desc2 a0 = describe(act), a1 = describe(pk), a2 = describe(scale), a3 = describe(zero), a4 = describe(acc), resa{};
+      ka.set_stream(c10::cuda::getCurrentCUDAStream(x.device().index()).stream());
+      ka.fn(&resa, &a0, &a1, &a2, &a3, &a4, nullptr);
+      c10::optional<at::Tensor> ba;
+      if (bias.has_value())
+        ba = bias->scalar_type() == at::kHalf ? *bias : bias->to(at::kHalf);
+      std::vector<int64_t> shapea(x.sizes().begin(), x.sizes().end());
+      shapea.back() = N;
+      return kfold_reduce_cuda(acc, M, 1, N, ba).reshape(shapea);
+    }
+  }
 
   // INT4, group-wise, no activation: the kernel with the f16-store epilogue writes the f16 result (+ bias) itself, one kernel, no f32 buffer.
   // `lookup` returns hot = false when that kernel cannot be built for the shape (then the f32 path below runs).

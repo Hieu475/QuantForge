@@ -549,3 +549,58 @@ def test_kfold_call_reads_only_its_own_rows_and_is_two_kernels(rows):
         call()
         torch.cuda.synchronize()
     assert len([e for e in p.events() if e.device_time > 0]) == 2
+
+
+@pytest.mark.parametrize("rows", [16, 3])
+def test_atomic_split_k_kernel(rows):
+    """`W4A16GemmAtomic`: the K reduction is split over blocks that add their partial results with red.global.add.f32 (one kernel, no partial
+    buffer). The result is added onto whatever `out` held; rows past `valid_rows` are never touched."""
+    _require_gpu()
+    from quantforge import quant
+    from quantforge.e2e import W4A16GemmAtomic
+
+    K, N, G, S = 2048, 128, 128, 4
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.05
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    opts = "decode=true block-tile-n=64 warp-tile-n=16 block-tile-k=128 smem-stages=1 prefetch-distance=1"
+    k = W4A16GemmAtomic.build(16, K, N, G, S, pipeline_opts=opts, valid_rows=rows if rows < 16 else 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    init = torch.randn(16, N, device="cuda", generator=g)
+    out = init.clone()
+    k.launch(x, packed, s, z, out)
+    torch.cuda.synchronize()
+    ref = init.clone()
+    ref[:rows] += x.float() @ deq
+    assert torch.allclose(out, ref, atol=2e-2, rtol=2e-2)
+    assert torch.equal(out[rows:], init[rows:])
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8, 16])
+def test_atomic_op_matches_the_plain_path(rows):
+    """The op takes the atomic split-K path for a long-K narrow layer (here 8960 x 1536, where it measures faster on the RTX 4050) at any 1..16
+    rows, also when the activation rows sit in a buffer whose neighbours are NaN; the result matches the dequantised reference."""
+    _require_gpu()
+    import quantforge.torch_ops as qt
+    from quantforge import atomic_plan, quant
+
+    if qt._cpp is None:
+        pytest.skip("needs the C++ runtime")
+    K, N, G = 8960, 1536, 128
+    if atomic_plan.plan_atomic(K, N, G) is None:
+        pytest.skip("the planner keeps the plain kernel for this shape on this GPU")
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(K, N, device="cuda", generator=g) * 0.02
+    q, s, z = quant.quantize_groupwise(w, G)
+    packed = quant.pack_int4(q)
+    deq = (q.float() - z.float().repeat_interleave(G, 0)) * s.float().repeat_interleave(G, 0)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.float16, generator=g)
+    buf = torch.full((rows + 16, K), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:rows] = x
+    b = torch.randn(N, device="cuda", dtype=torch.float16, generator=g)
+    y = torch.ops.quantforge.w4a16_gemm(buf[:rows], packed, s, z, G, b, "none")
+    ref = x.float() @ deq + b.float()
+    assert y.shape == (rows, N) and torch.isfinite(y).all()
+    assert (y.float() - ref).abs().max() < 0.05 * ref.abs().max().clamp(min=1.0)

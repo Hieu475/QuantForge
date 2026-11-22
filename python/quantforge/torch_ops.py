@@ -42,13 +42,16 @@ def _decode_opts(N: int) -> str:
     blocks): with 81 to 96 column blocks (N = 10240 .. 12288, e.g. the 11008-wide MLP of Llama-7B) the grid is only
     slightly larger than one wave of the 128-deep K tile, and a 32-deep tile (smaller shared memory per block, so all
     blocks are resident) is 8-12 % faster (1 x 4096 x 11008: 150 -> 135 us); from ~104 blocks up it loses again.
+    The same wave arithmetic gives a second band: 160 .. 200 column blocks (N = 20480 .. 25600, 32-deep tiles run in 2 waves of 96, the 128-deep
+    ones in 3 waves of 80): 10-14 % faster (2048 x 20480: 136.7 -> 124.3 us, 4096 x 24576: 328 -> 302 us; N = 8192 .. 9728 gains only 1-6 %, less than the padded
+    activation copy these kernels need, see `_kernel_f16`); 112 blocks (N = 14336) loses 14 % with the 32-deep tile and 224 (N = 28672) 4 %, so those stay at 128.
     Narrow outputs (N <= 2048) use 32 / 64 column blocks, as the autotuner picks for them. `set_autotune(True)` replaces the rule by
     a search."""
     if N <= 1152 and N % 32 == 0:       # narrow outputs need narrower blocks to fill 20 SMs (autotune winners; 4864 x 896: 49 -> 28 us)
         return "decode=true block-tile-n=32 warp-tile-n=8 block-tile-k=128 smem-stages=2"
     if N <= 2048 and N % 64 == 0:
         return "decode=true block-tile-n=64 warp-tile-n=16 block-tile-k=128 smem-stages=1 prefetch-distance=1"
-    bk = 32 if 10240 <= N <= 12288 else 128 if N >= 8192 else 64
+    bk = 32 if (10240 <= N <= 12288 or 20480 <= N <= 25600) else 128 if N >= 8192 else 64
     return f"decode=true block-tile-n=128 warp-tile-n=16 block-tile-k={bk} smem-stages=1 prefetch-distance=1"
 
 
@@ -215,6 +218,32 @@ def _kernel_fold(R: int, K: int, N: int, group_size: int, kind: int):
     return k
 
 
+_kernels_atomic: dict = {}
+
+
+def _kernel_atomic(M: int, K: int, N: int, group_size: int):
+    """The split-K kernel with in-kernel atomic reduction for M <= 16 rows (see `atomic_plan`), or a `_NoKernel` (not hot: the C++ op takes
+    the plain path). M in {1, 2, 4, 8}: exactly M rows (`valid-rows`) when the tile allows cp.async; otherwise a 16-row kernel on a padded copy."""
+    from . import atomic_plan
+    from .e2e import W4A16GemmAtomic
+
+    plan = atomic_plan.plan_atomic(K, N, group_size)
+    if plan is None:
+        return _NoKernel(16, -1, -1)
+    S, opts = plan
+    R = M if M in (1, 2, 4, 8) and atomic_plan.cp_async_ok(opts) and not os.environ.get("QUANTFORGE_NO_VALID_ROWS") else 16
+    key = (R, K, N, group_size)
+    k = _kernels_atomic.get(key)
+    if k is None:
+        with _lock:
+            k = _kernels_atomic.get(key)
+            if k is None:
+                k = W4A16GemmAtomic.build(16, K, N, group_size, S, pipeline_opts=opts, valid_rows=R if R < 16 else 0)
+                k.Mp, k.Kp, k.Np = R, K, N
+                _kernels_atomic[key] = k
+    return k
+
+
 class _NoKernel:
     """Stands for a shape the f16-store kernel cannot serve (K or N not a multiple of its tile, autotune on): the C++ op then uses the f32 path."""
 
@@ -247,8 +276,15 @@ def _kernel_f16(M: int, K: int, N: int, group_size: int, has_bias: bool):
             if _autotune or (Kp, Np) != (K, N) or os.environ.get("QUANTFORGE_NO_F16STORE"):
                 k = _NoKernel(Mp, Kp, Np)
             else:
-                k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts, valid_rows=Mb if exact and Mb < Mp else 0)
-                k.Mp, k.Kp, k.Np = (Mb if exact and Mb < Mp else Mp), K, N
+                try:
+                    k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts, valid_rows=Mb if exact and Mb < Mp else 0)
+                    k.Mp, k.Kp, k.Np = (Mb if exact and Mb < Mp else Mp), K, N
+                except RuntimeError:
+                    if not (exact and Mb < Mp):
+                        raise
+                    # the schedule cannot zero-fill the activation tile with cp.async: the bucket's kernel on a padded copy
+                    k = W4A16GemmF16.build(Mp, K, N, group_size, bias=has_bias, pipeline_opts=opts)
+                    k.Mp, k.Kp, k.Np = Mp, K, N
             _kernels_f16[key] = k
     return k
 
@@ -321,6 +357,9 @@ def _load_cpp_runtime():
             addr = lambda f: (ctypes.cast(f, ctypes.c_void_p).value or 0) if f is not None else 0  # noqa: E731
             if activation in ("f16s", "f16sb"):               # the f16-store kernel (W4A16GemmF16)
                 k = _kernel_f16(M, K, N, group_size, activation == "f16sb")
+                return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
+            if activation == "atomic":                        # split-K with atomic reduction for long-K narrow layers (see atomic_plan)
+                k = _kernel_atomic(M, K, N, group_size)
                 return addr(k._fn), addr(k._set_stream), k.Mp, k.Kp, k.Np
             if activation == "foldvr":                        # K-folded GEMM: exact rows, no padded copy (see _kernel_fold)
                 k = _kernel_fold(M, K, N, group_size, kind)

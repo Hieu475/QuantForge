@@ -303,6 +303,20 @@ Constraints: `K / S` must be a multiple of `block-tile-k` and of the group size.
 but 14-23 % faster only for long-K, narrow-N layers at 32 rows, and slower for most shapes at 64 rows (second kernel, `S x M x N` extra floats, a device allocation per call that
 would break CUDA-graph capture). A useful version would reduce inside the kernel (atomics / semaphore) and take the scratch as an argument; see the blog post for the numbers.
 
+## Split-K with an in-kernel reduction (`epilogue=atomic-add`)
+
+`split-k=S epilogue=atomic-add` keeps the 3-D grid of split-K (`scf.forall (m, n, z)`, every block owns a K slice) but `quantforge-fuse-epilogue`
+turns the stores of the accumulator fragments into `red.global.add.f32` on the f32 output argument (tagged `quantforge.int8_out`, initialised by the
+caller). The partial buffer `P[S, M, N]`, its `gpu.alloc` and the reduce kernel are erased (a rank-reducing subview of `P` is read as a `[16, bn]` tile:
+the dropped `z` dimension is the slice, which all blocks share). One kernel, nothing allocated per call, so a CUDA graph can capture it. `valid-rows=R`
+guards the atomics of the missing rows. Float additions arrive in any order: results differ by an ulp from run to run.
+
+`e2e.W4A16GemmAtomic` wraps it; `atomic_plan.plan_atomic(K, N, group)` picks (S, tile) by measurement (cold weights, cached in the autotune cache) and
+only keeps the atomic kernel when kernel + memset + f32 -> f16 conversion (~1.5 us) take <= 88 % of the plain kernel: long-K narrow layers (K / N >= 2.5, N <= 2048).
+RTX 4050, 16 rows, cold weights: 8960 x 1536 60 -> 46 us (Marlin 41), 4864 x 896 26.7 -> 24.3 us (Marlin 15.5; K-folding reaches 18.8 at <= 8 rows), 1536 x 1536 and 896 x 896 no gain.
+Unlike K-folding it needs no second copy of the weights and serves every row count up to 16. The cost is the atomics themselves: the same
+4864 x 896 split in 2 takes 22.1 us with atomics against 18.3 with plain stores (K-folded).
+
 ## INT8 GEMM (experimental)
 
 `i8 x i8 -> i32` goes through the same pipeline as the W4A16 kernels (`linalg.matmul_transpose_b`, B as `[N, K]`: `ldmatrix` cannot transpose 8-bit data). What it needed:

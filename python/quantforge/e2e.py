@@ -936,6 +936,59 @@ func.func @{cls.NAME}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %
         self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
 
 
+class W4A16GemmAtomic:
+    """W4A16 GEMM for a skinny M (one 16-row tile) whose K reduction is split over ``split_k`` blocks that add their partial results with
+    ``red.global.add.f32`` to the f32 output (``epilogue=atomic-add``): ONE kernel, no partial buffer, no weight copy. The caller initialises ``out``
+    (zeros, or the value to accumulate onto) and converts it afterwards. Fills the GPU for the long-K, narrow-N layers (``down_proj``,
+    ``o_proj``) at any 1..16 rows, which K-folding (``kfold.py``, a second copy of the weights, M * S <= 16) cannot. The order of the float
+    additions varies from run to run. ``valid_rows`` R: the caller passes activations ``[R, K]`` (as for ``W4A16GemmF16``); ``out`` keeps 16 rows."""
+
+    NAME = "w4a16_gemm_atomic"
+
+    def __init__(self, M: int, K: int, N: int, compiled: Compiled, split_k: int):
+        self.M, self.K, self.N, self.split_k = M, K, N, split_k
+        self.compiled = compiled
+        self._lib = ctypes.CDLL(str(compiled.lib_path))
+        self._fn = getattr(self._lib, f"_mlir_ciface_{self.NAME}")
+        self._fn.argtypes = [ctypes.c_void_p] * 6
+        self._fn.restype = None
+        self._set_stream = self._lib.mgpuSetStream
+        self._set_stream.argtypes = [ctypes.c_void_p]
+        self._result = _descriptor_type(2)()
+
+    @classmethod
+    def build(cls, M: int, K: int, N: int, group_size: int = 128, split_k: int = 2, workdir=None, chip: str = "sm_80",
+              pipeline_opts: str = "", valid_rows: int = 0) -> "W4A16GemmAtomic":
+        _check_shape(M, K, N, tile_sizes(pipeline_opts))
+        if M > 16 or split_k < 2 or K % (split_k * group_size):
+            raise ValueError("W4A16GemmAtomic: M <= 16, split_k >= 2 and K a multiple of split_k * group_size")
+        if valid_rows:
+            if not 0 < valid_rows < M:
+                raise ValueError("valid_rows must satisfy 0 < valid_rows < M")
+            pipeline_opts = f"{pipeline_opts} valid-rows={valid_rows}".strip()
+        G = group_size
+        ir = f"""func.func @{cls.NAME}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %scale: tensor<{K // G}x{N}xf16>, %zp: tensor<{K // G}x{N}xi8>,
+                      %c: tensor<{M}x{N}xf32> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf32> {{
+  %w = qf.unpack %wp : tensor<{K}x{N // 2}xi8> -> tensor<{K}x{N}xi8>
+  %wf = qf.dequant %w, %scale, %zp : tensor<{K}x{N}xi8>, tensor<{K // G}x{N}xf16>, tensor<{K // G}x{N}xi8> -> tensor<{K}x{N}xf16>
+  %r = linalg.matmul ins(%act, %wf : tensor<{M}x{K}xf16>, tensor<{K}x{N}xf16>) outs(%c : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  return %r : tensor<{M}x{N}xf32>
+}}
+"""
+        import tempfile
+
+        opts = f"{pipeline_opts} split-k={split_k} epilogue=atomic-add".strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            return cls(M, K, N, compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=opts), split_k)
+
+    def launch(self, act, packed, scale, zero, out) -> None:
+        import torch
+
+        d = [_descriptor(t) for t in (act, packed, scale, zero, out)]
+        self._set_stream(_current_raw_stream(torch, act.device.index or 0))
+        self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
+
+
 class Int8GemmDq:
     """INT8 GEMM with the dequantisation fused into the store: ``y[f16] = (A @ Bt^T)[i32] * sx[m] * sw[n] + bias[n]`` (``epilogue=int8-dequant``).
 
