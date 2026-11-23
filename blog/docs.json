@@ -71,6 +71,7 @@
      "posts": [],
      "items": [
        {"src": "CHANGELOG.md", "heading": "Unreleased"},
+       {"src": "CHANGELOG.md", "heading": "0.4.0"},
        {"src": "CHANGELOG.md", "heading": "0.3.0"},
        {"src": "CHANGELOG.md", "heading": "0.2.0"},
        {"src": "CHANGELOG.md", "heading": "0.1.0"}]}
