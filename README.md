@@ -615,10 +615,12 @@ RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache
 | QuantForge | 195 tok/s | 799 | 1525 | 1778 |
 | ratio | **0.94** | **0.94** | **0.94** | 0.66 |
 
-The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). Where the 32-request gap comes from (nsys with CUDA-graph node tracing, 48 steps,
-both runs 98 % GPU-busy, so it is kernel time and not launch overhead): the GEMMs take 597 ms against 408 ms for Marlin's MoE + dense kernels. At 32 requests the router touches ~20 of the 64 experts per layer (measured in place), and a block grid that small streams
-the weights at ~127 GB/s (gate/up GEMM) where Marlin manages ~150; with all 64 experts active the same kernel reaches 148 GB/s on a ceiling of 164 GB/s (torch's `sum` over the same memory). Sweeping the grouped decode schedule (block 32..256 columns, warp tile, K tile 32..256, 1..3 stages, look-ahead 0..2, padding, sinking) found a plateau,
-so what is missing is overlap / more bytes in flight at few active experts, which needs a different kernel structure (B fragments straight from global memory), not another tile choice. Only this one model was run end to end;
+The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). The gap at 32 requests is **not** explained yet. What is known (nsys with CUDA-graph
+node tracing, 48 decode steps isolated by differencing two lengths, 32 requests): GPU kernel time per decode step is 17.8 ms against 14.2 ms for Marlin, the GEMMs 13.5 ms against 9.9 ms; the router touches ~27 active experts per layer (counted on the device inside the graph).
+In a micro-benchmark with the same 27 experts, cold weights, CUDA-graph replay and spread over a 2.7 GB model the whole MoE op (routing, both grouped GEMMs, combine) runs at 156 GB/s of expert bytes at 20, 27, 40 and 64 active experts (the read ceiling measured with `torch.sum` is 164 GB/s), i.e. 545 us per layer, 8.7 ms for 16 layers;
+inside vLLM the gate/up kernel is ~35 % slower than that while the down kernel matches. Schedule sweeps of the grouped kernels (block 32..256 columns, warp tile, K tile, stages, look-ahead) found nothing better than the rule; an earlier version of this paragraph blamed
+"148 GB/s" on the kernel, but that figure came from a sweep that flushed the L2 by writing (it inflates every time, see the CHANGELOG). Possible causes not yet tested: the eager execution of the MoE layers between vLLM's piecewise graphs, real routing skew (experts with more than 16 tokens run as several blocks).
+Only this one model was run end to end;
 `pack build` records the grouped kernels of any MoE config (Mixtral, Qwen-MoE, Qwen3-MoE shapes compile, they were not run). Shared experts (Qwen-MoE) go through the dense layers and were not tested.
 
 ### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
