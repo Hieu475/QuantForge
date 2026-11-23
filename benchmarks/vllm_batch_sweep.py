@@ -14,7 +14,7 @@ def main():
     name, quant = sys.argv[1], sys.argv[2]
     batches = [int(x) for x in (sys.argv[3].split(",") if len(sys.argv) > 3 else "1,4,16,64".split(","))]
     llm = LLM(model=name, quantization=quant, dtype="float16", gpu_memory_utilization=float(__import__("os").environ.get("QF_GPU_UTIL", "0.55")), max_model_len=1024,
-              enable_prefix_caching=False)
+              enable_prefix_caching=False, kv_cache_dtype=__import__("os").environ.get("QF_KV", "auto"))
     sp = SamplingParams(temperature=0.0, max_tokens=128, ignore_eos=True)
     prompts = [f"Explain topic number {i} of physics in one paragraph." for i in range(max(batches))]
     llm.generate(prompts[:max(batches)], sp)                     # warm-up (compiles every kernel bucket)

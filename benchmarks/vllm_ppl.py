@@ -37,7 +37,7 @@ def main():
     ids = tok(text).input_ids
     wins = [ids[i * a.len:(i + 1) * a.len] for i in range(min(a.windows, len(ids) // a.len))]
     llm = LLM(a.model, quantization=None if a.quant == "none" else a.quant, dtype="float16", gpu_memory_utilization=a.util,
-              max_model_len=a.len + 8, enable_prefix_caching=False, max_num_seqs=8, enforce_eager=bool(os.environ.get("EAGER")))
+              max_model_len=a.len + 8, enable_prefix_caching=False, max_num_seqs=8, enforce_eager=bool(os.environ.get("EAGER")), kv_cache_dtype=os.environ.get("QF_KV", "auto"))
     outs = llm.generate([{"prompt_token_ids": w} for w in wins], SamplingParams(max_tokens=1, prompt_logprobs=0, temperature=0.0))
     nll, n = 0.0, 0
     for w, o in zip(wins, outs):
