@@ -5,7 +5,7 @@
 PyTorch's caching allocator hides small overruns inside a 2 MiB segment; with the cache off every tensor is its own allocation and any read or write past its end
 is reported. The generated kernels issue look-ahead loads (prefetch-distance, pipelined stages): this is what shows whether one runs past the end of a tensor.
 (The torch-profiler based planners cannot run under the sanitizer: `kfold.plan_ksplit` is skipped, the atomic planner uses CUDA events and runs.)
-Expected: ERROR SUMMARY: 0 errors for all three.
+Modes: w4a16, w4a8, w4a8rot (Hadamard rotation), moe. Expected: ERROR SUMMARY: 0 errors for all of them (0.5.0: all four clean).
 """
 import sys, torch, warnings
 warnings.simplefilter("ignore")
@@ -42,6 +42,17 @@ elif which == "w4a8":
             x = torch.randn(M, K, device=dev, generator=g, dtype=torch.float32).half()
             w4a8_op._impl(x, p8, gs, zp, sw, b, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, snk)
         torch.cuda.synchronize(); print("w4a8", K, N, "ok", flush=True)
+elif which == "w4a8rot":                               # the Hadamard rotation: fused into the INT8 quantisation above 64 rows, a kernel of its own below
+    for K, N, bias in SH:
+        w = torch.randn(N, K, device=dev, generator=g) * 0.03
+        p8, gs, zp, sw = quant.w4a8_quantize(w4a8_op.rotate_weight(w))
+        e = torch.empty(0, device=dev, dtype=torch.float16); snk = (gs.float() * sw[:, None]).half()
+        b = torch.randn(N, device=dev, generator=g).half() if bias else None
+        for M in ROWS:
+            x = torch.randn(M, K, device=dev, generator=g, dtype=torch.float32).half()
+            w4a8_op._impl(x, p8, gs, zp, sw, b, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, snk, True)
+            w4a8_op.rotate(x)
+        torch.cuda.synchronize(); print("w4a8rot", K, N, "ok", flush=True)
 else:
     E, H, I, G, k = 8, 256, 256, 64, 2
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test" / "E2E"))
