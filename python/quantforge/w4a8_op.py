@@ -131,10 +131,33 @@ def _padded16(x2: torch.Tensor) -> torch.Tensor:
     return buf
 
 
-def _quantize_tokens(x2: torch.Tensor):
+def _quantize_tokens(x2: torch.Tensor, Mp: int = 0):
+    """Per-token INT8 quantisation of the activations, padded to `Mp` rows (zero rows, scale 0). One CUDA kernel of the C++ runtime (`runtime/act_quant.cu`) when it is loaded,
+    else the torch.compile'd function of nn.py plus padding copies; both give the same bits."""
+    M = x2.shape[0]
+    Mp = Mp or M
+    if _native_quant() and x2.is_contiguous() and x2.shape[1] % 16 == 0:
+        return torch.ops.quantforge.quantize_rows(x2, Mp)
     from .nn import _int8_quantize_tokens        # torch.compile'd (one fused kernel pair, dynamic shapes): compiled by the first big call, i.e.
     xq, s = _int8_quantize_tokens(x2)           # vLLM's profiling run, before any CUDA graph is captured
-    return xq, s.reshape(-1)
+    s = s.reshape(-1)
+    if Mp != M:
+        xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
+        s = torch.nn.functional.pad(s, (0, Mp - M))
+    return xq, s
+
+
+_NATIVE = None
+
+
+def _native_quant() -> bool:
+    """The `quantize_rows` op exists (the runtime is loaded and built from a source that has it) and `QUANTFORGE_NO_NATIVE_QUANT` is not set."""
+    global _NATIVE
+    if _NATIVE is None:
+        from . import torch_ops  # noqa: F401 - loads the runtime
+
+        _NATIVE = not os.environ.get("QUANTFORGE_NO_NATIVE_QUANT") and hasattr(torch.ops.quantforge, "quantize_rows")
+    return _NATIVE
 
 
 def _min_int8_rows() -> int:
@@ -196,10 +219,7 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
         k = _kernel(Mp, K, N, bias is not None, kmajor)
     except KernelUnavailable:
         return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
-    xq, s_x = _quantize_tokens(x2)
-    if Mp != M:                                                       # zero rows (scale 0) up to the bucket
-        xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
-        s_x = torch.nn.functional.pad(s_x, (0, Mp - M))
+    xq, s_x = _quantize_tokens(x2, Mp)                                # padded to the bucket: zero rows, scale 0
     y = torch.empty(Mp, N, device=x.device, dtype=torch.float16)
     k.launch(xq, p8, gk, zk, s_x.contiguous(), sw, None if bias is None else bias.float().contiguous(), y)
     return (y[:M] if Mp != M else y).reshape(*lead, N)

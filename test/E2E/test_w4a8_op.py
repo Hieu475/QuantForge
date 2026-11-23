@@ -164,3 +164,24 @@ def test_int8_plan_candidates_are_valid_and_plans_are_looked_up(tmp_path, monkey
     assert choice is None or choice in int8_plan.candidates(64, K, N)
     assert w4a8_op._int8_opts(64, K, N, kmajor=False) == rule             # the n-major layer keeps the rule
     assert w4a8_op._int8_opts(64, K, N, kmajor=True) == (choice or rule)
+
+
+@pytest.mark.parametrize("M,Mp,K", [(1, 1, 64), (5, 16, 128), (33, 64, 896), (64, 64, 1536), (100, 128, 4864)])
+def test_native_activation_quantisation_is_bit_identical_to_the_eager_torch_expression(M, Mp, K):
+    """`quantize_rows` (runtime/act_quant.cu) replaces `nn._int8_quantize_tokens` + the two padding copies: the int8 values and scales of the *eager* torch expression
+    (IEEE division, round half to even), zero rows past M. (The torch.compile'd version multiplies by a reciprocal: it differs by one step on exact .5 ties and in the last bit of a scale.)"""
+    _require_gpu()
+    from quantforge import w4a8_op
+    if not w4a8_op._native_quant():
+        pytest.skip("the C++ runtime has no quantize_rows op")
+    g = torch.Generator(device="cuda").manual_seed(M * 7 + K)
+    x = torch.randn(M, K, device="cuda", dtype=torch.float32, generator=g).mul(torch.rand(M, 1, device="cuda", generator=g) * 20).half()
+    x[0, :4] = 0                                                   # a quarter-step tie and zeros
+    if M > 2:
+        x[1] = 0                                                   # an all-zero row: the scale floor 1e-8
+    want_s = (x.abs().amax(dim=1, keepdim=True).float() / 127.0).clamp(min=1e-8)
+    want_q = (x.float() / want_s).round().clamp(-127, 127).to(torch.int8)
+    xq, sx = torch.ops.quantforge.quantize_rows(x, Mp)
+    assert xq.shape == (Mp, K) and sx.shape == (Mp,)
+    assert torch.equal(xq[:M], want_q) and torch.equal(sx[:M], want_s.reshape(-1))
+    assert not xq[M:].any() and not sx[M:].any()

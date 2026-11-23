@@ -286,19 +286,13 @@ namespace mlir
             registerLowerUnpackBranchFreePass();
             registerFuseUnpackDequantBranchFreePass();
             registerLowerUnpackToNVVMPass();
-            // Phase 3 optimization passes
             registerLowerUnpackToPRMTPass();
             registerRegisterLayoutAwareUnpackPass();
             registerCanonicalizeDequantZeroPointPass();
-            // Task 2.2: Tiling pass
             registerTilingPass();
-            // Task 2.3.1: Vectorization pass
             registerVectorizationPass();
-            // Phase 4: GPU hardware mapping
             registerGPUMappingPass();
-            // Task 3.2: PTX translation boundary
             registerLowerToNVVMPass();
-            // Task 4: Bufferization & Shared Memory Management
             registerQuantForgeBufferizePass();
             registerSharedMemoryPromotionPass();
             registerSwizzleLoadPass();

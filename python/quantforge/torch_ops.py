@@ -445,7 +445,7 @@ def _load_cpp_runtime():
             rt = Path(__file__).resolve().parent / "runtime"
             src = rt / "torch_runtime.cpp"
             cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-            ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu")], with_cuda=True,
+            ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu"), str(rt / "act_quant.cu")], with_cuda=True,
                                      extra_include_paths=[f"{cuda}/include"], verbose=False)
 
         def builder(M, K, N, group_size, device_index, activation, overwrite, kind):

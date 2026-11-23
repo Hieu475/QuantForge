@@ -295,7 +295,7 @@ def cmd_ext(a) -> None:
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", a.arch)
     rt = Path(__file__).resolve().parent / "runtime"
     with tempfile.TemporaryDirectory() as tmp:
-        cpp_extension.load(name="quantforge_rt", sources=[str(rt / "torch_runtime.cpp"), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu")], with_cuda=True,
+        cpp_extension.load(name="quantforge_rt", sources=[str(rt / "torch_runtime.cpp"), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu"), str(rt / "act_quant.cu")], with_cuda=True,
                            extra_include_paths=[f"{cuda}/include"], build_directory=tmp, verbose=False)
         shutil.copy2(Path(tmp) / "quantforge_rt.so", out / "quantforge_rt.so")
     print(f"{out / 'quantforge_rt.so'}  (TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}, torch {torch.__version__}, CUDA toolkit {cuda})")
