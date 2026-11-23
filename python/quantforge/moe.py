@@ -86,6 +86,8 @@ _lock = threading.RLock()
 
 def _row_tile(tokens: int, top_k: int, E: int) -> int:
     """Row tile of the grouped GEMMs: the average number of rows per expert decides how much padding a tile may waste."""
+    if os.environ.get("QUANTFORGE_MOE_ROWS"):              # experiments: force the row tile
+        return int(os.environ["QUANTFORGE_MOE_ROWS"])
     avg = tokens * top_k / E
     return 16 if avg <= 8 else 32 if avg <= 24 else 64 if avg <= 56 else 128
 
