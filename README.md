@@ -651,6 +651,19 @@ What the simulation says and a rotation of 128 does not: the damage done by the 
 depends on the block size without a clear rule (1.5B, W4 only: no rotation 13.512; blocks of 16 / 32 / 64 / 128 / 256: 13.550 / 13.710 / 13.184 / 13.600 / 13.540), so the block was fixed at 128, the group size of the kernels, rather than tuned on this model.
 `quantization="quantforge_w4a8"` rotates by default; `quantforge_w4a8_plain` is the old method (a different name because vLLM's compile cache is keyed by it, a switch that changes the graph must not be an environment variable);
 a rotated checkpoint says `"rotated": true` in its `quantization_config`. Not applicable to the GPTQ / AWQ W4A16 checkpoints of other people (their weights are not in the rotated basis).
+**Other models, and where the rotation hurts** (vLLM perplexity of the online round-to-nearest W4A8, wikitext-2, window 512; fp16 in the first column where the model fits the 6 GB card):
+
+| model | fp16 | no rotation (`_plain`) | rotated everywhere | rotated, early `down_proj` excluded (the default) |
+|---|--:|--:|--:|--:|
+| Qwen2.5-1.5B | 11.932 | 13.949 | 13.395 | **13.376** |
+| Qwen2.5-0.5B | 18.10 | 23.148 | 21.195 | 21.395 |
+| OLMo-2-0425-1B | 17.188 | 20.843 | 18.953 | 18.987 |
+| Phi-3.5-mini | - | 9.472 | 9.007 | **8.718** |
+| Llama-3.2-1B | 18.353 | 22.930 | 22.257 | **21.539** |
+| Llama-3.2-3B | - | 16.640 | **17.752** (worse) | 16.658 |
+
+The Llama-3.2-3B failure is one layer: the input of the `down_proj` of layer 1 has a token 530 times the median norm (a massive activation, the attention sink) and the rotation, which spreads that single channel over its block of 128, raises that layer's output error from 0.054 to 0.080 and the model's perplexity by 1.1 (rotating only that `down_proj` gives 17.71, rotating everything else 16.74). Nothing in the weights flags such a layer (column norms are ordinary), so the online method, which has no activations, leaves the `down_proj` of the first four decoder layers unrotated (`vllm_plugin._early_down_proj`): the six models above are the evidence for that rule, not a proof for other families. Quantising with GPTQ has calibration data, so there the decision is made per layer (`gptq._rotation_helps`: the output error of the rotated and the plain quantisation on a few tokens of every window, including the one of largest norm) and the layers that stay plain are listed in `config.json` (`unrotated_layers`; Llama-3.2-3B: layer 1 `down_proj` and layer 23 `o_proj`): GPTQ W4A8 of Llama-3.2-3B 16.537 plain, 16.377 with the per-layer decision.
+
 **Groups of 64** (`quantization="quantforge_w4a8_g64"` online, or `make_w4a8_checkpoint.py --group 64`, the checkpoint carries `"group_size": 64`): the integer group scale of the format (1..16) is its coarse part, and halving the group helps: Qwen2.5-1.5B online 13.395 -> **13.186**; GPTQ checkpoint 12.331 -> **12.253** (the calibrated weights gain less). The INT8 kernel pays 2-3 % for the doubled scale / zero-point traffic (vLLM, 1.5B GPTQ checkpoint, tokens/s at 1 / 16 / 64 / 128 / 256 requests: 131 / 1958 / 5727 / 7390 / 9114 for group 128 against 128 / 1909 / 5624 / 7270 / 8964 for group 64, Marlin 131-141 / 1933-2090 / 5439-5847 / 7043-7242 / 7796-7875 in the two runs, which are noisy). Group 128 stays the default; groups of 32 compile and are exact but cost 4-10 % (CHANGELOG).
 
 Measured on two Qwen2.5 sizes and OLMo-2 1B only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).

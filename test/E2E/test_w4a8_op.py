@@ -279,3 +279,21 @@ def test_group_64_hybrid_op_matches_the_dequantised_reference_and_checkpoint_rou
             tol = 0.012 if M <= 16 else 0.03                 # INT8 activations above 16 rows
             assert ((y.float() - ref).norm() / ref.norm()).item() < tol, (rot, M)
     assert w4a8_op.FALLBACKS == fb, "a fallback served the call: the group-64 kernel was not used"
+
+
+def test_rotation_decision_and_layer_names():
+    """`gptq._rotation_helps` rotates when a few channels are large in every token (what per-token INT8 suffers from); inputs that are shared (q/k/v, gate/up) are grouped,
+    and the checkpoint names the fused vLLM layers."""
+    _require_gpu()
+    from quantforge import gptq, w4a8_checkpoint
+
+    for seed in range(3):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        W = torch.randn(512, 1024, device="cuda", generator=g) * 0.04
+        X = torch.randn(256, 1024, device="cuda", generator=g)
+        X[:, :4] *= 30.0
+        assert gptq._rotation_helps([(W, X)], 128) is True
+    groups = gptq._rotation_groups({"self_attn.q_proj": 0, "self_attn.k_proj": 0, "self_attn.v_proj": 0, "self_attn.o_proj": 0, "mlp.gate_proj": 0, "mlp.up_proj": 0, "mlp.down_proj": 0})
+    assert groups == [["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], ["self_attn.o_proj"], ["mlp.gate_proj", "mlp.up_proj"], ["mlp.down_proj"]]
+    assert w4a8_checkpoint._vllm_name("model.layers.3.self_attn.k_proj") == "model.layers.3.self_attn.qkv_proj"
+    assert w4a8_checkpoint._vllm_name("model.layers.3.mlp.up_proj") == "model.layers.3.mlp.gate_up_proj"

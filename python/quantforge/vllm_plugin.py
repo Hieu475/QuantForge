@@ -372,6 +372,13 @@ if HAVE_VLLM:
                 layer.qf8_scale_nk, bool(getattr(layer, "qf_rot", False)))      # rotate: x H inside the op (fused with the INT8 quantisation above 64 rows)
             return y if x.dtype == torch.float16 else y.to(x.dtype)
 
+    def _early_down_proj(prefix: str) -> bool:
+        """Online quantisation has no calibration data to decide the rotation per layer, so the layers where LLMs put their massive activations stay unrotated: the `down_proj` of
+        the first four decoder layers (Llama-3.2-3B layer 1: one token has 500x the median norm and the rotation, which spreads that channel over its block, cost +1.1 perplexity)."""
+        import re
+
+        return re.search(r"layers\.[0-3]\.mlp\.down_proj$", prefix) is not None
+
     @register_quantization_config("quantforge_w4a8")
     class QuantForgeW4A8Config(QuantizationConfig):
         """W4A8: either an unquantised checkpoint quantised while loading (no quantization_config needed), or a checkpoint written by
@@ -381,8 +388,9 @@ if HAVE_VLLM:
 
         GROUP = 128                                    # online quantisation: `quantforge_w4a8_g64` uses 64
 
-        def __init__(self, checkpoint: bool = False, rotated: bool = False, group: int = 0) -> None:
+        def __init__(self, checkpoint: bool = False, rotated: bool = False, group: int = 0, unrotated: tuple = ()) -> None:
             super().__init__()
+            self.unrotated = frozenset(unrotated)             # checkpoint: layers whose calibration decided against the rotation (config.json "unrotated_layers")
             self.checkpoint = checkpoint
             self.group = group or self.GROUP               # checkpoint: config.json "group_size"
             self.rotated = rotated                     # checkpoint: its weights were quantised after the rotation (config.json: "rotated": true)
@@ -406,10 +414,10 @@ if HAVE_VLLM:
         @classmethod
         def from_config(cls, config):
             return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8", rotated=bool(config.get("rotated", False)),
-                       group=int(config.get("group_size", 128)))
+                       group=int(config.get("group_size", 128)), unrotated=tuple(config.get("unrotated_layers", ())))
 
         def get_quant_method(self, layer, prefix):
-            return QuantForgeW4A8Method(self.checkpoint, self.rotated if self.checkpoint else self.ROTATE, self.group) if isinstance(layer, LinearBase) else None
+            return QuantForgeW4A8Method(self.checkpoint, (self.rotated and prefix not in self.unrotated) if self.checkpoint else self.ROTATE and not _early_down_proj(prefix), self.group) if isinstance(layer, LinearBase) else None
 
     @register_quantization_config("quantforge_w4a8_plain")
     class QuantForgeW4A8PlainConfig(QuantForgeW4A8Config):

@@ -106,6 +106,39 @@ def rotate_hessian(H: torch.Tensor, block: int = 128) -> torch.Tensor:
     return torch.einsum("pi,apbq,qj->aibj", Hm, H.float().reshape(n, block, n, block), Hm).reshape(H.shape)
 
 
+def _rotation_groups(targets: dict) -> list:
+    """Linears that share one input (q / k / v; gate / up) must agree on the rotation: lists of names, in `targets` order."""
+    groups, seen = [], {}
+    for n in targets:
+        key = n.replace("q_proj", "qkv").replace("k_proj", "qkv").replace("v_proj", "qkv").replace("gate_proj", "gate_up").replace("up_proj", "gate_up")
+        if key in seen:
+            groups[seen[key]].append(n)
+        else:
+            seen[key] = len(groups)
+            groups.append([n])
+    return groups
+
+
+@torch.no_grad()
+def _rotation_helps(members: list, group_size: int) -> bool:
+    """True when quantising `members` ([(weight [N, K], sample tokens [T, K])]) in the rotated basis gives the smaller output error on the sample tokens (round-to-nearest 4-bit
+    weights, per-token INT8 activations, squared error summed over the members). The sample holds the token of largest norm of every calibration window: a layer whose input has a
+    massive-activation token (Llama-3 `down_proj` of layer 1: 500x the median norm) is worse rotated, the rotation spreads that one channel over its whole block."""
+    from .w4a8_op import hadamard_matrix, rotate_weight
+
+    err = {False: 0.0, True: 0.0}
+    for W, X in members:
+        W, X = W.float(), X.float()
+        ref = X @ W.t()
+        for rot in (False, True):
+            Wq = quant.w4a8_dequantize(*quant.w4a8_quantize(rotate_weight(W) if rot else W, group_size), group_size)
+            Xr = (X.reshape(X.shape[0], -1, 128) @ hadamard_matrix(128, X.device)).reshape(X.shape) if rot else X
+            sx = (Xr.abs().amax(-1, keepdim=True) / 127).clamp_min(1e-8)
+            Xq = (Xr / sx).round().clamp(-127, 127) * sx
+            err[rot] += (Xq.half().float() @ Wq.t() - ref).square().sum().item()
+    return err[True] <= err[False]
+
+
 def gptq_quantize_weight_w4a8(W: torch.Tensor, H: torch.Tensor, group_size: int = 128, blocksize: int = 128, damp: float = 0.01):
     """GPTQ for the W4A8 format (``quant.w4a8_quantize``): the weight is divided by its per-channel scale (taken from the original
     weight, as round-to-nearest does) so that it lives in int8 steps, and every group of `group_size` columns gets an integer scale
@@ -264,11 +297,15 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
         hess = {n: torch.zeros(m.in_features, m.in_features, device=device) for n, m in targets.items()}
 
         ratio = {}                              # largest token norm / median token norm seen at each Linear input
+        samples = {n: [] for n in targets} if (rotate and fmt == "w4a8") else None     # a few tokens of every window (the two of largest norm, four random) for the rotation decision
 
         def make_hook(n):
             def hook(_, args):
                 x = args[0].reshape(-1, args[0].shape[-1]).float()
                 nrm = x.norm(dim=1)
+                if samples is not None:
+                    pick = torch.cat([nrm.topk(min(2, nrm.numel())).indices, torch.randint(0, nrm.numel(), (4,), device=x.device)])
+                    samples[n].append(x[pick].detach().clone())
                 ratio[n] = max(ratio.get(n, 0.0), (nrm.max() / nrm.median().clamp(min=1e-6)).item())
                 if token_clip > 0:
                     cap = token_clip * nrm.median().clamp(min=1e-6)
@@ -284,25 +321,35 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
         for h in handles:
             h.remove()
         rtn_set = set(rtn)
+        rot_here = {n: rotate for n in targets}
+        if samples is not None:
+            for grp in _rotation_groups(targets):
+                use = _rotation_helps([(targets[n].weight.data.to(device), torch.cat(samples[n])) for n in grp], group_size)
+                for n in grp:
+                    rot_here[n] = use
+                    if not use:
+                        stats.setdefault("unrotated", []).extend(f"{li}.{n}" for n in grp)
+            del samples
         for n, m in targets.items():
+            rotate_n = rot_here[n]
             if fmt == "w4a8":
                 if m.in_features % 128 or m.out_features % 128:
                     continue                                    # stays dense (the kernel needs multiples of 128)
                 from .w4a8_op import rotate_weight
 
                 if f"{li}.{n}" in rtn_set:
-                    if rotate:
+                    if rotate_n:
                         packed, gs, zp, sw = quant.w4a8_quantize(rotate_weight(m.weight.data.to(device)), group_size)
                         ql = W4A8Linear(packed, gs, zp, sw, None if m.bias is None else m.bias.data.to(device, torch.float16))
                     else:
                         ql = W4A8Linear.from_linear(m, device, group=group_size)
                 else:
                     W = m.weight.data.to(device)
-                    packed, gs, zp, sw = (gptq_quantize_weight_w4a8(rotate_weight(W), rotate_hessian(hess[n]), group_size, blocksize, damp) if rotate
+                    packed, gs, zp, sw = (gptq_quantize_weight_w4a8(rotate_weight(W), rotate_hessian(hess[n]), group_size, blocksize, damp) if rotate_n
                                           else gptq_quantize_weight_w4a8(W, hess[n], group_size, blocksize, damp))
                     bias = None if m.bias is None else m.bias.data.to(device, torch.float16)
                     ql = W4A8Linear(packed, gs, zp, sw, bias)
-                ql.rotate = rotate
+                ql.rotate = rotate_n
                 parent = layer.get_submodule(n.rsplit(".", 1)[0]) if "." in n else layer
                 setattr(parent, n.rsplit(".", 1)[-1], ql)
                 stats["quantized"] += 1

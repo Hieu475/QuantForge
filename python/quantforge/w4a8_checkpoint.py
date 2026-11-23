@@ -22,6 +22,15 @@ from .nn import W4A8Linear
 FORMAT_VERSION = 1
 
 
+def _vllm_name(name: str) -> str:
+    """The name vLLM gives the (fused) layer a Hugging Face linear belongs to."""
+    for part in ("q_proj", "k_proj", "v_proj"):
+        name = name.replace(part, "qkv_proj")
+    for part in ("gate_proj", "up_proj"):
+        name = name.replace(part, "gate_up_proj")
+    return name
+
+
 def save_w4a8(model: nn.Module, out_dir, tokenizer=None) -> Path:
     """Save `model` (a Hugging Face causal LM whose decoder linear layers are all ``W4A8Linear``, unfused) to `out_dir`."""
     out = Path(out_dir)
@@ -38,14 +47,16 @@ def save_w4a8(model: nn.Module, out_dir, tokenizer=None) -> Path:
         tokenizer.save_pretrained(out)
     cfg_path = out / "config.json"
     cfg = json.loads(cfg_path.read_text())
-    rot = {m.rotate for m in model.modules() if isinstance(m, W4A8Linear)}
-    if len(rot) != 1:
-        raise ValueError("the W4A8 layers must all be rotated or all be unrotated")
+    rot_of = {name: m.rotate for name, m in model.named_modules() if isinstance(m, W4A8Linear)}
+    unrotated = sorted({_vllm_name(n) for n, r in rot_of.items() if not r})
+    for n, r in rot_of.items():
+        if r and _vllm_name(n) in unrotated:
+            raise ValueError(f"{n} is rotated but another layer that shares its input (and fuses with it in vLLM) is not")
     groups = {m.group for m in model.modules() if isinstance(m, W4A8Linear)}
     if len(groups) != 1:
         raise ValueError("the W4A8 layers must all have the same group size")
     cfg["quantization_config"] = {"quant_method": "quantforge_w4a8", "group_size": groups.pop(), "format_version": FORMAT_VERSION,
-                                  "layout": "pack_k8", "rotated": rot.pop()}
+                                  "layout": "pack_k8", "rotated": any(rot_of.values()), "unrotated_layers": unrotated}
     cfg["torch_dtype"] = cfg["dtype"] = "float16"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
     return out
