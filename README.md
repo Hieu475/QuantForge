@@ -36,7 +36,21 @@ interleaved runs; details, other models and every negative result in the section
 | concurrent requests | 1 | 16 | 32 | 64 | 128 | 192 | 256 |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.93 | 0.93 | 0.91 | 0.85 | 0.81 | 0.88 | 0.87 |
-| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.95 | 0.96 | 0.95 | 0.97 | 0.96 | **1.06** | **1.06** |
+| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.94 | 0.96 | 0.97 | 0.98 | **1.01** | **1.08** | **1.13** |
+
+The W4A8 row is the dense-GEMM answer to "faster than Marlin": at the level of one layer (`benchmarks/compare_marlin_ops.py`: the ops the plugin calls, CUDA-graph replay, cold weights, interleaved rounds)
+the W4A8 op against Marlin's GEMM is
+
+| rows | 1 | 16 | 32 | 64 | 96 | 128 | 192 | 256 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| 4096 x 4096 | 0.88 | 0.91 | 0.95 | **1.02** | **1.06** | **1.15** | **1.17** | **1.22** |
+| 4096 x 11008 | 0.94 | 0.95 | 0.97 | **1.05** | **1.02** | **1.14** | **1.13** | **1.25** |
+| 11008 x 4096 | 0.82 | 0.82 | 0.92 | 0.94 | 0.94 | **1.09** | 0.92 | **1.24** |
+| 8960 x 1536 (1.5B down) | 0.80 | 0.84 | 0.82 | 0.97 | **1.11** | 0.88 | **1.15** | **1.21** |
+
+(the W4A16 op, exact Marlin numerics, is 1.00 / 1.00 / 0.90 / 0.75 / 0.89 / 0.76 / 0.94 / 0.84 on 4096 x 4096). What changed it: the INT8 kernel's schedule is now *measured per layer shape* (`int8_plan.py`; `ncu` showed the kernel
+waiting on global loads, long-scoreboard 67 % of the stalls, and a 64 x 64 block with a 256-deep K tile keeps more weight bytes in flight than the old rule's 64 x 128 block: 115 -> 65 us at 64 rows, 253 -> 145 us at 64 x 4096 x 11008) and the integer scales are kept K-major
+(8 adjacent output channels = one vector load). Below ~64 rows Marlin is still ahead because the W4A8 op has two extra costs it does not: quantising the activations (one kernel, ~3 us and its launch gap) and, at 1-16 rows, a decode kernel that is not as tight.
 
 Prefill is 1.1-1.15x of Marlin. The W4A8 path is not the same numerics as Marlin's W4A16 (INT8 activations; weights quantised by round-to-nearest on load, or GPTQ-quantised into a
 W4A8 checkpoint: wikitext-2 perplexity of Qwen2.5-0.5B 23.7 / 21.1 against 20.5 for GPTQ W4A16). Qwen2.5-3B reaches 0.93 / 0.87 / 0.78 / 0.76-0.82 of Marlin at 1 / 32 / 64 / 96-256 requests with W4A16;
@@ -699,7 +713,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   above was measured at the start of the work; the tile planners, 32-row buckets and split-K added later raised the end-to-end ratios, see "Headline results" and the CHANGELOG): there the GEMM is
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
-  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores) is what beats Marlin at high concurrency, at W4A8 quality.
+  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.01 / 1.08 / 1.13x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows it is 0.82-0.97x of Marlin.
 * MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.66 of Marlin at 32 concurrent requests. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
