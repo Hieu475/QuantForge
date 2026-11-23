@@ -24,11 +24,10 @@ FORMAT_VERSION = 1
 
 def _vllm_name(name: str) -> str:
     """The name vLLM gives the (fused) layer a Hugging Face linear belongs to."""
-    for part in ("q_proj", "k_proj", "v_proj"):
-        name = name.replace(part, "qkv_proj")
-    for part in ("gate_proj", "up_proj"):
-        name = name.replace(part, "gate_up_proj")
-    return name
+    import re
+
+    name = re.sub(r"\b[qkv]_proj$", "qkv_proj", name)
+    return re.sub(r"\b(gate|up)_proj$", "gate_up_proj", name)
 
 
 def save_w4a8(model: nn.Module, out_dir, tokenizer=None) -> Path:
