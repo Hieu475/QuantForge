@@ -37,6 +37,8 @@ python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', qua
 | a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.94x of Marlin MoE at 1-16 requests, 0.66x at 32 (one model measured) |
 | no LLVM / `nvcc` on the serving machine | `quantforge-pack install` a kernel pack | see "Kernel packs"; `quantforge-doctor` checks it |
 
+Start-up cost (Qwen2.5-1.5B, online W4A8, vLLM 0.25.1): 143 s the first time (kernels compiled, tile schedules measured), 38 s from the caches; a kernel pack of the model skips the compiling and the measuring.
+
 The honest summary: exact-numerics W4A16 is on par with Marlin up to 16 rows and 0.75-0.94x above; the faster-than-Marlin numbers need the W4A8 path.
 
 ## Headline results
