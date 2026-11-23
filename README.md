@@ -28,6 +28,17 @@ quantforge-doctor                           # GPU, toolchain, packs; runs a kern
 python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', quantization='quantforge', dtype='float16')"
 ```
 
+## Which path to use
+
+| you have | use | why / what to expect (RTX 4050 laptop, vs vLLM's Marlin) |
+|---|---|---|
+| a 4-bit GPTQ / AWQ checkpoint, small batches (chat, 1-16 requests) | `quantization="quantforge"` | same numerics as Marlin (asymmetric zero points kept, which Marlin cannot load); 0.93-1.0x at 1-16 requests |
+| the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.01-1.13x of Marlin from 128 requests, 1.07-1.14x prefill; 0.94-0.98x below; perplexity +0.6 to +3 (see "Online W4A8") |
+| a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.94x of Marlin MoE at 1-16 requests, 0.66x at 32 (one model measured) |
+| no LLVM / `nvcc` on the serving machine | `quantforge-pack install` a kernel pack | see "Kernel packs"; `quantforge-doctor` checks it |
+
+The honest summary: exact-numerics W4A16 is on par with Marlin up to 16 rows and 0.75-0.94x above; the faster-than-Marlin numbers need the W4A8 path.
+
 ## Headline results
 
 Decode throughput in vLLM against its Marlin kernel on the same GPU, same model, tokens/s summed over the concurrent requests (RTX 4050 laptop, 6 GB; Qwen2.5-1.5B; two
