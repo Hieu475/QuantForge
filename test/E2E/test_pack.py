@@ -158,3 +158,21 @@ def test_moe_grouped_kernels_are_served_from_a_pack_without_the_toolchain(tmp_pa
     ref = moe.moe_ffn_reference(x, ids, tw.float(), *w, G)
     assert (got.float() - ref.float()).abs().max().item() < 2e-2 * ref.float().abs().max().item() + 2e-3
     moe._kernels.clear()
+
+
+def test_extension_tags_use_major_minor_and_keep_the_exact_version_name():
+    """A torch patch release keeps the C++ ABI, so one extension serves 2.14.0 and 2.14.1; the 0.4.0 exact-version directory is still looked up."""
+    new, legacy = e2e.ext_tags()
+    ver = torch.__version__.split("+")[0].split(".")
+    assert new.startswith(f"torch{ver[0]}.{ver[1]}-cu") and new == e2e.ext_tag()
+    assert legacy.startswith("torch" + ".".join(ver) + "-cu") and new != legacy
+    assert new.endswith(legacy[legacy.index("-cu"):])
+
+
+def test_cuda_home_for_prefers_the_toolkit_that_matches_the_torch(tmp_path, monkeypatch):
+    from quantforge import pack
+
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    assert pack._cuda_home_for("12.8", "/opt/cuda") == "/opt/cuda"
+    monkeypatch.setenv("CUDA_HOME", "/somewhere")
+    assert pack._cuda_home_for("12.8", None) == "/somewhere"

@@ -6,4 +6,4 @@
 
 Run ``quantforge-doctor`` (or ``python -m quantforge.doctor``) to check the installation.
 """
-__version__ = "0.4.0"
+__version__ = "0.5.0"
