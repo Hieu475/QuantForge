@@ -133,7 +133,7 @@ def sweep_w4a8(shapes, rows=ROWS, log=print, modes=("dual", "compact")) -> None:
             if mode == "compact":
                 e = kfold.no_fold(dev)
                 p16, s16, z16, pf, sf, zf = e[0], quant.kmajor_scales(gs), quant.kmajor_scales(zp), e[0], e[1], e[2]      # K-major integer scales, as the plugin keeps them
-                scale_nk = (gs.float() * sw.float()[:, None]).half()
+                scale_nk = quant.kmajor_scales((gs.float() * sw.float()[:, None]).half())
             else:
                 p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())
                 S = kfold.plan_ksplit(K, N, 128, 4)

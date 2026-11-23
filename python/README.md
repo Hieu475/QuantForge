@@ -27,7 +27,7 @@ A layer shape that is in no pack and cannot be compiled still works: the op fall
 
 Measured on one RTX 4050 laptop GPU (6 GB, sm_89), vLLM 0.25, Qwen2.5 and Llama-3.2 checkpoints; other GPUs are untested (the kernels are PTX, so any sm_80+ card runs them,
 but the tile choices were tuned on this one and the planners measure per GPU). Decode throughput against vLLM's Marlin on the same GPTQ checkpoint, Qwen2.5-1.5B:
-about 0.92-0.94 of Marlin from 1 to 16 concurrent requests, 0.85-0.9 at 32-256; prefill is 1.1-1.15x of Marlin. The W4A8 path (INT8 activations, different numerics: round-to-nearest or GPTQ-quantised W4A8 weights)
+about 0.92-0.94 of Marlin from 1 to 16 concurrent requests, 0.85-0.9 at 32-256; prefill is 0.90-0.92x of Marlin (W4A8: 1.07-1.14x). The W4A8 path (INT8 activations, different numerics: round-to-nearest or GPTQ-quantised W4A8 weights)
 reaches 1.06x of Marlin at 192-256 concurrent requests. Details, methodology and the negative results are in the repository README and CHANGELOG:
 <https://github.com/Hieu475/QuantForge>, notes at <https://hieu475.github.io/>.
 

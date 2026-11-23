@@ -52,7 +52,7 @@ the W4A8 op against Marlin's GEMM is
 waiting on global loads, long-scoreboard 67 % of the stalls, and a 64 x 64 block with a 256-deep K tile keeps more weight bytes in flight than the old rule's 64 x 128 block: 115 -> 65 us at 64 rows, 253 -> 145 us at 64 x 4096 x 11008) and the integer scales are kept K-major
 (8 adjacent output channels = one vector load). Below ~64 rows Marlin is still ahead because the W4A8 op has two extra costs it does not: quantising the activations (one kernel, ~3 us and its launch gap) and, at 1-16 rows, a decode kernel that is not as tight.
 
-Prefill is 1.1-1.15x of Marlin. The W4A8 path is not the same numerics as Marlin's W4A16 (INT8 activations; weights quantised by round-to-nearest on load, or GPTQ-quantised into a
+Prefill (vLLM, 16 prompts of ~1000 tokens, Qwen2.5-1.5B, two runs): W4A16 0.90-0.92x of Marlin (11445 / 11068 tokens/s for Marlin, 10289 / 10188 here; an earlier claim of 1.1-1.15x does not hold on this model: the GEMMs take 1162 ms against Marlin's 1050 and a padded tail chunk still copies), W4A8 1.07-1.14x. The W4A8 path is not the same numerics as Marlin's W4A16 (INT8 activations; weights quantised by round-to-nearest on load, or GPTQ-quantised into a
 W4A8 checkpoint: wikitext-2 perplexity of Qwen2.5-0.5B 23.7 / 21.1 against 20.5 for GPTQ W4A16). Qwen2.5-3B reaches 0.93 / 0.87 / 0.78 / 0.76-0.82 of Marlin at 1 / 32 / 64 / 96-256 requests with W4A16;
 Llama-3.2-1B (checkpoint made with this repository) gives the same greedy text as Hugging Face.
 
@@ -709,7 +709,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
 
 ## Limitations
 
-* **Speed:** the W4A16 kernels are on par with Marlin up to 16 rows and 1.1-1.15x faster in prefill, but 0.8-0.9x of Marlin at 32-256 concurrent rows of decode (the table
+* **Speed:** the W4A16 kernels are on par with Marlin up to 16 rows and 0.90-0.92x of it in vLLM prefill (0.9-1.04x at the GEMM level for 384-2048 rows), 0.8-0.9x at 32-256 concurrent rows of decode (the table
   above was measured at the start of the work; the tile planners, 32-row buckets and split-K added later raised the end-to-end ratios, see "Headline results" and the CHANGELOG): there the GEMM is
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs

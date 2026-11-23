@@ -147,9 +147,11 @@ at::Tensor call_fallback(const at::Tensor &x, const at::Tensor &packed, const at
   return out.cast<at::Tensor>();
 }
 
+// `dst`: where the f16-store kernel may write its result directly when the row count needs no padding (the chunk loop of `w4a16_gemm` passes the slice of
+// its output; without it every chunk of a long prefill was computed into a fresh buffer and then copied: 73 MB per chunk for N = 17920, ~12 % of a prefill).
 at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scale,
                            const at::Tensor &zero, int64_t group_size, const c10::optional<at::Tensor> &bias,
-                           std::string activation) {
+                           std::string activation, const c10::optional<at::Tensor> &dst = c10::nullopt) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "x must be a float16 CUDA tensor");
   TORCH_CHECK(x.dim() >= 1 && packed.dim() == 2, "bad shapes");
   // INT4: packed [K, N/2]. INT8 (group-wise only): plain int8 [K, N], i.e. as wide as `scale`.
@@ -206,7 +208,8 @@ at::Tensor w4a16_gemm_rows(const at::Tensor &x, const at::Tensor &packed, const 
       bh = (bias->scalar_type() == at::kHalf ? *bias : bias->to(at::kHalf)).contiguous();
     if (k16.hot && k16.fn && (!bias.has_value() || aligned16(bh))) {
       at::Tensor act16 = (k16.Mp == M) ? x2 : padded_activations(x2, k16.Mp);
-      at::Tensor out16 = at::empty({k16.Mp, N}, x.options());
+      at::Tensor out16 = (dst.has_value() && k16.Mp == M && dst->is_contiguous() && dst->size(0) == M && dst->size(1) == N) ? *dst
+                                                                                                                         : at::empty({k16.Mp, N}, x.options());
       Desc2 e0 = describe(act16), e1 = describe(pk), e2 = describe(scale), e3 = describe(zero), eo = describe(out16), res16{};
       Desc1 eb{};
       if (bias.has_value())
@@ -261,8 +264,10 @@ at::Tensor w4a16_gemm(const at::Tensor &x, const at::Tensor &packed, const at::T
   at::Tensor out = at::empty({M, cols}, x.options());
   for (int64_t r = 0; r < M; r += kMaxRows) {
     const int64_t n = std::min<int64_t>(kMaxRows, M - r);
-    out.narrow(0, r, n).copy_(
-        w4a16_gemm_rows(x2.narrow(0, r, n), packed, scale, zero, group_size, bias, activation));
+    at::Tensor dst = out.narrow(0, r, n);
+    at::Tensor res = w4a16_gemm_rows(x2.narrow(0, r, n), packed, scale, zero, group_size, bias, activation, dst);
+    if (res.data_ptr() != dst.data_ptr())    // not written in place (a padded or non-f16-store chunk): copy it
+      dst.copy_(res);
   }
   std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
   shape.back() = cols;

@@ -102,14 +102,14 @@ def _decode_opts(K: int, N: int) -> str:
     return f"decode=true block-tile-n={bn} warp-tile-n=8 block-tile-k=256 smem-stages=3 accumulate=false"
 
 
-def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16):
-    key = ("dec", K, N, has_bias, rows)
+def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16, kmajor: bool = False):
+    key = ("dec", K, N, has_bias, rows, kmajor)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8DecodeGemm
 
         k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias, valid_rows=rows if rows < 16 else 0,
-                                                 pipeline_opts=_decode_opts(K, N))
+                                                 pipeline_opts=_decode_opts(K, N), kmajor=kmajor)
     return k
 
 
@@ -176,13 +176,15 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     M = x2.shape[0]
     if M <= 16 and packed16.numel() == 0:                             # compact: decode from the W4A8 layout itself (no second copy)
         b = None if bias is None else bias.contiguous()
+        km = scale16.numel() > 0                                      # K-major layer: zero16 = zero points, scale_nk = gs * sw, both [K/128, N]
+        dz = zero16 if km else zp
         try:
             if M in (1, 2, 4, 8) and x2.is_contiguous() and x2.data_ptr() % 16 == 0:     # exactly M rows: no padded copy (valid-rows kernel)
                 out = torch.empty(M, N, device=x.device, dtype=torch.float16)
-                _decode_kernel(K, N, bias is not None, M).launch(x2, p8, zp, scale_nk, out, b)
+                _decode_kernel(K, N, bias is not None, M, km).launch(x2, p8, dz, scale_nk, out, b)
                 return out.reshape(*lead, N)
             out = torch.empty(16, N, device=x.device, dtype=torch.float16)
-            _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
+            _decode_kernel(K, N, bias is not None, 16, km).launch(_padded16(x2), p8, dz, scale_nk, out, b)
             return out[:M].reshape(*lead, N)
         except KernelUnavailable:
             return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)

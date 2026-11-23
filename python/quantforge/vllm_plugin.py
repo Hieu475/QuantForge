@@ -345,7 +345,7 @@ if HAVE_VLLM:
                 layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), _keep_view(quant.kmajor_scales(gs)), _keep_view(quant.kmajor_scales(zp))
                 layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = param(e[0]), param(e[1]), param(e[2])
                 layer.qf_group = 128
-                layer.qf8_scale_nk = param((gs.float() * sw.float()[:, None]).half())
+                layer.qf8_scale_nk = _keep_view(quant.kmajor_scales((gs.float() * sw.float()[:, None]).half()))        # K-major too (decode kernel)
                 from . import int8_plan
 
                 int8_plan.preplan(K, N)               # the schedules of the INT8 kernel for this shape, measured now (looked up, never measured, at run time)

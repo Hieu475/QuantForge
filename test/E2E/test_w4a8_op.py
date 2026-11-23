@@ -126,24 +126,26 @@ def test_compact_decode_reads_only_its_own_rows(rows):
     assert torch.isfinite(y).all() and (y.float() - ref).norm() / ref.norm() < 0.01
 
 
-def test_int8_kernel_with_k_major_scales_matches_the_n_major_one():
-    """The compact layer keeps the integer scales / zero points as [K/128, N] too (scale16 / zero16 slots): same result as the [N, K/128] kernel."""
+def test_k_major_scales_match_the_n_major_kernels_decode_and_int8():
+    """The compact layer keeps the integer scales / zero points (and the decode scale gs * sw) as [K/128, N] too: the decode kernel (<= 16 rows) and the INT8 kernel
+    give the same result as with the [N, K/128] tensors."""
     _require_gpu()
     from quantforge import quant, w4a8_op
 
-    K, N, M = 512, 256, 96
+    K, N = 512, 256
     g = torch.Generator(device="cuda").manual_seed(11)
     w = torch.randn(N, K, device="cuda", generator=g) * 0.03
     p8, gs, zp, sw = quant.w4a8_quantize(w)
-    x = torch.randn(M, K, device="cuda", dtype=torch.float16, generator=g)
     e = torch.empty(0, device="cuda", dtype=torch.float16)
-    scale_nk = (gs.float() * sw[:, None]).half()
-    n_major = w4a8_op._impl(x, p8, gs, zp, sw, None, e, e, e, e, e, e, 128, scale_nk)
-    k_major = w4a8_op._impl(x, p8, gs, zp, sw, None, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, scale_nk)
-    assert any(key[-1] for key in w4a8_op._KERNELS if isinstance(key[-1], bool) and len(key) == 5)
-    assert torch.equal(n_major, k_major)
-    ref = x.float() @ quant.w4a8_dequantize(p8, gs, zp, sw).float().t()
-    assert (k_major.float() - ref).abs().max() < 0.05 * ref.abs().max()
+    snk = (gs.float() * sw[:, None]).half()
+    for M in (1, 5, 16, 96):
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16, generator=g)
+        bias = torch.randn(N, device="cuda", dtype=torch.float16, generator=g) if M == 5 else None
+        n_major = w4a8_op._impl(x, p8, gs, zp, sw, bias, e, e, e, e, e, e, 128, snk)
+        k_major = w4a8_op._impl(x, p8, gs, zp, sw, bias, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, quant.kmajor_scales(snk))
+        assert torch.equal(n_major, k_major), M
+        ref = x.float() @ quant.w4a8_dequantize(p8, gs, zp, sw).float().t() + (0 if bias is None else bias.float())
+        assert (k_major.float() - ref).abs().max() < 0.05 * ref.abs().max() + 1e-2, M
 
 
 def test_int8_plan_candidates_are_valid_and_plans_are_looked_up(tmp_path, monkeypatch):

@@ -889,10 +889,12 @@ class W4A8DecodeGemm:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS,
-              f16_out: bool = False, bias: bool = False, valid_rows: int = 0) -> "W4A8DecodeGemm":
+              f16_out: bool = False, bias: bool = False, valid_rows: int = 0, kmajor: bool = False) -> "W4A8DecodeGemm":
         """`f16_out=True`: the kernel writes f16 itself (``epilogue=f16-store``, with an optional f16 `bias`): one kernel, ``launch(a, bp, zp, sc,
-        bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``."""
+        bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``. `kmajor=True`: ``zp`` and ``sc`` are ``[K/128, N]`` (see
+        `quant.kmajor_scales`, which adds the padding row the look-ahead reads): the scale and zero point of the 8 output channels a thread dequantises are adjacent bytes."""
         G = W4A8_GROUP
+        sz, ix = (f"{K // G}x{N}", "%kg, %n") if kmajor else (f"{N}x{K // G}", "%n, %kg")
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
         if valid_rows:
@@ -927,7 +929,7 @@ class W4A8DecodeGemm:
         ir = f"""#nk = affine_map<(n, k) -> (n, k)>
 #mmn = affine_map<(m, n) -> (m, n)>
 #mn = affine_map<(m, n) -> (n)>
-func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp: tensor<{N}x{K // G}xi8>, %sc: tensor<{N}x{K // G}xf16>,
+func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp: tensor<{sz}xi8>, %sc: tensor<{sz}xf16>,
                       {extra_arg}) -> {ret} {{
   %c0 = arith.constant 0 : index
   %i2 = arith.constant 2 : index
@@ -951,8 +953,8 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp
       %kf = arith.muli %k16d, %i8 : index
       %kg = arith.divui %kf, %cg : index
       %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
-      %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
-      %s = tensor.extract %sc[%n, %kg] : tensor<{N}x{K // G}xf16>
+      %z = tensor.extract %zp[{ix}] : tensor<{sz}xi8>
+      %s = tensor.extract %sc[{ix}] : tensor<{sz}xf16>
       %k4d = arith.divui %k, %i4 : index
       %hi4 = arith.remui %k4d, %i2 : index
       %odd = arith.cmpi ne, %hi4, %c0 : index
