@@ -66,7 +66,7 @@ interleaved runs; details, other models and every negative result in the section
 
 | concurrent requests | 1 | 16 | 32 | 64 | 128 | 192 | 256 |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.93 | 0.93 | 0.91 | 0.85 | 0.81 | 0.88 | 0.87 |
+| `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.94 | 0.94 | 0.89 | 0.84 | 0.80 | 0.86 | 0.85 |
 | `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.95 | 0.96 | 0.99 | 0.99 | **1.04** | **1.13** | **1.18** |
 
 The W4A8 row is the dense-GEMM answer to "faster than Marlin": at the level of one layer (`benchmarks/compare_marlin_ops.py`: the ops the plugin calls, CUDA-graph replay, cold weights, interleaved rounds)
