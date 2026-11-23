@@ -37,7 +37,7 @@ python -m quantforge.pack build --out ./qwen15-pack --model Qwen/Qwen2.5-1.5B-In
 python -m quantforge.pack ext   --out ./qwen15-pack                                                 # the C++ runtime for this torch (no nvcc needed to load it)
 python -m quantforge.pack check ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4          # every row count 1..300 and up to 8192 with JIT off: fails on any gap
 
-python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: a nine-model pack is 9.4 MiB (38 MiB unpacked)
+python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: the release pack (nine dense models, three mixture-of-experts configs, 23 extensions for torch 2.8-2.15 x Python 3.10-3.13) is 37.7 MiB
 
 # on the machine that serves (pip install the package, no compiler, no LLVM)
 quantforge-pack install qwen15-pack.tar.gz                                                       # file or https URL -&gt; ~/.cache/quantforge/pack (or --dest DIR + QUANTFORGE_PACK=DIR)
@@ -77,7 +77,7 @@ python -c &quot;from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4'
 A shape the pack does not hold is not an error:
 the op warns once and serves it with a dense torch path (dequantise + cuBLAS: correct, several times slower), so a model never fails to load because of a missing kernel; <code>quantforge.torch_ops.DENSE_FALLBACKS</code> counts those calls.
 <code>QUANTFORGE_PACK</code> takes several directories; <code>~/.cache/quantforge/pack</code> and the package's own <code>kernel_pack</code> are always searched. Limits: the tile rules and plans were measured on one RTX 4050 (a pack built on another GPU
-carries that GPU's plans; the plans of another GPU model are not used without the compiler), the extension is tied to the torch / CUDA / Python it was built for (otherwise it is built on first use if <code>nvcc</code> exists, else the slower Python op runs).</p>
+carries that GPU's plans; the plans of another GPU model are not used without the compiler), the C++ extension is tied to the torch major.minor / CUDA / Python it was built for (<code>ext/torchX.Y-cuZ.W-abi1-pyNNN/</code>): a pack can carry several (<code>scripts/build_ext_matrix.sh</code> builds a matrix of torch 2.8-2.15 and Python 3.10-3.13 from throwaway venvs; the release ships them), and <code>quantforge-pack install --build-ext</code> / <code>quantforge-pack ext</code> builds the missing one (<code>--cuda-home</code> picks the toolkit), otherwise it is built on first use if <code>nvcc</code> exists, else the slower, equally correct Python op runs (measured on torch 2.15, 36 instead of 21 us per call). The kernels themselves are PTX and do not depend on torch: a pack built with torch 2.11 runs under torch 2.15 once the extension exists.</p>
 <h2 id="docker-no-toolchain-on-the-host">Docker (no toolchain on the host)<a class="headerlink" href="#docker-no-toolchain-on-the-host" title="Permanent link">#</a></h2>
 <pre><code class="language-bash">docker build -f docker/Dockerfile -t quantforge .                    # builds quantforge-opt (LLVM 18), installs torch (CUDA 12.8) and the package
 docker build -f docker/Dockerfile --build-arg WITH_VLLM=1 -t quantforge:vllm .      # + vLLM with the `quantization=&quot;quantforge&quot;` plugin
