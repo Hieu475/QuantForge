@@ -48,7 +48,14 @@ Quality through vLLM itself (`benchmarks/vllm_ppl.py`, Qwen2.5-1.5B-Instruct, wi
 | the same checkpoint through `quantforge` (W4A16) | 13.637 |
 | fp16 weights quantised online to W4A8 (`quantforge_w4a8`, round-to-nearest weights, INT8 activations) | 13.991 |
 
-So the exact path reproduces Marlin to the third decimal, and the faster W4A8 path costs +0.35 perplexity (2.6 %) against the GPTQ checkpoint on this model (its weights are round-to-nearest, not GPTQ; a W4A8 checkpoint made from GPTQ closes part of that gap, see "W4A8 checkpoints").
+With this repository's own GPTQ (128 windows of wikitext-2 *train* for calibration, so the test split is in-domain and these numbers are flattering in absolute terms; the public checkpoint above was calibrated on other data):
+
+| same calibration, same model | perplexity |
+|---|--:|
+| GPTQ W4A16 through `quantforge` (asymmetric: Marlin refuses to load it) | 12.605 |
+| GPTQ W4A8 checkpoint (`benchmarks/make_w4a8_checkpoint.py`, INT8 activations, integer group scales) | 12.851 |
+
+So the exact path reproduces Marlin to the third decimal, and what the faster W4A8 path costs is **+0.25 perplexity (1.9 %) with GPTQ weights** (+0.92 over fp16 against +0.67 for W4A16); online round-to-nearest weights cost more (13.991 against the public GPTQ's 13.636).
 
 The honest summary: exact-numerics W4A16 is on par with Marlin up to 16 rows and 0.75-0.94x above; the faster-than-Marlin numbers need the W4A8 path.
 
