@@ -50,8 +50,8 @@ def quant_w_real(W):                                  # the weight the W4A8 kern
     from quantforge import quant
     out = []
     for r in range(0, W.shape[0], 1024):
-        p8, gs, zp, sw = quant.w4a8_quantize(W[r:r + 1024].float(), 128, CHCLIPS)
-        out.append(quant.w4a8_dequantize(p8, gs, zp, sw))
+        G = int(__import__("os").environ.get("QF_GROUP", "128")); p8, gs, zp, sw = quant.w4a8_quantize(W[r:r + 1024].float(), G, CHCLIPS)
+        out.append(quant.w4a8_dequantize(p8, gs, zp, sw, G))
     return torch.cat(out)
 
 
