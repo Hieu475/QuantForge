@@ -131,11 +131,13 @@ def _padded16(x2: torch.Tensor) -> torch.Tensor:
     return buf
 
 
-def _quantize_tokens(x2: torch.Tensor, Mp: int = 0):
+def _quantize_tokens(x2: torch.Tensor, Mp: int = 0, rotated: bool = False):
     """Per-token INT8 quantisation of the activations, padded to `Mp` rows (zero rows, scale 0). One CUDA kernel of the C++ runtime (`runtime/act_quant.cu`) when it is loaded,
     else the torch.compile'd function of nn.py plus padding copies; both give the same bits."""
     M = x2.shape[0]
     Mp = Mp or M
+    if rotated:                                  # x2 is NOT rotated yet: quantise x2 H (callers check `can_fuse_rotation` first)
+        return torch.ops.quantforge.quantize_rows_rot(x2, Mp)
     if _native_quant() and x2.is_contiguous() and x2.shape[1] % 16 == 0:
         return torch.ops.quantforge.quantize_rows(x2, Mp)
     from .nn import _int8_quantize_tokens        # torch.compile'd (one fused kernel pair, dynamic shapes): compiled by the first big call, i.e.
@@ -158,6 +160,12 @@ def _native_quant() -> bool:
 
         _NATIVE = not os.environ.get("QUANTFORGE_NO_NATIVE_QUANT") and hasattr(torch.ops.quantforge, "quantize_rows")
     return _NATIVE
+
+
+def can_fuse_rotation(x2: torch.Tensor) -> bool:
+    """The rotation of the activations can ride in the quantisation kernel (`quantize_rows_rot`: f16 CUDA rows, K a multiple of 128 up to 24576)."""
+    return (_native_quant() and hasattr(torch.ops.quantforge, "quantize_rows_rot") and x2.is_cuda and x2.dtype == torch.float16 and x2.is_contiguous()
+            and x2.shape[1] <= 24576 and x2.shape[1] % 128 == 0 and x2.data_ptr() % 16 == 0)
 
 
 def _min_int8_rows() -> int:
@@ -193,10 +201,16 @@ def _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, sca
 
 def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw: torch.Tensor, bias: Optional[torch.Tensor],
           packed16: torch.Tensor, scale16: torch.Tensor, zero16: torch.Tensor, packed_f: torch.Tensor, scale_f: torch.Tensor,
-          zero_f: torch.Tensor, group: int, scale_nk: torch.Tensor) -> torch.Tensor:
+          zero_f: torch.Tensor, group: int, scale_nk: torch.Tensor, rotate: bool = False) -> torch.Tensor:
     lead, K, N = x.shape[:-1], x.shape[-1], p8.shape[0]
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
+    fuse = False
+    if rotate:     # activations x H (the weights were rotated when they were quantised): up to 16 rows / the W4A16 branch as a kernel of its own, the INT8 branch inside its quantisation kernel
+        int8_branch = M > 16 and not (M <= _min_int8_rows() and packed16.numel() > 0)
+        fuse = int8_branch and can_fuse_rotation(x2)
+        if not fuse:
+            x2 = _rotate_impl(x2.contiguous())
     if M <= 16 and packed16.numel() == 0:                             # compact: decode from the W4A8 layout itself (no second copy)
         b = None if bias is None else bias.contiguous()
         try:
@@ -218,16 +232,68 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     try:
         k = _kernel(Mp, K, N, bias is not None, kmajor)
     except KernelUnavailable:
+        if fuse:
+            x2 = _rotate_impl(x2)
         return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
-    xq, s_x = _quantize_tokens(x2, Mp)                                # padded to the bucket: zero rows, scale 0
+    xq, s_x = _quantize_tokens(x2, Mp, rotated=fuse)                                # padded to the bucket: zero rows, scale 0
     y = torch.empty(Mp, N, device=x.device, dtype=torch.float16)
     k.launch(xq, p8, gk, zk, s_x.contiguous(), sw, None if bias is None else bias.float().contiguous(), y)
     return (y[:M] if Mp != M else y).reshape(*lead, N)
 
 
-def _fake(x, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group, scale_nk):
+def _fake(x, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group, scale_nk, rotate=False):
     return x.new_empty((*x.shape[:-1], p8.shape[0]), dtype=torch.float16)
 
 
 _op = torch.library.custom_op("quantforge::w4a8_hybrid", mutates_args=())(_impl)
 _op.register_fake(_fake)
+
+
+# ---- block-Hadamard rotation (research/rotation_ppl.py): x -> x H on blocks of 128 along K, the weights are rotated the same way before quantisation ----
+_H128 = {}
+
+
+def hadamard_matrix(n: int = 128, device="cuda") -> torch.Tensor:
+    """Orthonormal Sylvester-Hadamard matrix [n, n] f32 (symmetric)."""
+    H = torch.ones(1, 1, dtype=torch.float32)  # explicit: vLLM sets the default dtype to f16 while loading
+    while H.shape[0] < n:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return (H / n ** 0.5).to(device)
+
+
+def rotate_weight(w: torch.Tensor) -> torch.Tensor:
+    """[N, K] -> w H (block-diagonal, blocks of 128 along K), float32."""
+    N, K = w.shape
+    return (w.float().reshape(N, K // 128, 128) @ hadamard_matrix(128, w.device)).reshape(N, K)
+
+
+def _rotate_impl(x: torch.Tensor) -> torch.Tensor:
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    if x2.is_cuda and x2.dtype == torch.float16 and K % 128 == 0 and _native_rotate():
+        return torch.ops.quantforge.hadamard128(x2.contiguous()).reshape(x.shape)
+    H = _H128.get(x.device)
+    if H is None:
+        H = _H128[x.device] = hadamard_matrix(128, x.device)
+    return (x2.float().reshape(-1, K // 128, 128) @ H).reshape(x.shape).to(x.dtype)
+
+
+_ROT = None
+
+
+def _native_rotate() -> bool:
+    global _ROT
+    if _ROT is None:
+        from . import torch_ops  # noqa: F401
+
+        _ROT = not os.environ.get("QUANTFORGE_NO_NATIVE_QUANT") and hasattr(torch.ops.quantforge, "hadamard128")
+    return _ROT
+
+
+_rotate_op = torch.library.custom_op("quantforge::rotate128", mutates_args=())(_rotate_impl)
+_rotate_op.register_fake(lambda x: x.new_empty(x.shape))           # contiguous, like the real result (empty_like would copy x's strides)
+
+
+def rotate(x: torch.Tensor) -> torch.Tensor:
+    """x H on blocks of 128 along the last dimension (f16 CUDA: one kernel of the C++ runtime)."""
+    return torch.ops.quantforge.rotate128(x)

@@ -185,3 +185,55 @@ def test_native_activation_quantisation_is_bit_identical_to_the_eager_torch_expr
     assert xq.shape == (Mp, K) and sx.shape == (Mp,)
     assert torch.equal(xq[:M], want_q) and torch.equal(sx[:M], want_s.reshape(-1))
     assert not xq[M:].any() and not sx[M:].any()
+
+
+def test_hadamard_rotation_kernel_matches_the_matrix_product_and_is_orthonormal():
+    """`quantforge.hadamard128` (one warp per 128-block) == x @ H per block in f32 (rounded to f16); applying it twice gives x back."""
+    _require_gpu()
+    from quantforge import torch_ops, w4a8_op  # noqa: F401
+
+    if not hasattr(torch.ops.quantforge, "hadamard128"):
+        pytest.skip("the C++ runtime is not built")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    for M, K in ((1, 128), (7, 384), (130, 1536)):
+        x = (torch.randn(M, K, device="cuda", generator=g) * 3).half()
+        y = w4a8_op.rotate(x)
+        H = w4a8_op.hadamard_matrix(128, "cuda")
+        ref = (x.float().reshape(M, K // 128, 128) @ H).reshape(M, K)
+        assert (y.float() - ref).abs().max().item() < 2e-3 * ref.abs().max().item(), (M, K)
+        back = w4a8_op.rotate(y)
+        assert (back.float() - x.float()).abs().max().item() < 4e-3 * x.abs().max().item(), (M, K)
+
+
+def test_fused_rotation_quantisation_is_bit_identical_to_rotate_then_quantize():
+    """`quantize_rows_rot` (rotation + per-token INT8 in one kernel) == `quantize_rows(hadamard128(x))`: same int8 values, same scales."""
+    _require_gpu()
+    from quantforge import torch_ops, w4a8_op  # noqa: F401
+
+    if not hasattr(torch.ops.quantforge, "quantize_rows_rot"):
+        pytest.skip("the C++ runtime is not built")
+    g = torch.Generator(device="cuda").manual_seed(1)
+    for M, Mp, K in ((5, 8, 128), (70, 128, 1536), (130, 192, 8960)):
+        x = (torch.randn(M, K, device="cuda", generator=g) * 2).half()
+        x[0, 3] = 900.0                                                    # an outlier row
+        xq, s = torch.ops.quantforge.quantize_rows_rot(x, Mp)
+        rq, rs = torch.ops.quantforge.quantize_rows(w4a8_op.rotate(x), Mp)
+        assert torch.equal(xq, rq) and torch.equal(s, rs), (M, K)
+
+
+def test_hybrid_with_rotation_matches_rotating_outside_the_op():
+    """`w4a8_hybrid(..., rotate=True)` on the weights rotated by `rotate_weight` == the op on `rotate(x)` with rotate=False, at decode, small-batch and INT8 row counts."""
+    _require_gpu()
+    from quantforge import kfold, quant, torch_ops, w4a8_op  # noqa: F401
+
+    K, N = 1536, 1024
+    g = torch.Generator(device="cuda").manual_seed(2)
+    W = torch.randn(N, K, device="cuda", generator=g) * 0.05
+    p8, gs, zp, sw = quant.w4a8_quantize(w4a8_op.rotate_weight(W))
+    e = kfold.no_fold(W.device)
+    args = (p8, gs, zp, sw.float(), None, e[0], quant.kmajor_scales(gs), quant.kmajor_scales(zp), e[0], e[1], e[2], 128, (gs.float() * sw.float()[:, None]).half())
+    for M in (1, 8, 40, 100, 300):
+        x = torch.randn(M, K, device="cuda", generator=g).half()
+        a = torch.ops.quantforge.w4a8_hybrid(x, *args, True)
+        b = torch.ops.quantforge.w4a8_hybrid(w4a8_op.rotate(x), *args, False)
+        assert torch.equal(a, b), M

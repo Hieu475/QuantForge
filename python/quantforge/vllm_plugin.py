@@ -281,9 +281,11 @@ if HAVE_VLLM:
         calls ``torch.ops.quantforge.w4a8_hybrid``: the compiled W4A8 kernel (INT8 tensor cores) above 16 rows, the W4A16 decode kernels below,
         both from the same weight. Memory: about one byte per weight (the two layouts), a quarter of fp16 would need dropping the decode copy."""
 
-        def __init__(self, checkpoint: bool = False) -> None:
+        def __init__(self, checkpoint: bool = False, rotate: bool = False) -> None:
             super().__init__()
             self.checkpoint = checkpoint          # True: the checkpoint holds W4A8 tensors (w4a8_checkpoint.save_w4a8); False: online quantisation
+            self.rotate = rotate and not checkpoint    # block-Hadamard rotation of weights (at load) and activations (per call); part of the method, not an environment switch:
+                                                       # vLLM's compile cache is keyed by the quantisation NAME, a graph that differs by an env var would be reused for the other setting
 
         def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
                            **extra_weight_attrs):
@@ -331,7 +333,8 @@ if HAVE_VLLM:
                 layer.qf_w4a8 = bool(N % 128 == 0 and K % 128 == 0 and w.is_cuda and w.dtype in (torch.float16, torch.bfloat16))
                 if not layer.qf_w4a8:
                     return super().process_weights_after_loading(layer)
-                parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
+                layer.qf_rot = self.rotate                                 # the weights AND the activations are rotated (see `w4a8_op.rotate`)
+                parts = [quant.w4a8_quantize(w4a8_op.rotate_weight(w[r:r + 2048]) if layer.qf_rot else w[r:r + 2048].float()) for r in range(0, N, 2048)]    # bounded float temporaries
                 packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
             _keep_view = lambda t: torch.nn.Parameter(t, requires_grad=False)              # noqa: E731 - a view into a padded buffer must stay one (`.contiguous()` would copy it away)
@@ -362,13 +365,15 @@ if HAVE_VLLM:
             y = torch.ops.quantforge.w4a8_hybrid(
                 xh, layer.qf8_packed, layer.qf8_gs, layer.qf8_zp, layer.qf8_sw, None if bias is None else bias.half(),
                 layer.qf_packed, layer.qf_scale, layer.qf_zero, layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f, layer.qf_group,
-                layer.qf8_scale_nk)
+                layer.qf8_scale_nk, bool(getattr(layer, "qf_rot", False)))      # rotate: x H inside the op (fused with the INT8 quantisation above 64 rows)
             return y if x.dtype == torch.float16 else y.to(x.dtype)
 
     @register_quantization_config("quantforge_w4a8")
     class QuantForgeW4A8Config(QuantizationConfig):
         """W4A8: either an unquantised checkpoint quantised while loading (no quantization_config needed), or a checkpoint written by
         ``w4a8_checkpoint.save_w4a8`` (GPTQ or round-to-nearest; its config.json says ``"quant_method": "quantforge_w4a8"``)."""
+
+        ROTATE = True                                  # online quantisation rotates (`quantforge_w4a8_plain` does not)
 
         def __init__(self, checkpoint: bool = False) -> None:
             super().__init__()
@@ -395,4 +400,18 @@ if HAVE_VLLM:
             return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8")
 
         def get_quant_method(self, layer, prefix):
-            return QuantForgeW4A8Method(self.checkpoint) if isinstance(layer, LinearBase) else None
+            return QuantForgeW4A8Method(self.checkpoint, self.ROTATE) if isinstance(layer, LinearBase) else None
+
+    @register_quantization_config("quantforge_w4a8_plain")
+    class QuantForgeW4A8PlainConfig(QuantForgeW4A8Config):
+        """Online W4A8 without the Hadamard rotation (what ``quantforge_w4a8`` did before 0.5.0), for comparisons."""
+
+        ROTATE = False
+
+        @classmethod
+        def get_name(cls):
+            return "quantforge_w4a8_plain"
+
+        @classmethod
+        def from_config(cls, config):
+            return cls(checkpoint=False)
