@@ -634,7 +634,7 @@ A MoE layer is many small GEMMs with the same shape and different weights. The c
 `expert-problems` / `expert-roles`): the ordinary dense kernel is launched with `grid.z` = a list of *row-block problems*, takes the expert of each from a device `int32` array
 (`meta[z]`; a negative entry is padding and the block returns at once) and advances its weight / scale / zero-point pointers by that expert's slab, its activation / output
 pointers by the problem's slab. Rows are sorted by expert and padded to the row tile, so every row block belongs to one expert; everything has static shapes and no host
-synchronisation (CUDA graphs capture it). `quantforge.moe` wraps it: four small CUDA kernels (`runtime/moe_kernels.cu`: routing, gather, cast, combine) around two grouped GEMMs (gate/up with the fused
+synchronisation (CUDA graphs capture it). `quantforge.moe` wraps it: three small CUDA kernels (`runtime/moe_kernels.cu`: routing, gather, combine) around two grouped GEMMs (gate/up with the fused
 SwiGLU epilogue, then down); `QuantForgeMoEMethod` in the vLLM plugin takes vLLM's own MoE weight loader and router and replaces only the expert computation (vLLM 0.25.1 and 0.34.0, 4-bit GPTQ / AWQ, silu-gated experts, no expert parallelism).
 
 Measured on OLMoE-1B-7B GPTQ (64 experts, top-8, 3.7 GiB; the checkpoint quantises the router too, which vLLM cannot load, so the router was dequantised to fp16 in a local copy used by both sides),
