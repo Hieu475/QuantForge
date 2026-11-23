@@ -82,7 +82,7 @@ def build(M, K, N, G=128):
     folded = kfold.fold_k(packed, s, zp, kfold.plan_ksplit(K, N, G, 4)) if kfold.plan_ksplit(K, N, G, 4) > 1 else kfold.no_fold(torch.device(dev))
     p8, gs, zp8, sw = quant.w4a8_quantize(w.t().float() * 0.5)
     e = kfold.no_fold(torch.device(dev))
-    scale_nk = quant.kmajor_scales((gs.float() * sw.float()[:, None]).half())      # K-major too: the decode kernel reads it
+    scale_nk = (gs.float() * sw.float()[:, None]).half()
     gs_k, zp_k = quant.kmajor_scales(gs), quant.kmajor_scales(zp8)           # the compact layer keeps the integer scales K-major for the INT8 kernel (vllm_plugin)
     int8_plan.preplan(K, N)                                          # measured schedules of the INT8 kernel for this shape (once, cached)
 

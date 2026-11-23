@@ -889,12 +889,11 @@ class W4A8DecodeGemm:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS,
-              f16_out: bool = False, bias: bool = False, valid_rows: int = 0, kmajor: bool = False) -> "W4A8DecodeGemm":
+              f16_out: bool = False, bias: bool = False, valid_rows: int = 0) -> "W4A8DecodeGemm":
         """`f16_out=True`: the kernel writes f16 itself (``epilogue=f16-store``, with an optional f16 `bias`): one kernel, ``launch(a, bp, zp, sc,
-        bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``. `kmajor=True`: ``zp`` and ``sc`` are ``[K/128, N]`` (see
-        `quant.kmajor_scales`, which adds the padding row the look-ahead reads): the scale and zero point of the 8 output channels a thread dequantises are adjacent bytes."""
+        bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``."""
         G = W4A8_GROUP
-        sz, ix = (f"{K // G}x{N}", "%kg, %n") if kmajor else (f"{N}x{K // G}", "%n, %kg")
+        sz, ix = f"{N}x{K // G}", "%n, %kg"
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
         if valid_rows:

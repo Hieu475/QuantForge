@@ -127,8 +127,8 @@ def test_compact_decode_reads_only_its_own_rows(rows):
 
 
 def test_k_major_scales_match_the_n_major_kernels_decode_and_int8():
-    """The compact layer keeps the integer scales / zero points (and the decode scale gs * sw) as [K/128, N] too: the decode kernel (<= 16 rows) and the INT8 kernel
-    give the same result as with the [N, K/128] tensors."""
+    """The compact layer keeps the integer scales / zero points as [K/128, N] too for the INT8 kernel (> 16 rows); the decode kernel (<= 16 rows) keeps reading the
+    [N, K/128] ones (a K-major variant of it measured no faster): same results either way."""
     _require_gpu()
     from quantforge import quant, w4a8_op
 
@@ -142,7 +142,7 @@ def test_k_major_scales_match_the_n_major_kernels_decode_and_int8():
         x = torch.randn(M, K, device="cuda", dtype=torch.float16, generator=g)
         bias = torch.randn(N, device="cuda", dtype=torch.float16, generator=g) if M == 5 else None
         n_major = w4a8_op._impl(x, p8, gs, zp, sw, bias, e, e, e, e, e, e, 128, snk)
-        k_major = w4a8_op._impl(x, p8, gs, zp, sw, bias, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, quant.kmajor_scales(snk))
+        k_major = w4a8_op._impl(x, p8, gs, zp, sw, bias, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, snk)
         assert torch.equal(n_major, k_major), M
         ref = x.float() @ quant.w4a8_dequantize(p8, gs, zp, sw).float().t() + (0 if bias is None else bias.float())
         assert (k_major.float() - ref).abs().max() < 0.05 * ref.abs().max() + 1e-2, M
