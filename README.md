@@ -34,7 +34,7 @@ python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', qua
 |---|---|---|
 | a 4-bit GPTQ / AWQ checkpoint, small batches (chat, 1-16 requests) | `quantization="quantforge"` | same numerics as Marlin (asymmetric zero points kept, which Marlin cannot load); 0.93-1.0x at 1-16 requests |
 | the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.04-1.18x of Marlin from 128 requests, 1.07-1.14x prefill; 0.95-0.99x below; perplexity +0.6 to +3 (see "Online W4A8") |
-| a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.94x of Marlin MoE at 1-16 requests, 0.66x at 32 (one model measured) |
+| a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.93-0.96x of Marlin MoE in decode, 0.88x in prefill (one model measured) |
 | no LLVM / `nvcc` on the serving machine | `quantforge-pack install` a kernel pack | see "Kernel packs"; `quantforge-doctor` checks it |
 
 Start-up cost (Qwen2.5-1.5B, online W4A8, vLLM 0.25.1): 143 s the first time (kernels compiled, tile schedules measured), 38 s from the caches; a kernel pack of the model skips the compiling and the measuring.
@@ -642,20 +642,17 @@ RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache
 
 | concurrent requests | 1 | 8 | 16 | 32 |
 |---|--:|--:|--:|--:|
-| Marlin MoE (vLLM) | 207 tok/s | 848 | 1629 | 2712 |
-| QuantForge | 195 tok/s | 799 | 1525 | 1778 |
-| ratio | **0.94** | **0.94** | **0.94** | 0.66 |
+| Marlin MoE (vLLM), tokens/s | 197 | 814 | 1556 | 2536 |
+| QuantForge, tokens/s | 189 | 771 | 1475 | 2354 |
+| ratio | **0.96** | **0.95** | **0.95** | **0.93** |
+
+(mean of four interleaved rounds for 16 and 32 requests, two for 1 and 8). An earlier version of this section said 0.66x at 32 requests: that run had a smaller KV cache (the f32 gate/up buffer of this op, which no longer exists, took memory from it) and vLLM preempted; with the buffer gone the same measurement gives 0.93x.
 
 Prefill (16 prompts of ~1275 tokens, 1024-token steps; vLLM's Marlin MoE 12117 / 11809 tokens/s): this op ran at 6873 / 6944 (0.58x), now 10616 / 10518 (0.88x). What changed it: the gate/up kernel writes `silu(gate) * up` as f16 itself (`quantforge.swiglu_out`,
 `GroupedGemm(kind="swiglu16")`: no f32 buffer, no conversion kernel, so the chunks could grow from 256 to 512 tokens and every expert's weights are read half as often), and the grouped kernels got their own schedules for 32 / 64-row tiles (a sweep over
 64-256-column blocks, warp tiles, K tiles, stages: K tile 64, one stage, look-ahead 1, 128-column blocks, 17-27 % faster than the dense schedule of the same row count, which also read the weights twice per 128-row problem); the row tile is 16 / 32 / 64 by rows per expert (128 never won).
 
-The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). The gap at 32 requests is **not** explained yet. What is known (nsys with CUDA-graph
-node tracing, 48 decode steps isolated by differencing two lengths, 32 requests): GPU kernel time per decode step is 17.8 ms against 14.2 ms for Marlin, the GEMMs 13.5 ms against 9.9 ms; the router touches ~27 active experts per layer (counted on the device inside the graph).
-In a micro-benchmark with the same 27 experts, cold weights, CUDA-graph replay and spread over a 2.7 GB model the whole MoE op (routing, both grouped GEMMs, combine) runs at 156 GB/s of expert bytes at 20, 27, 40 and 64 active experts (the read ceiling measured with `torch.sum` is 164 GB/s), i.e. 545 us per layer, 8.7 ms for 16 layers;
-inside vLLM the gate/up kernel is ~35 % slower than that while the down kernel matches. Schedule sweeps of the grouped kernels (block 32..256 columns, warp tile, K tile, stages, look-ahead) found nothing better than the rule; an earlier version of this paragraph blamed
-"148 GB/s" on the kernel, but that figure came from a sweep that flushed the L2 by writing (it inflates every time, see the CHANGELOG). Real routing of those 32-token decode steps is clustered (14.8 distinct experts per layer, 27 row blocks because experts with more than 16 tokens run as several blocks); replayed in the micro-benchmark it costs 312 us per layer, and 32- / 64-row blocks are slower (352 / 481 us), so the 16-row tile stays. The same replay inside vLLM measures 2.3x longer, for Marlin as well as for this op as far as the nsys numbers allow to tell, so the clean statement is the measured ratio (0.66x at 32 requests), not a kernel-level explanation. `QUANTFORGE_MOE_ROWS` forces the row tile for such experiments.
-Only this one model was run end to end;
+The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). Real decode routing is clustered (14.8 distinct experts per layer for 32 requests, 27 row blocks because experts with more than 16 tokens run as several blocks); the 16-row tile stays best there (32- / 64-row tiles measured slower). `QUANTFORGE_MOE_ROWS` forces the row tile for experiments. Only this one model was run end to end;
 `pack build` records the grouped kernels of any MoE config (Mixtral, Qwen-MoE, Qwen3-MoE shapes compile, they were not run). Shared experts (Qwen-MoE) go through the dense layers and were not tested.
 
 ### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
@@ -751,7 +748,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
   that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.04 / 1.13 / 1.18x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows of one GEMM it is 0.8-1.0x of Marlin (the INT8 kernel itself is on par; the activation quantisation and, at 1-16 rows, the decode kernel cost the rest).
-* MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.66 of Marlin at 32 concurrent requests. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
+* MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.93-0.96 of Marlin MoE at 1-32 concurrent requests, 0.88 in prefill. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
 * Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row
