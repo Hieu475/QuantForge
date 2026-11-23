@@ -104,7 +104,7 @@ def main():
         m = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.float16).cuda().eval()
         if v != "fp16":
             rot, a8 = v.startswith("rot"), v.endswith("a8")
-            wbits = 0 if v.endswith("-a8") and v.startswith("rot-a8") and False else 4
+            wbits = int(__import__("os").environ.get("QF_WBITS", "4"))
             if v == "rot-a8":
                 wbits = 0
             for layer in m.model.layers:
