@@ -41,7 +41,10 @@ def save_w4a8(model: nn.Module, out_dir, tokenizer=None) -> Path:
     rot = {m.rotate for m in model.modules() if isinstance(m, W4A8Linear)}
     if len(rot) != 1:
         raise ValueError("the W4A8 layers must all be rotated or all be unrotated")
-    cfg["quantization_config"] = {"quant_method": "quantforge_w4a8", "group_size": 128, "format_version": FORMAT_VERSION,
+    groups = {m.group for m in model.modules() if isinstance(m, W4A8Linear)}
+    if len(groups) != 1:
+        raise ValueError("the W4A8 layers must all have the same group size")
+    cfg["quantization_config"] = {"quant_method": "quantforge_w4a8", "group_size": groups.pop(), "format_version": FORMAT_VERSION,
                                   "layout": "pack_k8", "rotated": rot.pop()}
     cfg["torch_dtype"] = cfg["dtype"] = "float16"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")

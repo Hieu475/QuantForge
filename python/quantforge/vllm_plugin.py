@@ -281,8 +281,9 @@ if HAVE_VLLM:
         calls ``torch.ops.quantforge.w4a8_hybrid``: the compiled W4A8 kernel (INT8 tensor cores) above 16 rows, the W4A16 decode kernels below,
         both from the same weight. Memory: about one byte per weight (the two layouts), a quarter of fp16 would need dropping the decode copy."""
 
-        def __init__(self, checkpoint: bool = False, rotate: bool = False) -> None:
+        def __init__(self, checkpoint: bool = False, rotate: bool = False, group: int = 128) -> None:
             super().__init__()
+            self.group = group                    # size of a group of the integer scales along K (128; 64 is more accurate and 2-3 % slower; a checkpoint carries its own)
             self.checkpoint = checkpoint          # True: the checkpoint holds W4A8 tensors (w4a8_checkpoint.save_w4a8); False: online quantisation
             self.rotate = rotate    # block-Hadamard rotation of weights (at load) and activations (per call); part of the method, not an environment switch:
                                                        # vLLM's compile cache is keyed by the quantisation NAME, a graph that differs by an env var would be reused for the other setting
@@ -294,15 +295,15 @@ if HAVE_VLLM:
                 from vllm.model_executor.utils import set_weight_attrs
 
                 N, K = sum(output_partition_sizes), input_size_per_partition
-                if N % 128 or K % 128:
-                    raise ValueError(f"a W4A8 checkpoint layer needs sizes that are multiples of 128 (got {N} x {K})")
+                if N % 128 or K % 128 or K % self.group:
+                    raise ValueError(f"a W4A8 checkpoint layer needs sizes that are multiples of 128 (got {N} x {K}, group {self.group})")
                 loader = extra_weight_attrs.pop("weight_loader")
                 mk = lambda cols, dt: ModelWeightParameter(data=torch.empty(N, cols, dtype=dt), input_dim=1, output_dim=0,   # noqa: E731
                                                            weight_loader=loader)
                 # the names are those of ``nn.W4A8Linear`` buffers, which is what ``save_w4a8`` writes
                 layer.register_parameter("weight", mk(K // 2, torch.int8))
-                layer.register_parameter("group_scale", mk(K // 128, torch.int8))
-                layer.register_parameter("group_zero", mk(K // 128, torch.int8))
+                layer.register_parameter("group_scale", mk(K // self.group, torch.int8))
+                layer.register_parameter("group_zero", mk(K // self.group, torch.int8))
                 layer.register_parameter("w_scale", ChannelQuantScaleParameter(data=torch.empty(N, dtype=torch.float32), output_dim=0,
                                                                               weight_loader=loader))
                 for name in ("weight", "group_scale", "group_zero", "w_scale"):
@@ -335,7 +336,7 @@ if HAVE_VLLM:
                 if not layer.qf_w4a8:
                     return super().process_weights_after_loading(layer)
                 layer.qf_rot = self.rotate                                 # the weights AND the activations are rotated (see `w4a8_op.rotate`)
-                parts = [quant.w4a8_quantize(w4a8_op.rotate_weight(w[r:r + 2048]) if layer.qf_rot else w[r:r + 2048].float()) for r in range(0, N, 2048)]    # bounded float temporaries
+                parts = [quant.w4a8_quantize(w4a8_op.rotate_weight(w[r:r + 2048]) if layer.qf_rot else w[r:r + 2048].float(), self.group) for r in range(0, N, 2048)]    # bounded float temporaries
                 packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
             _keep_view = lambda t: torch.nn.Parameter(t, requires_grad=False)              # noqa: E731 - a view into a padded buffer must stay one (`.contiguous()` would copy it away)
@@ -348,12 +349,14 @@ if HAVE_VLLM:
                 # than 8 bytes 32 apart): a second, small copy (3 % of the weights) rides in the slots that stay empty in this layout
                 layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), _keep_view(quant.kmajor_scales(gs)), _keep_view(quant.kmajor_scales(zp))
                 layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = param(e[0]), param(e[1]), param(e[2])
-                layer.qf_group = 128
+                layer.qf_group = self.group
                 layer.qf8_scale_nk = param((gs.float() * sw.float()[:, None]).half())
                 from . import int8_plan
 
                 int8_plan.preplan(K, N)               # the schedules of the INT8 kernel for this shape, measured now (looked up, never measured, at run time)
             else:
+                if self.group != 128:
+                    raise ValueError("QUANTFORGE_W4A8_DECODE=two-layouts keeps the W4A16 layout of group 128; use the compact layout for other group sizes")
                 p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())
                 _install(layer, p16, s16, z16, None, 128, () if self.checkpoint else ("weight",))
                 layer.qf8_scale_nk = param(torch.empty(0, device=w.device, dtype=torch.float16))
@@ -376,9 +379,12 @@ if HAVE_VLLM:
 
         ROTATE = True                                  # online quantisation rotates (`quantforge_w4a8_plain` does not)
 
-        def __init__(self, checkpoint: bool = False, rotated: bool = False) -> None:
+        GROUP = 128                                    # online quantisation: `quantforge_w4a8_g64` uses 64
+
+        def __init__(self, checkpoint: bool = False, rotated: bool = False, group: int = 0) -> None:
             super().__init__()
             self.checkpoint = checkpoint
+            self.group = group or self.GROUP               # checkpoint: config.json "group_size"
             self.rotated = rotated                     # checkpoint: its weights were quantised after the rotation (config.json: "rotated": true)
 
         @classmethod
@@ -399,10 +405,11 @@ if HAVE_VLLM:
 
         @classmethod
         def from_config(cls, config):
-            return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8", rotated=bool(config.get("rotated", False)))
+            return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8", rotated=bool(config.get("rotated", False)),
+                       group=int(config.get("group_size", 128)))
 
         def get_quant_method(self, layer, prefix):
-            return QuantForgeW4A8Method(self.checkpoint, self.rotated if self.checkpoint else self.ROTATE) if isinstance(layer, LinearBase) else None
+            return QuantForgeW4A8Method(self.checkpoint, self.rotated if self.checkpoint else self.ROTATE, self.group) if isinstance(layer, LinearBase) else None
 
     @register_quantization_config("quantforge_w4a8_plain")
     class QuantForgeW4A8PlainConfig(QuantForgeW4A8Config):
@@ -417,3 +424,17 @@ if HAVE_VLLM:
         @classmethod
         def from_config(cls, config):
             return cls(checkpoint=False, rotated=False)
+
+    @register_quantization_config("quantforge_w4a8_g64")
+    class QuantForgeW4A8G64Config(QuantForgeW4A8Config):
+        """Online W4A8 with the Hadamard rotation and groups of 64 along K (more accurate than 128, 2-3 % slower)."""
+
+        GROUP = 64
+
+        @classmethod
+        def get_name(cls):
+            return "quantforge_w4a8_g64"
+
+        @classmethod
+        def from_config(cls, config):
+            return cls(checkpoint=False)

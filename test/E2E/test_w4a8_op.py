@@ -253,3 +253,29 @@ def test_rotated_hessian_and_weight_keep_the_layer_output():
     W = torch.randn(256, K, device="cuda", generator=g)
     x = torch.randn(10, K, device="cuda", generator=g)
     assert torch.allclose((x @ B) @ w4a8_op.rotate_weight(W).t(), x @ W.t(), atol=1e-3)
+
+
+def test_group_64_hybrid_op_matches_the_dequantised_reference_and_checkpoint_roundtrip(tmp_path):
+    """A weight quantised with groups of 64 runs through the compact op (decode kernel and INT8 kernel, rotated and not) and equals the dense matmul with its dequantised weight."""
+    _require_gpu()
+    from quantforge import kfold, quant, torch_ops, w4a8_op  # noqa: F401
+
+    K, N, G = 1536, 1024, 64
+    fb = w4a8_op.FALLBACKS
+    g = torch.Generator(device="cuda").manual_seed(5)
+    W = torch.randn(N, K, device="cuda", generator=g) * 0.05
+    for rot in (False, True):
+        Wq = w4a8_op.rotate_weight(W) if rot else W
+        p8, gs, zp, sw = quant.w4a8_quantize(Wq, G)
+        assert gs.shape == (N, K // G)
+        Wd = quant.w4a8_dequantize(p8, gs, zp, sw, G)
+        e = kfold.no_fold(W.device)
+        args = (p8, gs, zp, sw.float(), None, e[0], quant.kmajor_scales(gs), quant.kmajor_scales(zp), e[0], e[1], e[2], G, (gs.float() * sw.float()[:, None]).half())
+        for M in (1, 8, 40, 100, 300):
+            x = torch.randn(M, K, device="cuda", generator=g).half()
+            y = torch.ops.quantforge.w4a8_hybrid(x, *args, rot)
+            xr = w4a8_op.rotate(x) if rot else x
+            ref = xr.float() @ Wd.t()
+            tol = 0.012 if M <= 16 else 0.03                 # INT8 activations above 16 rows
+            assert ((y.float() - ref).norm() / ref.norm()).item() < tol, (rot, M)
+    assert w4a8_op.FALLBACKS == fb, "a fallback served the call: the group-64 kernel was not used"

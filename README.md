@@ -651,6 +651,8 @@ What the simulation says and a rotation of 128 does not: the damage done by the 
 depends on the block size without a clear rule (1.5B, W4 only: no rotation 13.512; blocks of 16 / 32 / 64 / 128 / 256: 13.550 / 13.710 / 13.184 / 13.600 / 13.540), so the block was fixed at 128, the group size of the kernels, rather than tuned on this model.
 `quantization="quantforge_w4a8"` rotates by default; `quantforge_w4a8_plain` is the old method (a different name because vLLM's compile cache is keyed by it, a switch that changes the graph must not be an environment variable);
 a rotated checkpoint says `"rotated": true` in its `quantization_config`. Not applicable to the GPTQ / AWQ W4A16 checkpoints of other people (their weights are not in the rotated basis).
+**Groups of 64** (`quantization="quantforge_w4a8_g64"` online, or `make_w4a8_checkpoint.py --group 64`, the checkpoint carries `"group_size": 64`): the integer group scale of the format (1..16) is its coarse part, and halving the group helps: Qwen2.5-1.5B online 13.395 -> **13.186**; GPTQ checkpoint 12.331 -> **12.253** (the calibrated weights gain less). The INT8 kernel pays 2-3 % for the doubled scale / zero-point traffic (vLLM, 1.5B GPTQ checkpoint, tokens/s at 1 / 16 / 64 / 128 / 256 requests: 131 / 1958 / 5727 / 7390 / 9114 for group 128 against 128 / 1909 / 5624 / 7270 / 8964 for group 64, Marlin 131-141 / 1933-2090 / 5439-5847 / 7043-7242 / 7796-7875 in the two runs, which are noisy). Group 128 stays the default; groups of 32 compile and are exact but cost 4-10 % (CHANGELOG).
+
 Measured on two Qwen2.5 sizes and OLMo-2 1B only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).
 
 ### Mixture-of-experts models (`quantization="quantforge"`)

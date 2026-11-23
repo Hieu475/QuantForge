@@ -30,6 +30,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--train", help="parquet with a `text` column (GPTQ calibration)")
     ap.add_argument("--rtn", action="store_true")
+    ap.add_argument("--group", type=int, default=128, help="group size of the integer scales along K (128, or 64: more accurate, 2-3 %% slower)")
     ap.add_argument("--rotate", action="store_true", help="block-Hadamard rotation of weights and activations (better quality, ~2 %% slower)")
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--calib-len", type=int, default=512)
@@ -41,14 +42,14 @@ def main():
     tok = AutoTokenizer.from_pretrained(ns.model)
     m = AutoModelForCausalLM.from_pretrained(ns.model, dtype=torch.float16, low_cpu_mem_usage=True).eval()
     if ns.rtn:
-        qnn.quantize_model(m, "w4a8", fuse=False)
+        qnn.quantize_model(m, "w4a8", ns.group if ns.group != 128 else 128, fuse=False)
         if ns.rotate:
             raise SystemExit("--rotate with --rtn: use quantization='quantforge_w4a8' on the fp16 model (online, rotated by default)")
     else:
         import pandas as pd
 
         calib = qgptq.calibration_ids(tok, "\n\n".join(pd.read_parquet(ns.train)["text"].iloc[:20000]), ns.nsamples, ns.calib_len, 0)
-        qgptq.quantize_model_gptq(m, calib, 128, fmt="w4a8", fuse=False, verbose=False, rotate=ns.rotate)
+        qgptq.quantize_model_gptq(m, calib, ns.group, fmt="w4a8", fuse=False, verbose=False, rotate=ns.rotate)
     print("saved", ck.save_w4a8(m, ns.out, tok))
 
 

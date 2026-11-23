@@ -292,10 +292,10 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
 
                 if f"{li}.{n}" in rtn_set:
                     if rotate:
-                        packed, gs, zp, sw = quant.w4a8_quantize(rotate_weight(m.weight.data.to(device)))
+                        packed, gs, zp, sw = quant.w4a8_quantize(rotate_weight(m.weight.data.to(device)), group_size)
                         ql = W4A8Linear(packed, gs, zp, sw, None if m.bias is None else m.bias.data.to(device, torch.float16))
                     else:
-                        ql = W4A8Linear.from_linear(m, device)
+                        ql = W4A8Linear.from_linear(m, device, group=group_size)
                 else:
                     W = m.weight.data.to(device)
                     packed, gs, zp, sw = (gptq_quantize_weight_w4a8(rotate_weight(W), rotate_hessian(hess[n]), group_size, blocksize, damp) if rotate

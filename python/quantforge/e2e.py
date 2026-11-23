@@ -779,10 +779,11 @@ class W4A8GemmDq:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, bias: bool = True, workdir=None, chip: str = "sm_80",
-              pipeline_opts: str = W4A8_GEMM_OPTS, kmajor: bool = False) -> "W4A8GemmDq":
+              pipeline_opts: str = W4A8_GEMM_OPTS, kmajor: bool = False, group: int = 0) -> "W4A8GemmDq":
         """`kmajor=True`: ``gs`` / ``zp`` are int8 ``[K/128, N]`` (the weight's own layout stays ``[N, K/2]``): the scale and zero point of the
-        8 output channels a thread dequantises are then 8 adjacent bytes (one vector load) instead of 8 bytes 32 apart."""
-        G = W4A8_GROUP
+        8 output channels a thread dequantises are then 8 adjacent bytes (one vector load) instead of 8 bytes 32 apart. `group`: the group size of gs / zp along K
+        (128 by default; 64 and 32 compile and are exact, see the CHANGELOG)."""
+        G = group or W4A8_GROUP
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
         sz, ix = (f"{K // G}x{N}", "%kg, %n") if kmajor else (f"{N}x{K // G}", "%n, %kg")
@@ -889,10 +890,10 @@ class W4A8DecodeGemm:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, workdir=None, chip: str = "sm_80", pipeline_opts: str = W4A8_DECODE_OPTS,
-              f16_out: bool = False, bias: bool = False, valid_rows: int = 0) -> "W4A8DecodeGemm":
+              f16_out: bool = False, bias: bool = False, valid_rows: int = 0, group: int = 0) -> "W4A8DecodeGemm":
         """`f16_out=True`: the kernel writes f16 itself (``epilogue=f16-store``, with an optional f16 `bias`): one kernel, ``launch(a, bp, zp, sc,
         bias, y)`` with ``y`` f16 ``[M, N]``; otherwise it overwrites an f32 ``[M, N]``."""
-        G = W4A8_GROUP
+        G = group or W4A8_GROUP
         sz, ix = f"{N}x{K // G}", "%n, %kg"
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")

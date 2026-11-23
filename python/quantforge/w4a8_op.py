@@ -79,13 +79,13 @@ def _rule_opts(Mp: int, K: int, N: int) -> str:
     return o(32, 128, 32, 32)
 
 
-def _kernel(Mp: int, K: int, N: int, has_bias: bool, kmajor: bool = False):
-    key = (Mp, K, N, has_bias, kmajor)
+def _kernel(Mp: int, K: int, N: int, has_bias: bool, kmajor: bool = False, group: int = 128):
+    key = (Mp, K, N, has_bias, kmajor) if group == 128 else (Mp, K, N, has_bias, kmajor, group)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8GemmDq
 
-        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias, pipeline_opts=_int8_opts(Mp, K, N, kmajor), kmajor=kmajor)
+        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias, pipeline_opts=_int8_opts(Mp, K, N, kmajor), kmajor=kmajor, group=group)
     return k
 
 
@@ -102,14 +102,14 @@ def _decode_opts(K: int, N: int) -> str:
     return f"decode=true block-tile-n={bn} warp-tile-n=8 block-tile-k=256 smem-stages=3 accumulate=false"
 
 
-def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16):
-    key = ("dec", K, N, has_bias, rows)
+def _decode_kernel(K: int, N: int, has_bias: bool, rows: int = 16, group: int = 128):
+    key = ("dec", K, N, has_bias, rows) if group == 128 else ("dec", K, N, has_bias, rows, group)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8DecodeGemm
 
         k = _KERNELS[key] = W4A8DecodeGemm.build(16, K, N, f16_out=True, bias=has_bias, valid_rows=rows if rows < 16 else 0,
-                                                 pipeline_opts=_decode_opts(K, N))
+                                                 pipeline_opts=_decode_opts(K, N), group=group)
     return k
 
 
@@ -216,10 +216,10 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
         try:
             if M in (1, 2, 4, 8) and x2.is_contiguous() and x2.data_ptr() % 16 == 0:     # exactly M rows: no padded copy (valid-rows kernel)
                 out = torch.empty(M, N, device=x.device, dtype=torch.float16)
-                _decode_kernel(K, N, bias is not None, M).launch(x2, p8, zp, scale_nk, out, b)
+                _decode_kernel(K, N, bias is not None, M, group).launch(x2, p8, zp, scale_nk, out, b)
                 return out.reshape(*lead, N)
             out = torch.empty(16, N, device=x.device, dtype=torch.float16)
-            _decode_kernel(K, N, bias is not None).launch(_padded16(x2), p8, zp, scale_nk, out, b)
+            _decode_kernel(K, N, bias is not None, 16, group).launch(_padded16(x2), p8, zp, scale_nk, out, b)
             return out[:M].reshape(*lead, N)
         except KernelUnavailable:
             return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
@@ -230,7 +230,7 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
     kmajor = packed16.numel() == 0 and scale16.numel() > 0          # compact layer: gs / zp also kept as int8 [K/128, N] (scale16 / zero16 carry them)
     gk, zk = (scale16, zero16) if kmajor else (gs, zp)
     try:
-        k = _kernel(Mp, K, N, bias is not None, kmajor)
+        k = _kernel(Mp, K, N, bias is not None, kmajor, group)
     except KernelUnavailable:
         if fuse:
             x2 = _rotate_impl(x2)

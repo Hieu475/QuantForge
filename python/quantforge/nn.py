@@ -420,6 +420,7 @@ class W4A8Linear(INT8W8A8Linear):
         self.register_buffer("bias", bias)
         self.backend = "quantforge"
         self.rotate = False        # True: the weight was quantised after a block-Hadamard rotation (w4a8_op.rotate_weight); the forward rotates its input the same way
+        self.group = self.in_features // group_scale.shape[1]       # 128 (default) or 64 / 32 along K
         self.use_compiled = self.out_features % self._TILE_N == 0 and self.in_features % self._TILE_K == 0
         self.register_buffer("_w_scale32", w_scale.float().contiguous(), persistent=False)
         self.register_buffer("_bias32", (bias if bias is not None else torch.zeros(self.out_features, device=packed.device)).float().contiguous(),
@@ -428,12 +429,14 @@ class W4A8Linear(INT8W8A8Linear):
 
     @classmethod
     @torch.no_grad()
-    def from_linear(cls, lin: nn.Linear, device="cuda", backend: str = "quantforge") -> "W4A8Linear":
+    def from_linear(cls, lin: nn.Linear, device="cuda", backend: str = "quantforge", group: int = 128) -> "W4A8Linear":
         from .quant import w4a8_quantize
 
         if lin.in_features % 128 or lin.out_features % 128:
             raise ValueError("w4a8 needs in_features and out_features that are multiples of 128")
-        packed, gs, zp, sw = w4a8_quantize(lin.weight.data.to(device, torch.float32))
+        if lin.in_features % group:
+            raise ValueError(f"in_features {lin.in_features} is not a multiple of the group size {group}")
+        packed, gs, zp, sw = w4a8_quantize(lin.weight.data.to(device, torch.float32), group)
         bias = None if lin.bias is None else lin.bias.data.to(device, torch.float16)
         return cls(packed, gs, zp, sw, bias)
 
@@ -454,7 +457,7 @@ class W4A8Linear(INT8W8A8Linear):
     def _build_kernel(self, Mp: int, K: int):
         from .e2e import W4A8GemmDq
 
-        return W4A8GemmDq.build(Mp, K, self.out_features, bias=True)
+        return W4A8GemmDq.build(Mp, K, self.out_features, bias=True, group=self.group)
 
     def _launch(self, k, xq, s_x, y) -> None:
         k.launch(xq, self.weight, self.group_scale, self.group_zero, s_x, self._w_scale32, self._bias32, y)
@@ -476,7 +479,7 @@ class W4A8Linear(INT8W8A8Linear):
     def dequantized_weight(self) -> torch.Tensor:
         from .quant import w4a8_dequantize
 
-        return w4a8_dequantize(self.weight, self.group_scale, self.group_zero, self.w_scale).half()
+        return w4a8_dequantize(self.weight, self.group_scale, self.group_zero, self.w_scale, self.group).half()
 
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, fmt=w4a8"
@@ -758,7 +761,7 @@ def quantize_model(model: nn.Module, fmt: str = "int4", group_size: int = 128,
     for mod, cname, lin, full in targets:
         try:
             if fmt == W4A8_FORMAT:
-                ql = W4A8Linear.from_linear(lin, device)
+                ql = W4A8Linear.from_linear(lin, device, group=group_size)
             elif fmt == INT8_W8A8_FORMAT:
                 ql = INT8W8A8Linear.from_linear(lin, device, backend=int8_backend)
             elif fmt == W8A8_FORMAT:
