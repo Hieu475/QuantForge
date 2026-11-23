@@ -166,3 +166,29 @@ def test_moe_ffn_ignores_invalid_expert_ids():
     got = moe.moe_ffn_impl(x, ids_bad, tw, *w, G)
     assert (got.float() - ref.float()).abs().max().item() < 2e-2 * ref.float().abs().max().item() + 2e-3
     assert got[2].abs().max().item() == 0.0
+
+
+def test_grouped_swiglu16_writes_f16_directly_and_matches_the_f32_kernel():
+    """`kind="swiglu16"`: the same silu(gate) * up, stored as f16 into its own [rows, N/2] output."""
+    _require_gpu()
+    Mcap, E, K, I, G = 16, 4, 256, 128, 64
+    meta_l = [3, 1, 1, -1, 0]
+    P = len(meta_l)
+    qg, sg, zg = _experts(E, K, I, G, 2)
+    qu, su, zu = _experts(E, K, I, G, 3)
+    inter = [quant.interleave_gate_up((pack_int4(qg[e]), sg[e], zg[e]), (pack_int4(qu[e]), su[e], zu[e])) for e in range(E)]
+    packed, sc, zp = (torch.stack([t[i] for t in inter]).contiguous() for i in range(3))
+    g = torch.Generator(device="cuda").manual_seed(4)
+    rows = (torch.rand(P * Mcap, K, device="cuda", generator=g) * 2 - 1).half()
+    meta = torch.tensor(meta_l, dtype=torch.int32, device="cuda")
+    out32 = torch.zeros(P * Mcap, 2 * I, device="cuda", dtype=torch.float32)
+    GroupedGemm.build(Mcap, K, 2 * I, E, P, G, "swiglu", OPTS[16]).launch(rows, packed, sc, zp, out32, meta)
+    out16 = torch.full((P * Mcap, I), 7.0, device="cuda", dtype=torch.half)               # padding problems must stay untouched
+    GroupedGemm.build(Mcap, K, 2 * I, E, P, G, "swiglu16", OPTS[16]).launch(rows, packed, sc, zp, out16, meta)
+    for p, e in enumerate(meta_l):
+        blk = out16[p * Mcap:(p + 1) * Mcap]
+        if e < 0:
+            assert (blk == 7.0).all()
+        else:
+            ref = out32[p * Mcap:(p + 1) * Mcap, :I]
+            assert (blk.float() - ref).abs().max().item() < 2e-3 * ref.abs().max().item() + 1e-3, (p, e)

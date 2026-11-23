@@ -18,8 +18,8 @@ def main():
     from vllm import LLM, SamplingParams
 
     name, quant = sys.argv[1], sys.argv[2]
-    llm = LLM(model=name, quantization=None if quant == "none" else quant, dtype="float16", gpu_memory_utilization=0.6,
-              max_model_len=2048, max_num_batched_tokens=4096, enable_prefix_caching=False)
+    llm = LLM(model=name, quantization=None if quant == "none" else quant, dtype="float16", gpu_memory_utilization=float(__import__("os").environ.get("QF_GPU_UTIL", "0.6")),
+              max_model_len=int(__import__("os").environ.get("QF_MAX_LEN", "2048")), max_num_batched_tokens=int(__import__("os").environ.get("QF_MAX_TOK", "4096")), enable_prefix_caching=False)
     words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".split()
     long_prompts = [" ".join(words[(i + j) % len(words)] for j in range(900)) for i in range(16)]
     ntok = len(llm.get_tokenizer().encode(long_prompts[0]))

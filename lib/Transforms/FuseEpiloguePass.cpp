@@ -372,6 +372,20 @@ struct FuseEpiloguePass
       });
     });
     if (kind == "swiglu") {
+      Value f16Out;
+      {
+        func::FuncOp fn = getOperation();
+        for (unsigned i = 0; i < fn.getNumArguments(); ++i)
+          if (fn.getArgAttr(i, "quantforge.swiglu_out"))
+            f16Out = fn.getArgument(i);
+        if (f16Out) {
+          auto mt = dyn_cast<MemRefType>(f16Out.getType());
+          if (!mt || mt.getRank() != 2 || !mt.getElementType().isF16()) {
+            fn.emitError("quantforge.swiglu_out must be a rank-2 f16 memref");
+            return signalPassFailure();
+          }
+        }
+      }
       for (Operation *op : stores) {
         auto st = dyn_cast<vector::StoreOp>(op);
         auto vt = st ? dyn_cast<VectorType>(st.getValueToStore().getType()) : VectorType();
@@ -401,7 +415,13 @@ struct FuseEpiloguePass
         Value silu = b.create<arith::MulFOp>(loc, gate, sigmoid(b, loc, gate));
         Value res = b.create<arith::MulFOp>(loc, silu, up);
         Value half = b.create<arith::DivUIOp>(loc, col, b.create<arith::ConstantIndexOp>(loc, 2));
-        b.create<memref::StoreOp>(loc, res, memref, ValueRange{row, half});
+        if (f16Out) {
+          // the result goes to its own f16 [M, N/2] argument (`quantforge.swiglu_out`): no f32 buffer, no later conversion
+          Value h16 = b.create<arith::TruncFOp>(loc, b.getF16Type(), res);
+          b.create<memref::StoreOp>(loc, h16, f16Out, ValueRange{row, half});
+        } else {
+          b.create<memref::StoreOp>(loc, res, memref, ValueRange{row, half});
+        }
         st->erase();
       }
       return;

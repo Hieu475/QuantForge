@@ -27,14 +27,16 @@ class GroupedGemm:
     """``out[z*Mcap:(z+1)*Mcap] = rows[z*Mcap:(z+1)*Mcap] @ dequant(W[meta[z]])`` for every problem z with ``meta[z] >= 0``.
 
     ``kind="f16"``: f16 output (``epilogue=f16-store``). ``kind="swiglu"``: gate and up projections interleaved by column
-    (``quant.interleave_gate_up``), f32 output of ``silu(gate) * up`` in the first N/2 columns."""
+    (``quant.interleave_gate_up``), f32 output of ``silu(gate) * up`` in the first N/2 columns. ``kind="swiglu16"``: the same, written as f16 into its own
+    ``[rows, N/2]`` output (`out` of `launch` has N/2 columns): no f32 buffer, no conversion kernel."""
 
     def __init__(self, compiled, name: str, kind: str, Mcap: int, K: int, N: int, E: int, P: int, group_size: int):
         self.kind, self.Mcap, self.K, self.N, self.E, self.P, self.group_size = kind, Mcap, K, N, E, P, group_size
         self.compiled = compiled
         self._lib = ctypes.CDLL(str(compiled.lib_path))
         self._fn = getattr(self._lib, f"_mlir_ciface_{name}")
-        self._fn.argtypes = [ctypes.c_void_p] * 7
+        self._fn.argtypes = [ctypes.c_void_p] * (8 if kind == "swiglu16" else 7)
+        self._dummy = None
         self._fn.restype = None
         self._set_stream = self._lib.mgpuSetStream
         self._set_stream.argtypes = [ctypes.c_void_p]
@@ -43,20 +45,26 @@ class GroupedGemm:
     @classmethod
     def build(cls, Mcap: int, K: int, N: int, E: int, P: int, group_size: int = 128, kind: str = "f16",
               pipeline_opts: str = "", workdir=None, chip: str = "sm_80") -> "GroupedGemm":
-        if kind not in ("f16", "swiglu"):
-            raise ValueError("kind must be 'f16' or 'swiglu'")
+        if kind not in ("f16", "swiglu", "swiglu16"):
+            raise ValueError("kind must be 'f16', 'swiglu' or 'swiglu16'")
         if P < 1:
             raise ValueError("need at least one problem")
         _check_shape(Mcap, K, N, tile_sizes(pipeline_opts))
-        if kind == "swiglu":
+        roles = ROLES
+        if kind in ("swiglu", "swiglu16"):
             name = "w4a16_gemm"
             ir = w4a16_gemm_ir(Mcap, K, N, name, "f32", group_size, pipeline_opts)
             opts = f"{pipeline_opts} epilogue=swiglu"
+            if kind == "swiglu16":
+                old = f"%c: tensor<{Mcap}x{N}xf32>) -> tensor<{Mcap}x{N}xf32>"
+                assert old in ir
+                ir = ir.replace(old, f"%c: tensor<{Mcap}x{N}xf32>, %y: tensor<{Mcap}x{N // 2}xf16> {{quantforge.swiglu_out}}) -> tensor<{Mcap}x{N}xf32>")
+                roles = "reeesr"                           # act, packed, scale, zero, c (never touched), y
         else:
             name = "w4a16_gemm_f16"
             ir = w4a16_f16_ir(Mcap, K, N, group_size, name, False)
             opts = f"{pipeline_opts} accumulate=false epilogue=f16-store"
-        opts = f"{opts} expert-problems={P} expert-roles={ROLES}".strip()
+        opts = f"{opts} expert-problems={P} expert-roles={roles}".strip()
         with tempfile.TemporaryDirectory() as tmp:
             return cls(compile_ir(ir, workdir or tmp, chip=chip, pipeline_opts=opts), name, kind, Mcap, K, N, E, P, group_size)
 
@@ -65,7 +73,13 @@ class GroupedGemm:
         import torch
 
         M = self.Mcap
-        descs = [_descriptor(t) for t in (rows[:M], packed[0], scale[0], zero[0], out[:M], meta)]
+        if self.kind == "swiglu16":
+            if self._dummy is None:                         # the f32 [M, N] result of the plain swiglu kernel: declared, never read or written
+                self._dummy = torch.empty(M, self.N, dtype=torch.float32, device=rows.device)
+            tensors = (rows[:M], packed[0], scale[0], zero[0], self._dummy, out[:M], meta)
+        else:
+            tensors = (rows[:M], packed[0], scale[0], zero[0], out[:M], meta)
+        descs = [_descriptor(t) for t in tensors]
         self._set_stream(_current_raw_stream(torch, rows.device.index or 0))
         self._fn(ctypes.byref(self._result), *(ctypes.byref(d) for d in descs))
 
@@ -78,7 +92,7 @@ import threading  # noqa: E402
 
 import torch  # noqa: E402
 
-_T_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)         # larger batches run in chunks of 256 tokens: bounds the f32 gate/up buffer (a KV-cache-sized cost in vLLM)
+_T_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)    # larger batches run in chunks of 512 tokens: bounds the intermediate buffers (a KV-cache-sized cost in vLLM); every chunk reads all the experts again
 MAX_TOKENS = _T_BUCKETS[-1]            # larger batches run in chunks of this many tokens
 _kernels: dict = {}
 _lock = threading.RLock()
@@ -89,7 +103,7 @@ def _row_tile(tokens: int, top_k: int, E: int) -> int:
     if os.environ.get("QUANTFORGE_MOE_ROWS"):              # experiments: force the row tile
         return int(os.environ["QUANTFORGE_MOE_ROWS"])
     avg = tokens * top_k / E
-    return 16 if avg <= 8 else 32 if avg <= 24 else 64 if avg <= 56 else 128
+    return 16 if avg <= 8 else 32 if avg <= 40 else 64      # 128 rows never won: it pads the experts that have a few more rows than the tile and ran 30 % slower at 512 tokens
 
 
 def _problems(tokens: int, top_k: int, E: int, mcap: int) -> int:
@@ -108,6 +122,12 @@ def _opts(mcap: int, K: int, N: int) -> str:
 
     if mcap == 16 and K % 64 == 0 and N % 128 == 0 and K >= 256:
         return _GROUPED_DECODE
+    if mcap >= 32 and K % 64 == 0 and N % 128 == 0 and K >= 256:
+        # Rows per expert block of 32 / 64 / 128 (prefill): the dense schedule of that row count reads every expert's weights once per 64-row half of a 128-row
+        # problem and had the wrong warp tiles. A sweep (cold weights, 64 experts, all candidates of block 64..256 columns, warp tiles, K tile 32..128, 1-3 stages)
+        # found one family: K tile 64, one stage, look-ahead 1, 128-column blocks; 17-27 % faster than the dense rule for the gate/up kernel, 23 % for the down kernel at 64 rows.
+        wm, wn = {32: (32, 32), 64: (32, 64), 128: (64, 32)}.get(mcap, (32, 64))
+        return f"block-tile-m={mcap} warp-tile-m={wm} block-tile-n=128 warp-tile-n={wn} block-tile-k=64 smem-stages=1 prefetch-distance=1"
     return t.default_opts(mcap, K, N)
 
 
@@ -187,25 +207,23 @@ def moe_ffn_impl(x, topk_ids, topk_w, packed13, scale13, zero13, packed2, scale2
     Tb = bucket_tokens(T)
     mcap = _row_tile(Tb, k, E)
     P = _problems(Tb, k, E, mcap)
-    k1 = _kernel("swiglu", mcap, H, 2 * I, E, P, group_size)
+    k1 = _kernel("swiglu16", mcap, H, 2 * I, E, P, group_size)
     k2 = _kernel("f16", mcap, I, H, E, P, group_size)
     R = P * mcap
     if _fast_ops():
         ops = torch.ops.quantforge
         dest, row_src, meta = ops.moe_route(topk_ids.contiguous(), E, mcap, P)
         rows = ops.moe_gather(x.contiguous(), row_src, k)
-        g1 = torch.empty(R, 2 * I, dtype=torch.float32, device=x.device)
-        k1.launch(rows, packed13, scale13, zero13, g1, meta)
-        h = ops.moe_cast_rows(g1, meta, mcap, I)
+        h = torch.empty(R, I, dtype=torch.float16, device=x.device)      # the grouped kernel writes silu(gate) * up as f16 itself
+        k1.launch(rows, packed13, scale13, zero13, h, meta)
         y = torch.empty(R + 1, H, dtype=torch.float16, device=x.device)
         k2.launch(h, packed2, scale2, zero2, y, meta)
         return ops.moe_combine(y, dest, topk_w.contiguous())
     dest, token, dest_sorted, meta, valid = route(topk_ids, E, mcap, P)
     rows = torch.zeros(R + 1, H, dtype=torch.float16, device=x.device)       # + the scratch row of the invalid pairs
     rows[dest_sorted] = x[token]
-    g1 = torch.empty(R, 2 * I, dtype=torch.float32, device=x.device)
-    k1.launch(rows, packed13, scale13, zero13, g1, meta)
-    h = g1[:, :I].to(torch.float16).contiguous()
+    h = torch.empty(R, I, dtype=torch.float16, device=x.device)
+    k1.launch(rows, packed13, scale13, zero13, h, meta)
     y = torch.empty(R + 1, H, dtype=torch.float16, device=x.device)
     k2.launch(h, packed2, scale2, zero2, y, meta)
     y[R].zero_()
@@ -287,5 +305,5 @@ def prepare(E: int, H: int, I: int, top_k: int, group_size: int, max_tokens: int
             continue
         mcap = _row_tile(Tb, top_k, E)
         P = _problems(Tb, top_k, E, mcap)
-        _kernel("swiglu", mcap, H, 2 * I, E, P, group_size)
+        _kernel("swiglu16", mcap, H, 2 * I, E, P, group_size)
         _kernel("f16", mcap, I, H, E, P, group_size)

@@ -646,6 +646,10 @@ RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache
 | QuantForge | 195 tok/s | 799 | 1525 | 1778 |
 | ratio | **0.94** | **0.94** | **0.94** | 0.66 |
 
+Prefill (16 prompts of ~1275 tokens, 1024-token steps; vLLM's Marlin MoE 12117 / 11809 tokens/s): this op ran at 6873 / 6944 (0.58x), now 10616 / 10518 (0.88x). What changed it: the gate/up kernel writes `silu(gate) * up` as f16 itself (`quantforge.swiglu_out`,
+`GroupedGemm(kind="swiglu16")`: no f32 buffer, no conversion kernel, so the chunks could grow from 256 to 512 tokens and every expert's weights are read half as often), and the grouped kernels got their own schedules for 32 / 64-row tiles (a sweep over
+64-256-column blocks, warp tiles, K tiles, stages: K tile 64, one stage, look-ahead 1, 128-column blocks, 17-27 % faster than the dense schedule of the same row count, which also read the weights twice per 128-row problem); the row tile is 16 / 32 / 64 by rows per expert (128 never won).
+
 The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). The gap at 32 requests is **not** explained yet. What is known (nsys with CUDA-graph
 node tracing, 48 decode steps isolated by differencing two lengths, 32 requests): GPU kernel time per decode step is 17.8 ms against 14.2 ms for Marlin, the GEMMs 13.5 ms against 9.9 ms; the router touches ~27 active experts per layer (counted on the device inside the graph).
 In a micro-benchmark with the same 27 experts, cold weights, CUDA-graph replay and spread over a 2.7 GB model the whole MoE op (routing, both grouped GEMMs, combine) runs at 156 GB/s of expert bytes at 20, 27, 40 and 64 active experts (the read ceiling measured with `torch.sum` is 164 GB/s), i.e. 545 us per layer, 8.7 ms for 16 layers;
