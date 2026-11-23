@@ -273,22 +273,38 @@ def unpack_k8(packed: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def w4a8_quantize(w: torch.Tensor, group: int = 128):
+def w4a8_quantize(w: torch.Tensor, group: int = 128, channel_clips: tuple = (1.0,)):
     """Progressive INT4 quantisation of a weight ``[N, K]`` for the W4A8 kernel (QServe's scheme): INT8 per output channel (the usual
     +-127), then INT4 per group of `group` along K with an *integer* scale ``gs`` (1..16) and an integer zero point ``z`` (0..15)
     per group, chosen to minimise the squared error of the group (a group may clip its largest values when that buys a finer step for
     the rest). The weight the tensor cores see is ``(q - z) * gs`` with q in 0..15; the candidates are limited to the (gs, z) for which
     that stays inside int8 ([-128, 127]), so the kernel's 8-bit arithmetic cannot wrap, and the only float scale is per channel.
 
+    ``channel_clips``: ratios of the channel's largest magnitude that may map to +-127 (default only 1.0 = no clipping of the channel); with several, every output channel
+    keeps the ratio whose whole quantised row (INT8 channel step, then the groups' integer steps) is closest to the original in squared error.
+
     Returns ``(packed int8 [N, K/2] (`pack_k8` layout), gs int8 [N, K/group], z int8 [N, K/group], sw f32 [N])``."""
     N, K = w.shape
     if K % group or K % 2:
         raise ValueError(f"in_features={K} must be a multiple of {group}")
     w = w.float()
-    sw = (w.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
-    g8 = (w / sw[:, None]).round().clamp(-127, 127).reshape(N, K // group, group)
-    gs, zp = w4a8_group_params(g8)
-    q = (g8 / gs[:, :, None] + zp[:, :, None]).round().clamp(0, 15)
+    amax = w.abs().amax(dim=1).clamp(min=1e-8 * 127.0)
+    best = None
+    for c in channel_clips:
+        sw_c = amax * c / 127.0
+        g8_c = (w / sw_c[:, None]).round().clamp(-127, 127).reshape(N, K // group, group)
+        gs_c, zp_c = w4a8_group_params(g8_c)
+        q_c = (g8_c / gs_c[:, :, None] + zp_c[:, :, None]).round().clamp(0, 15)
+        if len(channel_clips) == 1:
+            best = (sw_c, g8_c, gs_c, zp_c, q_c, None)
+            break
+        err = (((q_c - zp_c[:, :, None]) * gs_c[:, :, None]).reshape(N, K) * sw_c[:, None] - w).square().sum(1)
+        if best is None:
+            best = (sw_c, g8_c, gs_c, zp_c, q_c, err)
+        else:
+            m = err < best[5]
+            best = tuple(torch.where(m.reshape(-1, *([1] * (a.dim() - 1))), b, a) for a, b in zip(best[:5], (sw_c, g8_c, gs_c, zp_c, q_c))) + (torch.minimum(err, best[5]),)
+    sw, g8, gs, zp, q = best[:5]
     nib = q.to(torch.uint8).reshape(N, K)
     packed = pack_k8(nib)
     return packed, gs.to(torch.int8).contiguous(), zp.to(torch.int8).contiguous(), sw

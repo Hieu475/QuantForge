@@ -18,14 +18,41 @@ def hadamard(n):
     return H / math.sqrt(n)
 
 
-def quant_w(W, G=128, bits=4):                     # [N, K] -> fake-quantised [N, K], asymmetric, group along K
+CLIPS = (1.0,)                                      # candidate clip ratios of a group's range (set by --clip)
+
+
+def quant_w(W, G=128, bits=4):                     # [N, K] -> fake-quantised [N, K], asymmetric, group along K; the clip ratio of each group is the one with the smallest squared error
     N, K = W.shape
     w = W.float().reshape(N, K // G, G)
-    lo, hi = w.amin(-1, keepdim=True), w.amax(-1, keepdim=True)
+    lo0, hi0 = w.amin(-1, keepdim=True), w.amax(-1, keepdim=True)
     q = 2 ** bits - 1
-    s = ((hi - lo) / q).clamp_min(1e-8)
-    z = (-lo / s).round()
-    return (((w / s).round() + z).clamp(0, q) - z).mul(s).reshape(N, K)
+    best, best_e = None, None
+    for c in CLIPS:
+        lo, hi = lo0 * c, hi0 * c
+        s = ((hi - lo) / q).clamp_min(1e-8)
+        z = (-lo / s).round()
+        dq = (((w / s).round() + z).clamp(0, q) - z).mul(s)
+        e = (dq - w).pow(2).sum(-1, keepdim=True)
+        if best is None:
+            best, best_e = dq, e
+        else:
+            better = e < best_e
+            best = torch.where(better, dq, best); best_e = torch.minimum(e, best_e)
+    return best.reshape(N, K)
+
+
+CHCLIPS = None                                       # per-channel clip ratios of the real W4A8 quantiser (--chclip); None: use quant_w (float scales)
+
+
+def quant_w_real(W):                                  # the weight the W4A8 kernel really sees: INT8 channel scale, integer group scale / zero point (quantforge.quant)
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "python"))
+    from quantforge import quant
+    out = []
+    for r in range(0, W.shape[0], 1024):
+        p8, gs, zp, sw = quant.w4a8_quantize(W[r:r + 1024].float(), 128, CHCLIPS)
+        out.append(quant.w4a8_dequantize(p8, gs, zp, sw))
+    return torch.cat(out)
 
 
 def quant_a(x):                                    # per-token symmetric int8
@@ -43,7 +70,7 @@ class QLinear(torch.nn.Module):
             self.H = hadamard(block).to(W.device)
             N, K = W.shape
             W = (W.reshape(N, K // block, block) @ self.H).reshape(N, K)
-        self.weight = quant_w(W, 128, wbits).to(lin.weight.dtype) if wbits else W.to(lin.weight.dtype)
+        self.weight = (quant_w_real(W) if CHCLIPS else quant_w(W, 128, wbits)).to(lin.weight.dtype) if wbits else W.to(lin.weight.dtype)
         self.bias, self.a8, self.block = lin.bias, a8, block
 
     def forward(self, x):
@@ -59,7 +86,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model"); ap.add_argument("--block", type=int, default=128); ap.add_argument("--windows", type=int, default=40)
     ap.add_argument("--len", type=int, default=512); ap.add_argument("--variants", default="fp16,w4,w4a8,rot-w4,rot-w4a8,rot-a8")
+    ap.add_argument("--chclip", default="", help="use the real W4A8 quantiser with these per-channel clip ratios (e.g. 1.0 or 1.0,0.95,0.9)")
+    ap.add_argument("--clip", default="1.0", help="comma separated clip ratios searched per group (e.g. 1.0,0.95,0.9,0.85,0.8)")
     a = ap.parse_args()
+    global CLIPS, CHCLIPS
+    CHCLIPS = tuple(float(x) for x in a.chclip.split(",")) if a.chclip else None
+    CLIPS = tuple(float(x) for x in a.clip.split(","))
     from huggingface_hub import hf_hub_download
     import pandas as pd
     from transformers import AutoModelForCausalLM, AutoTokenizer
