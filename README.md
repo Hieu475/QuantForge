@@ -697,7 +697,7 @@ The generated text is identical to the one of vLLM's Marlin MoE on four prompts 
 
 ### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
 
-An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, `quant.w4a8_quantize`) while vLLM loads it: `LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")`.
+An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, `quant.w4a8_quantize`, after the Hadamard rotation of ["Hadamard rotation of W4A8"](#hadamard-rotation-of-w4a8-new-in-050); `quantforge_w4a8_plain` skips it, `quantforge_w4a8_g64` uses groups of 64) while vLLM loads it: `LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")`.
 Every linear layer whose sizes are multiples of 128 calls `torch.ops.quantforge.w4a8_hybrid` (`w4a8_op.py`): above 16 rows the compiled W4A8 kernel on the INT8 tensor cores (the per-token activation quantisation is the compiled
 `_int8_quantize_tokens`; with an eager one the prefill was half as fast), up to 16 rows the W4A16 decode kernels (with K-folding), both from the same weight; the branch is inside the op, so `torch.compile` and CUDA graphs see none.
 Measured on vLLM 0.25.1 (RTX 4050; `benchmarks/vllm_prefill.py`: prefill of 16 prompts of 975 tokens, decode of 1 / 16 requests; tokens/s, best of 3):
@@ -728,7 +728,7 @@ that the prefill GEMMs run on the INT8 tensor cores; its costs are that the weig
 
 ### W4A8 checkpoints for vLLM (GPTQ quality, loads in seconds)
 
-`benchmarks/make_w4a8_checkpoint.py <model> <out_dir> --train <wikitext-2 train parquet>` quantises a Hugging Face model with the GPTQ of this format (`quantize_model_gptq(..., fmt="w4a8")`; `--rtn` for round-to-nearest) and writes it with
+`benchmarks/make_w4a8_checkpoint.py <model> <out_dir> --train <wikitext-2 train parquet>` quantises a Hugging Face model with the GPTQ of this format (`quantize_model_gptq(..., fmt="w4a8")`; `--rtn` for round-to-nearest; `--rotate` for the Hadamard rotation, decided per layer; `--group 64`) and writes it with
 `quantforge.w4a8_checkpoint.save_w4a8`: per decoder linear layer `weight` (int8 `[N, K/2]`, the `pack_k8` layout), `group_scale` / `group_zero` (int8 `[N, K/128]`), `w_scale` (f32 `[N]`), everything else dense fp16, and
 `quantization_config = {"quant_method": "quantforge_w4a8"}` in `config.json`. `LLM("out_dir", quantization="quantforge_w4a8")` then loads the quantised tensors as they are (the loader shards them like any other layer): no fp16 copy, no round-to-nearest
 step. Qwen2.5-3B (GPTQ, perplexity 12.54 against 13.47 for the online round-to-nearest): 1.99 GiB, **loads in 2 s** (25 s online), prefill 6678 tokens/s, decode 65 / 994 at 1 / 16 requests (compact mode), the same speed as the online path.
@@ -788,6 +788,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
   that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.04 / 1.13 / 1.18x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows of one GEMM it is 0.8-1.0x of Marlin (the INT8 kernel itself is on par; the activation quantisation and, at 1-16 rows, the decode kernel cost the rest).
+* W4A8 rotation: measured on Qwen2.5 (0.5B, 1.5B), OLMo-2 1B, Phi-3.5-mini and Llama-3.2 (1B, 3B) only; it is not a free win (rotated everywhere, Llama-3.2-3B gets 1.1 perplexity worse because of one massive-activation layer) and the online method relies on a rule (the `down_proj` of the first four layers stays unrotated) that six models support, not prove. Use `quantforge_w4a8_plain` as the reference when trying a new family; the GPTQ path decides per layer from calibration data.
 * MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.93-0.96 of Marlin MoE at 1-32 concurrent requests, 0.88 in prefill. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
