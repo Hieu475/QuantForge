@@ -644,13 +644,14 @@ Wikitext-2 perplexity (`benchmarks/vllm_ppl.py`, the kernels vLLM really runs; f
 |---|--:|--:|--:|
 | Qwen2.5-1.5B, online round-to-nearest | 11.932 | 13.949 | **13.395** |
 | Qwen2.5-0.5B, online round-to-nearest | 18.10 | 23.148 | **21.195** |
+| OLMo-2-0425-1B-Instruct (another family), online round-to-nearest | 17.188 | 20.843 | **18.953** |
 | Qwen2.5-1.5B, GPTQ checkpoint | 11.932 | 12.864 | **12.331** |
 
 What the simulation says and a rotation of 128 does not: the damage done by the INT8 activations (+0.42 / +0.63 on the two models) all but disappears (+0.01 / +0.04 on top of the rotated W4 weights); the effect on the 4-bit weights themselves
 depends on the block size without a clear rule (1.5B, W4 only: no rotation 13.512; blocks of 16 / 32 / 64 / 128 / 256: 13.550 / 13.710 / 13.184 / 13.600 / 13.540), so the block was fixed at 128, the group size of the kernels, rather than tuned on this model.
 `quantization="quantforge_w4a8"` rotates by default; `quantforge_w4a8_plain` is the old method (a different name because vLLM's compile cache is keyed by it, a switch that changes the graph must not be an environment variable);
 a rotated checkpoint says `"rotated": true` in its `quantization_config`. Not applicable to the GPTQ / AWQ W4A16 checkpoints of other people (their weights are not in the rotated basis).
-Measured on two Qwen2.5 sizes only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).
+Measured on two Qwen2.5 sizes and OLMo-2 1B only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).
 
 ### Mixture-of-experts models (`quantization="quantforge"`)
 
