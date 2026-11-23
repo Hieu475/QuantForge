@@ -21,6 +21,7 @@ add_mlir_library(QuantForgeTransforms
   ThreadDistributePass.cpp             # warp/lane loops -> threadIdx
   FuseProducerIntoLoadsPass.cpp        # dequant recomputed at the smem staging loads
   PrefetchWeightLoadsPass.cpp          # multi-tile look-ahead of the weight loads (iter_args)
+  ExpertBatchPass.cpp                  # grouped GEMM for MoE: grid.z problems, per-expert weight pointers
   OverwriteOutputPass.cpp              # C = A @ W (accumulators start from zero)
   FuseEpiloguePass.cpp                 # relu / silu / gelu on the accumulator before the C store
   SinkDequantStoresPass.cpp            # overlap the weight-load latency with the MMAs

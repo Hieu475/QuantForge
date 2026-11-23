@@ -161,6 +161,70 @@ if HAVE_VLLM:
         def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
             return _apply(layer, x, bias)
 
+    try:                              # mixture-of-experts layers (vLLM >= 0.25: RoutedExperts + MoeWNA16Method)
+        from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
+        from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
+        HAVE_MOE = True
+    except ImportError:
+        HAVE_MOE = False
+
+    if HAVE_MOE:
+
+        def _wna16_settings(cfg: "QuantForgeConfig") -> "QuantForgeConfig":
+            """``MoeWNA16Method.create_weights`` / its weight loader read these from the quantization config (and vLLM keeps the config
+            object on the layer, so it has to stay a real ``QuantizationConfig``)."""
+            cfg.bit8_pack_factor = 8 // cfg.weight_bits
+            cfg.linear_quant_method = "awq" if cfg.awq else "gptq"
+            cfg.has_zp = True if cfg.awq else not cfg.is_sym
+            return cfg
+
+        class QuantForgeMoEMethod(MoeWNA16Method):
+            """Mixture-of-experts layers of a 4-bit GPTQ / AWQ checkpoint: vLLM's own loader fills its WNA16 tensors, after loading they are
+            converted to the grouped-GEMM layout (``moe.from_wna16``) and the whole expert MLP of a layer runs as two grouped QuantForge
+            kernels (``moe.moe_ffn_impl``): routing with vLLM's router, no host synchronisation, so CUDA graphs capture it."""
+
+            def __init__(self, quant_config: "QuantForgeConfig", moe) -> None:
+                FusedMoEMethodBase.__init__(self, moe)            # not MoeWNA16Method's: it would pick one of vLLM's kernels
+                self.quant_config = _wna16_settings(quant_config)
+                if self.quant_config.weight_bits != 4:
+                    raise NotImplementedError("quantforge: only 4-bit mixture-of-experts layers are supported")
+
+            def get_fused_moe_quant_config(self, layer):
+                return None
+
+            def process_weights_after_loading(self, layer) -> None:
+                from . import moe as qmoe
+
+                has_zp = self.quant_config.has_zp
+                get = lambda n: getattr(layer, n).data if hasattr(layer, n) and getattr(layer, n).numel() else None   # noqa: E731
+                tensors = qmoe.from_wna16(get("w13_qweight"), get("w13_scales"), get("w13_qzeros") if has_zp else None,
+                                          get("w2_qweight"), get("w2_scales"), get("w2_qzeros") if has_zp else None)
+                for name in ("w13_qweight", "w13_scales", "w13_qzeros", "w2_qweight", "w2_scales", "w2_qzeros", "w13_weight", "w2_weight"):
+                    if hasattr(layer, name):
+                        delattr(layer, name)
+                layer.qf_moe = tuple(t.contiguous() for t in tensors)
+                torch.cuda.empty_cache()
+                E, H = tensors[0].shape[0], tensors[0].shape[1]
+                qmoe.prepare(E, H, tensors[3].shape[1], layer.top_k, layer.group_size)
+
+            def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
+                from . import moe as qmoe
+
+                if layer.expert_map is not None or getattr(layer, "apply_router_weight_on_input", False):
+                    raise NotImplementedError("quantforge MoE: expert parallelism / router weights on the input are not supported")
+                act = str(getattr(layer, "activation", "silu")).lower()
+                if "silu" not in act:
+                    raise NotImplementedError(f"quantforge MoE: activation {act!r} is not supported (SwiGLU only)")
+                if os.environ.get("QF_DEBUG_MOE"):
+                    print("QF_MOE", tuple(x.shape), x.dtype, tuple(topk_ids.shape), topk_ids.dtype, int(topk_ids.min()), int(topk_ids.max()),
+                          tuple(topk_weights.shape), topk_weights.dtype, flush=True)
+                xh = x if x.dtype == torch.float16 else x.half()
+                y = qmoe.moe_ffn_impl(xh, topk_ids, topk_weights, *layer.qf_moe, layer.group_size)
+                return y if x.dtype == torch.float16 else y.to(x.dtype)
+
+            def apply_monolithic(self, *args, **kwargs):
+                raise NotImplementedError("quantforge MoE uses vLLM's router (not monolithic)")
+
     @register_quantization_config(NAME)
     class QuantForgeConfig(AutoGPTQConfig):
         """vLLM's GPTQ config with the QuantForge linear methods; also reads AWQ (4-bit, zero-point) checkpoints."""
@@ -205,8 +269,12 @@ if HAVE_VLLM:
                     if _layer_skipped(prefix, self.modules_to_not_convert, self.packed_modules_mapping):
                         return UnquantizedLinearMethod()
                     return QuantForgeAWQLinearMethod(self)
+                if HAVE_MOE and isinstance(layer, RoutedExperts):
+                    return QuantForgeMoEMethod(self, layer.moe_config)
                 return None
-            # linear layers only (get_linear_quant_method returns None for anything else, e.g. MoE experts)
+            if HAVE_MOE and isinstance(layer, RoutedExperts):
+                return QuantForgeMoEMethod(self, layer.moe_config)
+            # linear layers only (get_linear_quant_method returns None for anything else)
             return get_linear_quant_method(self, layer, prefix, QuantForgeLinearMethod)
 
 

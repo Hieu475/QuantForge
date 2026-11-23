@@ -113,6 +113,18 @@ struct GPUPipelineOptions
                      "address arithmetic, fewer IMAD/LEA/SGXT; 0 = 64). Needs "
                      "bare-kernel-pointers when 32"),
       llvm::cl::init(0)};
+  Option<int> expertProblems{
+      *this, "expert-problems",
+      llvm::cl::desc("grouped GEMM (mixture of experts): grid.z = this many "
+                     "row-block problems, the expert of each one read from an "
+                     "extra i32 kernel argument (see ExpertBatchPass.cpp); "
+                     "0 = an ordinary GEMM"),
+      llvm::cl::init(0)};
+  Option<std::string> expertRoles{
+      *this, "expert-roles",
+      llvm::cl::desc("one letter per argument of the host function: e = "
+                     "per-expert weights, r = per-problem rows, s = shared"),
+      llvm::cl::init("")};
   Option<bool> bareKernelPointers{
       *this, "bare-kernel-pointers",
       llvm::cl::desc("Pass memrefs to the kernels as bare pointers (static "
@@ -363,8 +375,12 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
   // runtime value, no strength reduction, extra param loads). Sink them in.
   if (opts.sinkIndex && tensorCore)
     text += "func.func(gpu-launch-sink-index-computations),";
-  text += "gpu-kernel-outlining,"
-          "gpu.module(gpu.func(quantforge-workgroup-alloc-to-attribution)),"
+  text += "gpu-kernel-outlining,";
+  if (opts.expertProblems > 0)
+    text += "quantforge-expert-batch-launch{problems=" +
+            std::to_string(opts.expertProblems.getValue()) + " roles=" +
+            opts.expertRoles.getValue() + "},";
+  text += "gpu.module(gpu.func(quantforge-workgroup-alloc-to-attribution)),"
           + std::string(needNvgpu ? "convert-nvgpu-to-nvvm," : "") +
           "lower-affine,"
           "convert-vector-to-scf{full-unroll=true},"
@@ -381,6 +397,9 @@ void buildGPUPipeline(OpPassManager &pm, const GPUPipelineOptions &opts) {
           std::to_string(opts.indexBitwidth.getValue()) +
           (opts.bareKernelPointers ? " use-bare-ptr-memref-call-conv=true" : "") +
           "},canonicalize,cse),"
+          + std::string(opts.expertProblems > 0
+                            ? "gpu.module(quantforge-expert-batch-pointers),"
+                            : "") +
           "func.func(gpu-async-region),gpu-to-llvm" +
           std::string(opts.bareKernelPointers
                           ? "{use-bare-pointers-for-kernels=true}"

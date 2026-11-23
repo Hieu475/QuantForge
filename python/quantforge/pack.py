@@ -217,26 +217,41 @@ def cmd_check(a) -> None:
     sys.exit(r.returncode)
 
 
+def _cuda_home_for(torch_cuda: str, given: str | None) -> str:
+    """The toolkit to compile the runtime with: the one named by ``--cuda-home`` / ``CUDA_HOME``, else an installed toolkit
+    that matches the CUDA of this torch (``/usr/local/cuda-12.8`` for a cu128 torch), else ``/usr/local/cuda``."""
+    if given:
+        return given
+    if os.environ.get("CUDA_HOME"):
+        return os.environ["CUDA_HOME"]
+    for cand in (f"/usr/local/cuda-{torch_cuda}", f"/usr/local/cuda-{torch_cuda.split('.')[0]}"):
+        if Path(cand, "bin", "nvcc").exists():
+            return cand
+    return "/usr/local/cuda"
+
+
 def cmd_ext(a) -> None:
     """Build the C++ torch runtime once for this torch / CUDA / Python and store it in the pack (hosts without nvcc / a compiler then load it)."""
     import shutil
     import tempfile
 
     import torch
-    from torch.utils import cpp_extension
 
     from .e2e import ext_tag
+
+    cuda = _cuda_home_for(torch.version.cuda or "", a.cuda_home)
+    os.environ["CUDA_HOME"] = cuda                         # torch reads it when cpp_extension is imported
+    from torch.utils import cpp_extension
 
     out = Path(a.out).resolve() / "ext" / ext_tag()
     out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", a.arch)
     rt = Path(__file__).resolve().parent / "runtime"
-    cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     with tempfile.TemporaryDirectory() as tmp:
-        cpp_extension.load(name="quantforge_rt", sources=[str(rt / "torch_runtime.cpp"), str(rt / "kfold_reduce.cu")], with_cuda=True,
+        cpp_extension.load(name="quantforge_rt", sources=[str(rt / "torch_runtime.cpp"), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu")], with_cuda=True,
                            extra_include_paths=[f"{cuda}/include"], build_directory=tmp, verbose=False)
         shutil.copy2(Path(tmp) / "quantforge_rt.so", out / "quantforge_rt.so")
-    print(f"{out / 'quantforge_rt.so'}  (TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}, torch {torch.__version__})")
+    print(f"{out / 'quantforge_rt.so'}  (TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}, torch {torch.__version__}, CUDA toolkit {cuda})")
 
 
 def cmd_archive(a) -> None:
@@ -281,6 +296,27 @@ def cmd_install(a) -> None:
                     shutil.copy2(f, t)
     n = len(list((dest / "kernels").glob("*.so")))
     print(f"installed into {dest}: {n} kernels in total")
+    _report_ext(dest, build=a.build_ext)
+
+
+def _report_ext(dest: Path, build: bool = False) -> None:
+    """Say whether the C++ runtime of this torch is in the pack; with ``build`` and a toolkit, build it now."""
+    try:
+        import torch
+
+        from .e2e import ext_tags
+    except Exception:  # noqa: BLE001 - torch missing: nothing to say
+        return
+    if any((dest / "ext" / t / "quantforge_rt.so").exists() for t in ext_tags()):
+        print("the C++ runtime for this torch is in the pack")
+        return
+    have = sorted(p.name for p in (dest / "ext").glob("*") if p.is_dir()) if (dest / "ext").exists() else []
+    print(f"the pack has no C++ runtime for this torch ({ext_tags()[0]}); it has: {', '.join(have) or 'none'}.")
+    if build:
+        cmd_ext(argparse.Namespace(out=str(dest), arch="8.0;8.6;8.9+PTX", cuda_home=None))
+    else:
+        print("QuantForge still works (a Python op, a little slower per call). To build it, once, with a CUDA toolkit installed:\n"
+              f"  quantforge-pack ext --out {dest}      (or rerun install with --build-ext)")
 
 
 def main(argv=None) -> None:
@@ -298,6 +334,7 @@ def main(argv=None) -> None:
     ins = sub.add_parser("install", help="unpack a pack archive (file or URL) into ~/.cache/quantforge/pack")
     ins.add_argument("source")
     ins.add_argument("--dest", help="another directory (then point QUANTFORGE_PACK at it)")
+    ins.add_argument("--build-ext", action="store_true", help="when the pack has no C++ runtime for this torch, build it now (needs a CUDA toolkit)")
     rc = sub.add_parser("_record", help=argparse.SUPPRESS)
     rc.add_argument("--out", required=True)
     rc.add_argument("--group", type=int, default=128)
@@ -305,6 +342,7 @@ def main(argv=None) -> None:
     rc.add_argument("--w4a8", action="store_true")
     e = sub.add_parser("ext", help="build the C++ torch runtime for this torch into the pack")
     e.add_argument("--out", required=True)
+    e.add_argument("--cuda-home", help="CUDA toolkit to compile with (default: CUDA_HOME, or an installed toolkit matching the CUDA of this torch)")
     e.add_argument("--arch", default="8.0;8.6;8.9+PTX", help="TORCH_CUDA_ARCH_LIST of the one CUDA kernel of the runtime")
     c = sub.add_parser("check", help="run every row count with JIT off and fail on a dense fallback")
     c.add_argument("pack")

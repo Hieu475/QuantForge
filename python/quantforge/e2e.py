@@ -231,13 +231,27 @@ def pack_dirs() -> list[Path]:
 
 
 def ext_tag() -> str:
-    """Identifies the torch build a prebuilt extension (pack ``ext/<tag>/quantforge_rt.so``) was linked against."""
+    """Identifies the torch build a prebuilt extension (pack ``ext/<tag>/quantforge_rt.so``) was linked against.
+
+    Torch patch releases keep the C++ ABI, so the tag holds ``major.minor`` only (torch 2.14.0 and 2.14.1 share one extension)."""
     import sys
 
     import torch
 
     abi = int(bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)))
-    return f"torch{torch.__version__.split('+')[0]}-cu{torch.version.cuda}-abi{abi}-py{sys.version_info.major}{sys.version_info.minor}"
+    ver = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+    return f"torch{ver}-cu{torch.version.cuda}-abi{abi}-py{sys.version_info.major}{sys.version_info.minor}"
+
+
+def ext_tags() -> list:
+    """Tags to look for, best first: the current one, then the exact-version spelling that 0.4.0 packs use."""
+    import sys
+
+    import torch
+
+    abi = int(bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)))
+    legacy = f"torch{torch.__version__.split('+')[0]}-cu{torch.version.cuda}-abi{abi}-py{sys.version_info.major}{sys.version_info.minor}"
+    return [ext_tag(), legacy]
 
 
 def _toolchain_available() -> bool:
@@ -965,6 +979,35 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xf16>, %bp: tensor<{N}x{K // 2}xi8>, %zp
         self._fn(ctypes.byref(self._result), *(ctypes.byref(x) for x in d))
 
 
+def w4a16_f16_ir(M: int, K: int, N: int, group_size: int, name: str = "w4a16_gemm_f16", bias: bool = False) -> str:
+    """qf IR of the f16-store GEMM: y[f16] = f16(A @ dequant(W) + bias[n]) (`epilogue=f16-store`)."""
+    G = group_size
+    b_arg = f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else ""
+    b_in, b_ty, b_map, b_blk = (", %bias", f", tensor<{N}xf16>", ", #mn", ", %b: f16") if bias else ("", "", "", "")
+    b_add = "%v = arith.addf %ci, %bf : f32" if bias else "%v = arith.addf %ci, %zero : f32"
+    b_ext = "%bf = arith.extf %b : f16 to f32\n      " if bias else "%zero = arith.constant 0.0 : f32\n      "
+    ir = f"""#mmn = affine_map<(m, n) -> (m, n)>
+#mn = affine_map<(m, n) -> (n)>
+func.func @{name}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %scale: tensor<{K // G}x{N}xf16>, %zp: tensor<{K // G}x{N}xi8>,
+                  {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
+  %w = qf.unpack %wp : tensor<{K}x{N // 2}xi8> -> tensor<{K}x{N}xi8>
+  %wf = qf.dequant %w, %scale, %zp : tensor<{K}x{N}xi8>, tensor<{K // G}x{N}xf16>, tensor<{K // G}x{N}xi8> -> tensor<{K}x{N}xf16>
+  %e = tensor.empty() : tensor<{M}x{N}xf32>
+  %c = linalg.matmul ins(%act, %wf : tensor<{M}x{K}xf16>, tensor<{K}x{N}xf16>) outs(%e : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
+  %r = linalg.generic {{indexing_maps = [#mmn{b_map}, #mmn], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
+      ins(%c{b_in} : tensor<{M}x{N}xf32>{b_ty}) outs(%y : tensor<{M}x{N}xf16>) {{
+    ^bb0(%ci: f32{b_blk}, %o: f16):
+      {b_ext}{b_add}
+      %h = arith.truncf %v : f32 to f16
+      linalg.yield %h : f16
+  }} -> tensor<{M}x{N}xf16>
+  return %r : tensor<{M}x{N}xf16>
+}}
+"""
+
+    return ir
+
+
 class W4A16GemmF16:
     """W4A16 GEMM whose result is written as f16 by the kernel itself (``epilogue=f16-store``): ``y[f16] = f16(A @ dequant(W) + bias[n])``
     in ONE kernel, no f32 buffer and no conversion / bias kernel afterwards. INT4 group-wise weights ``packed [K, N/2]``, ``scale f16 [K/G, N]``,
@@ -993,29 +1036,7 @@ class W4A16GemmF16:
             if not 0 < valid_rows < M or M > 16:
                 raise ValueError("valid_rows must satisfy 0 < valid_rows < M <= 16")
             pipeline_opts = f"{pipeline_opts} valid-rows={valid_rows}".strip()
-        G = group_size
-        b_arg = f"%bias: tensor<{N}xf16> {{quantforge.int8_bias}}, " if bias else ""
-        b_in, b_ty, b_map, b_blk = (", %bias", f", tensor<{N}xf16>", ", #mn", ", %b: f16") if bias else ("", "", "", "")
-        b_add = "%v = arith.addf %ci, %bf : f32" if bias else "%v = arith.addf %ci, %zero : f32"
-        b_ext = "%bf = arith.extf %b : f16 to f32\n      " if bias else "%zero = arith.constant 0.0 : f32\n      "
-        ir = f"""#mmn = affine_map<(m, n) -> (m, n)>
-#mn = affine_map<(m, n) -> (n)>
-func.func @{cls.NAME}(%act: tensor<{M}x{K}xf16>, %wp: tensor<{K}x{N // 2}xi8>, %scale: tensor<{K // G}x{N}xf16>, %zp: tensor<{K // G}x{N}xi8>,
-                      {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
-  %w = qf.unpack %wp : tensor<{K}x{N // 2}xi8> -> tensor<{K}x{N}xi8>
-  %wf = qf.dequant %w, %scale, %zp : tensor<{K}x{N}xi8>, tensor<{K // G}x{N}xf16>, tensor<{K // G}x{N}xi8> -> tensor<{K}x{N}xf16>
-  %e = tensor.empty() : tensor<{M}x{N}xf32>
-  %c = linalg.matmul ins(%act, %wf : tensor<{M}x{K}xf16>, tensor<{K}x{N}xf16>) outs(%e : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
-  %r = linalg.generic {{indexing_maps = [#mmn{b_map}, #mmn], iterator_types = ["parallel", "parallel"], quantforge.no_tile, quantforge.no_vectorize}}
-      ins(%c{b_in} : tensor<{M}x{N}xf32>{b_ty}) outs(%y : tensor<{M}x{N}xf16>) {{
-    ^bb0(%ci: f32{b_blk}, %o: f16):
-      {b_ext}{b_add}
-      %h = arith.truncf %v : f32 to f16
-      linalg.yield %h : f16
-  }} -> tensor<{M}x{N}xf16>
-  return %r : tensor<{M}x{N}xf16>
-}}
-"""
+        ir = w4a16_f16_ir(M, K, N, group_size, cls.NAME, bias)
         import tempfile
 
         opts = f"{pipeline_opts} epilogue=f16-store".strip()

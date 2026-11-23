@@ -78,12 +78,12 @@ def main() -> int:
         _line(found is not None, tool, found or f"not on PATH and not in {cuda}/bin")
     packs = []
     try:
-        from .e2e import ext_tag, pack_dirs
+        from .e2e import ext_tags, pack_dirs
 
         packs = pack_dirs()
         for d in packs:
             n = len(list((d / "kernels").glob("*.so")))
-            ext = (d / "ext" / ext_tag() / "quantforge_rt.so").exists()
+            ext = any((d / "ext" / t / "quantforge_rt.so").exists() for t in ext_tags())
             _line(None, "kernel pack", f"{d}: {n} kernels, C++ runtime for this torch: {'yes' if ext else 'no'}")
     except Exception as e:  # noqa: BLE001
         _line(None, "kernel pack", f"{type(e).__name__}: {e}")

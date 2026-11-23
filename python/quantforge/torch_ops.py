@@ -419,16 +419,16 @@ def _prebuilt_ext():
         return None
     import importlib.util
 
-    from .e2e import ext_tag, pack_dirs
+    from .e2e import ext_tags, pack_dirs
 
-    tag = ext_tag()
-    for d in pack_dirs():
-        so = d / "ext" / tag / "quantforge_rt.so"
-        if so.exists():
-            spec = importlib.util.spec_from_file_location("quantforge_rt", so)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
+    for tag in ext_tags():
+        for d in pack_dirs():
+            so = d / "ext" / tag / "quantforge_rt.so"
+            if so.exists():
+                spec = importlib.util.spec_from_file_location("quantforge_rt", so)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
     return None
 
 
@@ -445,7 +445,7 @@ def _load_cpp_runtime():
             rt = Path(__file__).resolve().parent / "runtime"
             src = rt / "torch_runtime.cpp"
             cuda = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-            ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu")], with_cuda=True,
+            ext = cpp_extension.load(name="quantforge_rt", sources=[str(src), str(rt / "kfold_reduce.cu"), str(rt / "moe_kernels.cu")], with_cuda=True,
                                      extra_include_paths=[f"{cuda}/include"], verbose=False)
 
         def builder(M, K, N, group_size, device_index, activation, overwrite, kind):

@@ -261,6 +261,13 @@ namespace mlir
         std::unique_ptr<Pass> createOverwriteOutputPass();
         void registerOverwriteOutputPass();
 
+        /// Grouped GEMM for mixture-of-experts (ExpertBatchPass.cpp): grid.z problems, an `i32` meta
+        /// array with the expert of every problem as an extra kernel argument, per-problem base
+        /// pointers and an early exit for padding problems.
+        std::unique_ptr<Pass> createExpertBatchLaunchPass();
+        std::unique_ptr<Pass> createExpertBatchPointersPass();
+        void registerExpertBatchPasses();
+
         // === End-to-end pipeline ===
 
         /// Register `--quantforge-gpu-pipeline`: tiling → bufferization →
@@ -309,6 +316,7 @@ namespace mlir
             registerPrefetchWeightLoadsPass();
             registerFuseEpiloguePass();
             registerOverwriteOutputPass();
+            registerExpertBatchPasses();
             registerWorkgroupAllocToAttributionPass();
             // End-to-end pipeline (qf → PTX)
             registerGPUPipeline();
