@@ -21,9 +21,9 @@ for spec in "$@"; do
       echo "== python $py torch $tok" | tee -a "$log"
       if ! uv venv -q --python "$py" "$v" >>"$log" 2>&1; then echo "   venv failed" | tee -a "$log"; continue; fi
       if [ -n "$idx" ]; then
-        uv pip install -q --python "$v/bin/python" "torch==$tv" --index-url "https://download.pytorch.org/whl/$idx" >>"$log" 2>&1 && uv pip install -q --python "$v/bin/python" ninja >>"$log" 2>&1
+        uv pip install -q --python "$v/bin/python" "torch==$tv" --index-url "https://download.pytorch.org/whl/$idx" >>"$log" 2>&1 && uv pip install -q --python "$v/bin/python" ninja setuptools >>"$log" 2>&1
       else
-        uv pip install -q --python "$v/bin/python" "torch==$tv" ninja >>"$log" 2>&1
+        uv pip install -q --python "$v/bin/python" "torch==$tv" ninja setuptools >>"$log" 2>&1
       fi
       if [ $? -ne 0 ]; then echo "   torch install failed" | tee -a "$log"; rm -rf "$v"; continue; fi
       if PYTHONPATH="$here/python" "$v/bin/python" -I -c "import sys; sys.path.insert(0, '$here/python'); from quantforge import pack; pack.main(['ext', '--out', '$out'])" >>"$log" 2>&1; then

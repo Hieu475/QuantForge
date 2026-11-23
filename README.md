@@ -145,7 +145,7 @@ python -m quantforge.pack build --out ./qwen15-pack --model Qwen/Qwen2.5-1.5B-In
 python -m quantforge.pack ext   --out ./qwen15-pack                                                 # the C++ runtime for this torch (no nvcc needed to load it)
 python -m quantforge.pack check ./qwen15-pack --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4          # every row count 1..300 and up to 8192 with JIT off: fails on any gap
 
-python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: a nine-model pack is 9.4 MiB (38 MiB unpacked)
+python -m quantforge.pack archive ./qwen15-pack qwen15-pack.tar.gz                                 # one file to ship: the release pack (nine dense models, three mixture-of-experts configs, 23 extensions for torch 2.8-2.15 x Python 3.10-3.13) is 37.7 MiB
 
 # on the machine that serves (pip install the package, no compiler, no LLVM)
 quantforge-pack install qwen15-pack.tar.gz                                                       # file or https URL -> ~/.cache/quantforge/pack (or --dest DIR + QUANTFORGE_PACK=DIR)
