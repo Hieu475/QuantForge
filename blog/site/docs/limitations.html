@@ -22,12 +22,13 @@
 </div>
 </details><h2 id="limitations">Limitations<a class="headerlink" href="#limitations" title="Permanent link">#</a></h2>
 <ul>
-<li><strong>Speed:</strong> the W4A16 kernels are on par with Marlin up to 16 rows and 1.1-1.15x faster in prefill, but 0.8-0.9x of Marlin at 32-256 concurrent rows of decode (the table
+<li><strong>Speed:</strong> the W4A16 kernels are on par with Marlin up to 16 rows and 0.90-0.92x of it in vLLM prefill (0.9-1.04x at the GEMM level for 384-2048 rows), 0.8-0.9x at 32-256 concurrent rows of decode (the table
   above was measured at the start of the work; the tile planners, 32-row buckets and split-K added later raised the end-to-end ratios, see "Headline results" and the CHANGELOG): there the GEMM is
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (<code>PIPELINE.md</code>), closing it needs
-  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.01 / 1.08 / 1.13x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows it is 0.82-0.97x of Marlin.</li>
-<li>MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.66 of Marlin at 32 concurrent requests. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
+  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.04 / 1.13 / 1.18x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows of one GEMM it is 0.8-1.0x of Marlin (the INT8 kernel itself is on par; the activation quantisation and, at 1-16 rows, the decode kernel cost the rest).</li>
+<li>W4A8 rotation: measured on Qwen2.5 (0.5B, 1.5B), OLMo-2 1B, Phi-3.5-mini and Llama-3.2 (1B, 3B) only; it is not a free win (rotated everywhere, Llama-3.2-3B gets 1.1 perplexity worse because of one massive-activation layer) and the online method relies on a rule (the <code>down_proj</code> of the first four layers stays unrotated) that seven models support, not prove. Use <code>quantforge_w4a8_plain</code> as the reference when trying a new family; the GPTQ path decides per layer from calibration data.</li>
+<li>MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.93-0.96 of Marlin MoE at 1-32 concurrent requests, 0.88 in prefill. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by <code>save_gptq</code>. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).</li>
 <li>Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row

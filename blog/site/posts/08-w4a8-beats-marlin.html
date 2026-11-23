@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Faster than Marlin only on the INT8 tensor cores: what W4A16 could not do and what W4A8 took - QuantForge Notes</title>
+<meta name="description" content="The exact-numerics W4A16 path stays at 0.8 to 0.94 of Marlin from 32 requests up, whatever I tried; an INT4-weight, INT8-activation kernel with measured schedules passes Marlin from about 128 concurrent requests. The negative results, and three benchmarking traps that cost days.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/08-w4a8-beats-marlin.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>Faster than Marlin only on the INT8 tensor cores: what W4A16 could not do and what W4A8 took</h1><p class="lede">The exact-numerics W4A16 path stays at 0.8 to 0.94 of Marlin from 32 requests up, whatever I tried; an INT4-weight, INT8-activation kernel with measured schedules passes Marlin from about 128 concurrent requests. The negative results, and three benchmarking traps that cost days.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#what-did-not-close-the-w4a16-gap">What did not close the W4A16 gap</a></li>
+<li><a href="#changing-the-arithmetic-w4a8">Changing the arithmetic: W4A8</a></li>
+<li><a href="#three-measurement-traps">Three measurement traps</a></li>
+</ul>
+</div>
+</details><p>The <a href="06-inside-vllm.html">vLLM post</a> ended with a gap: at 32 to 256 concurrent requests the generated W4A16 kernel is slower than Marlin. This post is what happened to that gap since: a list of things that did not close it, one thing that did (by changing the arithmetic, not the schedule), and the mistakes in the measurements on the way.</p>
+<h2 id="what-did-not-close-the-w4a16-gap">What did not close the W4A16 gap<a class="headerlink" href="#what-did-not-close-the-w4a16-gap" title="Permanent link">#</a></h2>
+<p>Ratios against Marlin in vLLM, Qwen2.5-1.5B, same weights, interleaved runs: <strong>0.94, 0.94, 0.89, 0.84, 0.80, 0.86, 0.85</strong> at 1, 16, 32, 64, 128, 192 and 256 concurrent requests. The profiler explains the shape:</p>
+<table>
+<thead>
+<tr>
+<th>128 x 4096 x 4096, cold weights (<code>ncu</code>)</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">generated W4A16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>duration</td>
+<td style="text-align: right;">115 us</td>
+<td style="text-align: right;">154 us</td>
+</tr>
+<tr>
+<td>registers per thread</td>
+<td style="text-align: right;">255</td>
+<td style="text-align: right;">124</td>
+</tr>
+<tr>
+<td>resident blocks per SM</td>
+<td style="text-align: right;">1 (persistent)</td>
+<td style="text-align: right;">about 3</td>
+</tr>
+<tr>
+<td>DRAM throughput</td>
+<td style="text-align: right;">50 %</td>
+<td style="text-align: right;">36 %</td>
+</tr>
+</tbody>
+</table>
+<p>Both kernels are latency-bound; Marlin keeps more bytes in flight with fewer, fatter blocks and loads its B fragments from global memory straight into registers (the weights are pre-shuffled for it). Things I tried that did not move the gap: a sweep of block, warp and K tiles per shape; split-K with atomics at 128 rows (165 us against 155 us: more blocks do not help, so it is not wave quantisation); a single kernel for the row padding instead of three small launches (inside the noise); the memory fraction handed to vLLM (the ratio is the same at 0.7 and 0.78, so it is not a KV-cache effect). What is left is the weight format, which means a different layout and a different dequantisation path, and I have not done it.</p>
+<h2 id="changing-the-arithmetic-w4a8">Changing the arithmetic: W4A8<a class="headerlink" href="#changing-the-arithmetic-w4a8" title="Permanent link">#</a></h2>
+<p>The INT8 tensor cores do twice the work of the fp16 ones and the INT4 weights stay the only weight traffic. The kernel (<code>W4A8GemmDq</code>) expands the nibbles to int8 while the tile is staged into shared memory, accumulates in int32 over the whole of K and applies one float scale per output channel in the epilogue. The format is QServe's progressive quantisation: INT8 per output channel, then INT4 per group of 128 with an <em>integer</em> scale and zero point, chosen so that <code>(q - z) * s</code> stays inside int8 and the kernel's 8-bit arithmetic cannot wrap. Three things made it fast rather than merely correct:</p>
+<ul>
+<li><strong>K-major scales with a padding row.</strong> The 8 output channels a thread dequantises have 8 adjacent scale bytes in <code>[K/128, N]</code> order, one vector load instead of 8 bytes 32 apart: 3 to 5 %. The look-ahead loads of the pipeline read the scale of the group after the last one, so the buffer has one extra row of zeros (the first version read past the end of the tensor).</li>
+<li><strong>A planner that measures.</strong> The schedule rule had been tuned on layers with N &lt;= 2048; at 64 x 4096 x 4096 it ran 115 us where another schedule runs 65 us. <code>int8_plan</code> times a handful of candidates per (rows, K, N) once, caches the winner, and the op only looks it up. A kernel pack carries the decisions.</li>
+<li><strong>A native activation-quantisation kernel.</strong> Quantising the activations per token was a <code>torch.compile</code>d pair of kernels plus two padding copies; one CUDA kernel does the amax, the scale, the rounding and the padding. It had to be bit-identical to the torch expression it replaced, and it was not at first: torch divides by a scalar as a multiplication by the float reciprocal, and rounds half to even.</li>
+</ul>
+<figure class="viz"><div class="viz-title">Decode throughput against Marlin in vLLM (1.0 = Marlin, higher is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>W4A16</span><span class="lg"><i class="sw s2"></i>W4A8 rotated</span><span class="lg"><i class="sw mk"></i>Marlin</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Decode throughput against Marlin in vLLM (1.0 = Marlin, higher is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">0.28</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">0.56</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">0.84</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">1.12</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">1.4</text><path class="s1" d="M66.9 268 V105.5 a4 4 0 0 1 4 -4 H96.9 a4 4 0 0 1 4 4 V268 Z"><title>1 - W4A16: 0.94</title></path><text class="val" x="83.9" y="96.5" text-anchor="middle">0.94</text><path class="s2" d="M102.9 268 V109.0 a4 4 0 0 1 4 -4 H132.9 a4 4 0 0 1 4 4 V268 Z"><title>1 - W4A8 rotated: 0.92</title></path><text class="val" x="119.9" y="100.0" text-anchor="middle">0.92</text><line class="marker" x1="61.9" y1="90.9" x2="141.9" y2="90.9"><title>1 - Marlin: 1</title></line><text class="lab" x="101.9" y="286" text-anchor="middle">1</text><path class="s1" d="M166.6 268 V105.5 a4 4 0 0 1 4 -4 H196.6 a4 4 0 0 1 4 4 V268 Z"><title>16 - W4A16: 0.94</title></path><text class="val" x="183.6" y="96.5" text-anchor="middle">0.94</text><path class="s2" d="M202.6 268 V107.3 a4 4 0 0 1 4 -4 H232.6 a4 4 0 0 1 4 4 V268 Z"><title>16 - W4A8 rotated: 0.93</title></path><text class="val" x="219.6" y="98.3" text-anchor="middle">0.93</text><line class="marker" x1="161.6" y1="90.9" x2="241.6" y2="90.9"><title>16 - Marlin: 1</title></line><text class="lab" x="201.6" y="286" text-anchor="middle">16</text><path class="s1" d="M266.3 268 V114.3 a4 4 0 0 1 4 -4 H296.3 a4 4 0 0 1 4 4 V268 Z"><title>32 - W4A16: 0.89</title></path><text class="val" x="283.3" y="105.3" text-anchor="middle">0.89</text><path class="s2" d="M302.3 268 V100.2 a4 4 0 0 1 4 -4 H332.3 a4 4 0 0 1 4 4 V268 Z"><title>32 - W4A8 rotated: 0.97</title></path><text class="val" x="319.3" y="91.2" text-anchor="middle">0.97</text><line class="marker" x1="261.3" y1="90.9" x2="341.3" y2="90.9"><title>32 - Marlin: 1</title></line><text class="lab" x="301.3" y="286" text-anchor="middle">32</text><path class="s1" d="M366.0 268 V123.2 a4 4 0 0 1 4 -4 H396.0 a4 4 0 0 1 4 4 V268 Z"><title>64 - W4A16: 0.84</title></path><text class="val" x="383.0" y="114.2" text-anchor="middle">0.84</text><path class="s2" d="M402.0 268 V98.4 a4 4 0 0 1 4 -4 H432.0 a4 4 0 0 1 4 4 V268 Z"><title>64 - W4A8 rotated: 0.98</title></path><text class="val" x="419.0" y="89.4" text-anchor="middle">0.98</text><line class="marker" x1="361.0" y1="90.9" x2="441.0" y2="90.9"><title>64 - Marlin: 1</title></line><text class="lab" x="401.0" y="286" text-anchor="middle">64</text><path class="s1" d="M465.7 268 V130.3 a4 4 0 0 1 4 -4 H495.7 a4 4 0 0 1 4 4 V268 Z"><title>128 - W4A16: 0.80</title></path><text class="val" x="482.7" y="121.3" text-anchor="middle">0.80</text><path class="s2" d="M501.7 268 V93.1 a4 4 0 0 1 4 -4 H531.7 a4 4 0 0 1 4 4 V268 Z"><title>128 - W4A8 rotated: 1.01</title></path><text class="val" x="518.7" y="84.1" text-anchor="middle">1.01</text><line class="marker" x1="460.7" y1="90.9" x2="540.7" y2="90.9"><title>128 - Marlin: 1</title></line><text class="lab" x="500.7" y="286" text-anchor="middle">128</text><path class="s1" d="M565.4 268 V119.7 a4 4 0 0 1 4 -4 H595.4 a4 4 0 0 1 4 4 V268 Z"><title>192 - W4A16: 0.86</title></path><text class="val" x="582.4" y="110.7" text-anchor="middle">0.86</text><path class="s2" d="M601.4 268 V75.4 a4 4 0 0 1 4 -4 H631.4 a4 4 0 0 1 4 4 V268 Z"><title>192 - W4A8 rotated: 1.11</title></path><text class="val" x="618.4" y="66.4" text-anchor="middle">1.11</text><line class="marker" x1="560.4" y1="90.9" x2="640.4" y2="90.9"><title>192 - Marlin: 1</title></line><text class="lab" x="600.4" y="286" text-anchor="middle">192</text><path class="s1" d="M665.1 268 V121.4 a4 4 0 0 1 4 -4 H695.1 a4 4 0 0 1 4 4 V268 Z"><title>256 - W4A16: 0.85</title></path><text class="val" x="682.1" y="112.4" text-anchor="middle">0.85</text><path class="s2" d="M701.1 268 V66.5 a4 4 0 0 1 4 -4 H731.1 a4 4 0 0 1 4 4 V268 Z"><title>256 - W4A8 rotated: 1.16</title></path><text class="val" x="718.1" y="57.5" text-anchor="middle">1.16</text><line class="marker" x1="660.1" y1="90.9" x2="740.1" y2="90.9"><title>256 - Marlin: 1</title></line><text class="lab" x="700.1" y="286" text-anchor="middle">256</text></svg><figcaption>Qwen2.5-1.5B, same INT4 weights, RTX 4050 Laptop, interleaved runs. W4A16 is the exact-numerics path; W4A8 uses INT8 activations (Hadamard-rotated, default).</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>W4A16</th><th>W4A8 rotated</th><th>Marlin</th></tr></thead><tbody><tr><th>1</th><td>0.94</td><td>0.92</td><td>1</td></tr><tr><th>16</th><td>0.94</td><td>0.93</td><td>1</td></tr><tr><th>32</th><td>0.89</td><td>0.97</td><td>1</td></tr><tr><th>64</th><td>0.84</td><td>0.98</td><td>1</td></tr><tr><th>128</th><td>0.80</td><td>1.01</td><td>1</td></tr><tr><th>192</th><td>0.86</td><td>1.11</td><td>1</td></tr><tr><th>256</th><td>0.85</td><td>1.16</td><td>1</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>concurrent requests</th>
+<th style="text-align: right;">1</th>
+<th style="text-align: right;">16</th>
+<th style="text-align: right;">32</th>
+<th style="text-align: right;">64</th>
+<th style="text-align: right;">128</th>
+<th style="text-align: right;">192</th>
+<th style="text-align: right;">256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>W4A16 (exact Marlin numerics)</td>
+<td style="text-align: right;">0.94</td>
+<td style="text-align: right;">0.94</td>
+<td style="text-align: right;">0.89</td>
+<td style="text-align: right;">0.84</td>
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.86</td>
+<td style="text-align: right;">0.85</td>
+</tr>
+<tr>
+<td>W4A8, Hadamard-rotated (default)</td>
+<td style="text-align: right;">0.92</td>
+<td style="text-align: right;">0.93</td>
+<td style="text-align: right;">0.97</td>
+<td style="text-align: right;">0.98</td>
+<td style="text-align: right;">1.01</td>
+<td style="text-align: right;">1.11</td>
+<td style="text-align: right;">1.16</td>
+</tr>
+<tr>
+<td>W4A8, no rotation</td>
+<td style="text-align: right;">0.95</td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">0.99</td>
+<td style="text-align: right;">0.99</td>
+<td style="text-align: right;">1.04</td>
+<td style="text-align: right;">1.13</td>
+<td style="text-align: right;">1.18</td>
+</tr>
+</tbody>
+</table>
+<p>The honest reading: W4A8 is faster than Marlin from about 128 concurrent requests (and from 64 rows at the level of one GEMM), and below that it is 2 to 8 % slower, because up to 64 rows it uses the same W4A16 kernels as before. It also is not the same arithmetic: Marlin's checkpoints are W4A16, this path quantises the activations to INT8. <a href="09-hadamard-rotation.html">The next post</a> is about what that costs in quality, and how the rotation turns the cost into a gain.</p>
+<h2 id="three-measurement-traps">Three measurement traps<a class="headerlink" href="#three-measurement-traps" title="Permanent link">#</a></h2>
+<ul>
+<li><strong>Flush the L2 by reading, not by writing.</strong> My sweep flushed with <code>zero_()</code>; the dirty lines written back during the timed kernel added 30 to 50 us to <em>every</em> time, which changed which schedule won. The same artifact inflated the first MoE numbers.</li>
+<li><strong>vLLM changes torch's default dtype while it loads.</strong> The planner created its random test tensors with <code>torch.rand</code>, which was f16 inside vLLM and f32 everywhere else; the kernel read an f16 buffer as f32 and failed with an illegal address <em>only inside vLLM</em>. <code>compute-sanitizer python script.py</code> on the engine load found it in minutes after days of staring; the fix is to pass <code>dtype=</code> everywhere.</li>
+<li><strong>A throughput comparison in vLLM is a KV-cache comparison.</strong> Any extra buffer an op allocates shrinks the KV cache, vLLM preempts, and the ratio moves by 30 %. <a href="10-moe-grouped-gemm.html">The MoE post</a> has the worst case.</li>
+</ul></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

@@ -1,81 +1,311 @@
 {
   "repo_blob": "https://github.com/Hieu475/QuantForge/blob/main/",
   "pages": [
-    {"slug": "getting-started", "title": "Getting started", "summary": "Install, build, test, and the first calls.",
-     "posts": ["01-overview"],
-     "items": [
-       {"src": "README.md", "heading": "Install the Python package", "own": true},
-       {"src": "README.md", "heading": "Kernel packs: run without LLVM"},
-       {"src": "README.md", "heading": "Docker"},
-       {"src": "README.md", "heading": "Build"},
-       {"src": "README.md", "heading": "Test"},
-       {"src": "README.md", "heading": "Use", "own": true}]},
-    {"slug": "quantisation", "title": "Quantisation formats", "summary": "INT4, INT8, W8A8, GPTQ and the FP8 negative result.",
-     "posts": ["05-gptq-and-checkpoints", "07-fp8-tensor-cores"],
-     "items": [
-       {"src": "README.md", "heading": "Quantise a whole model"},
-       {"src": "README.md", "heading": "Better 4-bit quality: GPTQ in the library"},
-       {"src": "README.md", "heading": "INT8 W8A8"},
-       {"src": "README.md", "heading": "FP8 W8A8 on the Ada FP8 tensor cores"}]},
-    {"slug": "pipeline", "title": "Compiler pipeline", "summary": "The gpu pipeline: stages, options and constraints.",
-     "posts": ["01-overview"],
-     "items": [
-       {"src": "python/quantforge/PIPELINE.md", "heading": "`--quantforge-gpu-pipeline`", "own": true, "drop_heading": true},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Stages"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Options"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Constraints"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Group-wise quantization"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Testing"}]},
-    {"slug": "kernels", "title": "Kernels and measurements", "summary": "What limits decode, small batch and prefill, with the numbers.",
-     "posts": ["02-decode-instruction-bound", "04-mid-batch-postmortem"],
-     "items": [
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Performance"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Measured against Marlin"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "What limits the decode kernel"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Decode (M"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Small batch"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Prefill"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "FP8 (E4M3) weights"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Wave-aware K tile"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Split-K (`split-k=S`"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Split-K with an in-kernel reduction"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Profile of a 7B decode step"}]},
-    {"slug": "int8-w4a8", "title": "INT8 and W4A8 GEMM", "summary": "Integer tensor cores: the int8-dequant epilogue and packed W4A8 dequantisation.",
-     "posts": ["07-fp8-tensor-cores"],
-     "items": [{"src": "python/quantforge/PIPELINE.md", "heading": "INT8 GEMM (experimental)"}]},
-    {"slug": "runtime", "title": "Runtime and PyTorch op", "summary": "Host side, compile cache, row buckets and the launches around the GEMM.",
-     "posts": [],
-     "items": [
-       {"src": "README.md", "heading": "As a PyTorch op"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Runtime (host side)"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Compile cache and row buckets"},
-       {"src": "python/quantforge/PIPELINE.md", "heading": "Launches around the GEMM"}]},
-    {"slug": "vllm", "title": "vLLM plugin", "summary": "INT4 and W4A8 inside vLLM: methods, env variables, checkpoints, results.",
-     "posts": ["06-inside-vllm"],
-     "items": [
-       {"src": "README.md", "heading": "End-to-end on a real model", "own": true},
-       {"src": "README.md", "heading": "Inside vLLM (plugin)"},
-       {"src": "README.md", "heading": "Online W4A8 in vLLM"},
-       {"src": "README.md", "heading": "W4A8 checkpoints for vLLM"},
-       {"src": "README.md", "heading": "Other models"}]},
-    {"slug": "results", "title": "Results", "summary": "The measured numbers: GPU, date and method are in each table.",
-     "posts": [],
-     "items": [{"src": "README.md", "heading": "Performance snapshot"}]},
-    {"slug": "limitations", "title": "Limitations and layout", "summary": "What does not work yet, and where things live in the repository.",
-     "posts": [],
-     "items": [
-       {"src": "README.md", "heading": "Limitations"},
-       {"src": "README.md", "heading": "Repository layout"},
-       {"src": "README.md", "heading": "Contributing"}]},
-    {"slug": "changelog", "title": "Changelog", "summary": "Release notes.",
-     "posts": [],
-     "items": [
-       {"src": "CHANGELOG.md", "heading": "Unreleased"},
-       {"src": "CHANGELOG.md", "heading": "0.5.0"},
-       {"src": "CHANGELOG.md", "heading": "0.4.0"},
-       {"src": "CHANGELOG.md", "heading": "0.3.0"},
-       {"src": "CHANGELOG.md", "heading": "0.2.0"},
-       {"src": "CHANGELOG.md", "heading": "0.1.0"}]}
+    {
+      "slug": "getting-started",
+      "title": "Getting started",
+      "summary": "Install, build, test, and the first calls.",
+      "posts": [
+        "01-overview"
+      ],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "Install the Python package",
+          "own": true
+        },
+        {
+          "src": "README.md",
+          "heading": "Kernel packs: run without LLVM"
+        },
+        {
+          "src": "README.md",
+          "heading": "Docker"
+        },
+        {
+          "src": "README.md",
+          "heading": "Build"
+        },
+        {
+          "src": "README.md",
+          "heading": "Test"
+        },
+        {
+          "src": "README.md",
+          "heading": "Use",
+          "own": true
+        }
+      ]
+    },
+    {
+      "slug": "quantisation",
+      "title": "Quantisation formats",
+      "summary": "INT4, INT8, W8A8, GPTQ and the FP8 negative result.",
+      "posts": [
+        "05-gptq-and-checkpoints",
+        "07-fp8-tensor-cores"
+      ],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "Quantise a whole model"
+        },
+        {
+          "src": "README.md",
+          "heading": "Better 4-bit quality: GPTQ in the library"
+        },
+        {
+          "src": "README.md",
+          "heading": "INT8 W8A8"
+        },
+        {
+          "src": "README.md",
+          "heading": "FP8 W8A8 on the Ada FP8 tensor cores"
+        }
+      ]
+    },
+    {
+      "slug": "pipeline",
+      "title": "Compiler pipeline",
+      "summary": "The gpu pipeline: stages, options and constraints.",
+      "posts": [
+        "01-overview"
+      ],
+      "items": [
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "`--quantforge-gpu-pipeline`",
+          "own": true,
+          "drop_heading": true
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Stages"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Options"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Constraints"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Group-wise quantization"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Testing"
+        }
+      ]
+    },
+    {
+      "slug": "kernels",
+      "title": "Kernels and measurements",
+      "summary": "What limits decode, small batch and prefill, with the numbers.",
+      "posts": [
+        "02-decode-instruction-bound",
+        "04-mid-batch-postmortem"
+      ],
+      "items": [
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Performance"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Measured against Marlin"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "What limits the decode kernel"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Decode (M"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Small batch"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Prefill"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "FP8 (E4M3) weights"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Wave-aware K tile"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Split-K (`split-k=S`"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Split-K with an in-kernel reduction"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Profile of a 7B decode step"
+        }
+      ]
+    },
+    {
+      "slug": "int8-w4a8",
+      "title": "INT8 and W4A8 GEMM",
+      "summary": "Integer tensor cores: the int8-dequant epilogue and packed W4A8 dequantisation.",
+      "posts": [
+        "07-fp8-tensor-cores",
+        "08-w4a8-beats-marlin",
+        "09-hadamard-rotation"
+      ],
+      "items": [
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "INT8 GEMM (experimental)"
+        }
+      ]
+    },
+    {
+      "slug": "runtime",
+      "title": "Runtime and PyTorch op",
+      "summary": "Host side, compile cache, row buckets and the launches around the GEMM.",
+      "posts": [],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "As a PyTorch op"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Runtime (host side)"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Compile cache and row buckets"
+        },
+        {
+          "src": "python/quantforge/PIPELINE.md",
+          "heading": "Launches around the GEMM"
+        }
+      ]
+    },
+    {
+      "slug": "vllm",
+      "title": "vLLM plugin",
+      "summary": "INT4 and W4A8 inside vLLM: methods, env variables, checkpoints, results.",
+      "posts": [
+        "06-inside-vllm",
+        "08-w4a8-beats-marlin",
+        "09-hadamard-rotation",
+        "10-moe-grouped-gemm"
+      ],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "End-to-end on a real model",
+          "own": true
+        },
+        {
+          "src": "README.md",
+          "heading": "Inside vLLM (plugin)"
+        },
+        {
+          "src": "README.md",
+          "heading": "Mixture-of-experts models"
+        },
+        {
+          "src": "README.md",
+          "heading": "Online W4A8 in vLLM"
+        },
+        {
+          "src": "README.md",
+          "heading": "Hadamard rotation of W4A8"
+        },
+        {
+          "src": "README.md",
+          "heading": "W4A8 checkpoints for vLLM"
+        },
+        {
+          "src": "README.md",
+          "heading": "Other models"
+        }
+      ]
+    },
+    {
+      "slug": "results",
+      "title": "Results",
+      "summary": "The measured numbers: GPU, date and method are in each table.",
+      "posts": [],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "Performance snapshot"
+        }
+      ]
+    },
+    {
+      "slug": "limitations",
+      "title": "Limitations and layout",
+      "summary": "What does not work yet, and where things live in the repository.",
+      "posts": [],
+      "items": [
+        {
+          "src": "README.md",
+          "heading": "Limitations"
+        },
+        {
+          "src": "README.md",
+          "heading": "Repository layout"
+        },
+        {
+          "src": "README.md",
+          "heading": "Contributing"
+        }
+      ]
+    },
+    {
+      "slug": "changelog",
+      "title": "Changelog",
+      "summary": "Release notes.",
+      "posts": [],
+      "items": [
+        {
+          "src": "CHANGELOG.md",
+          "heading": "Unreleased"
+        },
+        {
+          "src": "CHANGELOG.md",
+          "heading": "0.5.0"
+        },
+        {
+          "src": "CHANGELOG.md",
+          "heading": "0.4.0"
+        },
+        {
+          "src": "CHANGELOG.md",
+          "heading": "0.3.0"
+        },
+        {
+          "src": "CHANGELOG.md",
+          "heading": "0.2.0"
+        },
+        {
+          "src": "CHANGELOG.md",
+          "heading": "0.1.0"
+        }
+      ]
+    }
   ],
-  "intro": {"src": "README.md", "heading": "QuantForge", "own": true, "drop_heading": true}
+  "intro": {
+    "src": "README.md",
+    "heading": "QuantForge",
+    "own": true,
+    "drop_heading": true
+  }
 }

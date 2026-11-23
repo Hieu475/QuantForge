@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixture-of-experts as one kernel launch, a prefill gap nobody had measured, and a 0.66x that was an artifact - QuantForge Notes</title>
+<meta name="description" content="Grouped W4A16 GEMMs through two compiler passes (the expert of each row block read from a device array, no host synchronisation), the first end-to-end MoE numbers, a prefill that ran at 0.58 of Marlin MoE until two fixes, and a diagnosis that chased a gap that was really the KV cache.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/10-moe-grouped-gemm.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>Mixture-of-experts as one kernel launch, a prefill gap nobody had measured, and a 0.66x that was an artifact</h1><p class="lede">Grouped W4A16 GEMMs through two compiler passes (the expert of each row block read from a device array, no host synchronisation), the first end-to-end MoE numbers, a prefill that ran at 0.58 of Marlin MoE until two fixes, and a diagnosis that chased a gap that was really the KV cache.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#the-compiler-side">The compiler side</a></li>
+<li><a href="#what-was-measured-and-a-number-that-was-wrong">What was measured, and a number that was wrong</a></li>
+<li><a href="#prefill-058-to-088">Prefill: 0.58 to 0.88</a></li>
+<li><a href="#a-path-i-measured-and-did-not-build">A path I measured and did not build</a></li>
+</ul>
+</div>
+</details><p>A mixture-of-experts layer is many small GEMMs with the same shape and different weights. Launching one kernel per expert wastes the GPU and synchronises the host, and a CUDA graph needs static shapes; the way out is to sort the rows by expert, pad them to the row tile and run <strong>one</strong> kernel whose <code>grid.z</code> is a list of row-block problems.</p>
+<h2 id="the-compiler-side">The compiler side<a class="headerlink" href="#the-compiler-side" title="Permanent link">#</a></h2>
+<p>Two passes (<code>ExpertBatchPass.cpp</code>, pipeline options <code>expert-problems</code> and <code>expert-roles</code>) turn the ordinary dense kernel into a grouped one: <code>grid.z</code> becomes the problem index; the kernel gets one extra argument, an <code>int32</code> array <code>meta</code> holding the expert of every problem; a negative entry is padding and the block returns at once; every weight, scale and zero-point argument advances by <code>meta[z]</code> slabs and the activation and output arguments by <code>z</code> row slabs. All shapes are static and nothing waits for the host. Around the two grouped GEMMs (gate/up with the SwiGLU epilogue, then down) three small CUDA kernels route, gather and combine; the vLLM plugin (<code>QuantForgeMoEMethod</code>) takes vLLM's own weight loader and router and replaces only the expert computation.</p>
+<h2 id="what-was-measured-and-a-number-that-was-wrong">What was measured, and a number that was wrong<a class="headerlink" href="#what-was-measured-and-a-number-that-was-wrong" title="Permanent link">#</a></h2>
+<p>OLMoE-1B-7B (64 experts, top-8), the decode step against vLLM's Marlin MoE:</p>
+<figure class="viz"><div class="viz-title">OLMoE-1B-7B against vLLM&#x27;s Marlin MoE (1.0 = Marlin MoE, higher is better)</div><svg class="chart" viewBox="0 0 760 222" role="img" aria-label="OLMoE-1B-7B against vLLM&#x27;s Marlin MoE (1.0 = Marlin MoE, higher is better)"><line class="grid" x1="170.0" y1="12" x2="170.0" y2="200"/><text class="tick" x="170.0" y="216" text-anchor="middle">0x</text><line class="grid" x1="274.0" y1="12" x2="274.0" y2="200"/><text class="tick" x="274.0" y="216" text-anchor="middle">0.25x</text><line class="grid" x1="378.0" y1="12" x2="378.0" y2="200"/><text class="tick" x="378.0" y="216" text-anchor="middle">0.5x</text><line class="grid" x1="482.0" y1="12" x2="482.0" y2="200"/><text class="tick" x="482.0" y="216" text-anchor="middle">0.75x</text><line class="grid" x1="586.0" y1="12" x2="586.0" y2="200"/><text class="tick" x="586.0" y="216" text-anchor="middle">1x</text><line class="grid" x1="690.0" y1="12" x2="690.0" y2="200"/><text class="tick" x="690.0" y="216" text-anchor="middle">1.25x</text><text class="lab" x="160" y="32.4" text-anchor="end">decode, 1 request</text><path class="s1" d="M170 18 H565.4 a4 4 0 0 1 4 4 V34 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 1 request: 0.96x</title></path><text class="val" x="577.4" y="32.4">0.96x</text><text class="lab" x="160" y="62.4" text-anchor="end">decode, 8 requests</text><path class="s1" d="M170 48 H561.2 a4 4 0 0 1 4 4 V64 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 8 requests: 0.95x</title></path><text class="val" x="573.2" y="62.4">0.95x</text><text class="lab" x="160" y="92.4" text-anchor="end">decode, 16 requests</text><path class="s1" d="M170 78 H561.2 a4 4 0 0 1 4 4 V94 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 16 requests: 0.95x</title></path><text class="val" x="573.2" y="92.4">0.95x</text><text class="lab" x="160" y="122.4" text-anchor="end">decode, 32 requests</text><path class="s1" d="M170 108 H552.9 a4 4 0 0 1 4 4 V124 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 32 requests: 0.93x</title></path><text class="val" x="564.9" y="122.4">0.93x</text><text class="lab" x="160" y="152.4" text-anchor="end">prefill, now</text><path class="s1" d="M170 138 H532.1 a4 4 0 0 1 4 4 V154 a4 4 0 0 1 -4 4 H170 Z"><title>prefill, now: 0.88x</title></path><text class="val" x="544.1" y="152.4">0.88x</text><text class="lab" x="160" y="182.4" text-anchor="end">prefill, first version</text><path class="s1" d="M170 168 H407.3 a4 4 0 0 1 4 4 V184 a4 4 0 0 1 -4 4 H170 Z"><title>prefill, first version: 0.58x</title></path><text class="val" x="419.3" y="182.4">0.58x</text><line class="ref" x1="586.0" y1="10" x2="586.0" y2="200"/><text class="reflab" x="591.0" y="10">Marlin = 1.0</text></svg><figcaption>Decode: pure decode-step time with the KV cache not limiting. Prefill: 16 prompts of 1275 tokens in 1024-token steps.</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>concurrent requests</th>
+<th style="text-align: right;">1</th>
+<th style="text-align: right;">8</th>
+<th style="text-align: right;">16</th>
+<th style="text-align: right;">32</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Marlin MoE, tokens/s</td>
+<td style="text-align: right;">197</td>
+<td style="text-align: right;">814</td>
+<td style="text-align: right;">1556</td>
+<td style="text-align: right;">2536</td>
+</tr>
+<tr>
+<td>QuantForge, tokens/s</td>
+<td style="text-align: right;">189</td>
+<td style="text-align: right;">771</td>
+<td style="text-align: right;">1475</td>
+<td style="text-align: right;">2354</td>
+</tr>
+<tr>
+<td>ratio</td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">0.95</td>
+<td style="text-align: right;">0.95</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+</tbody>
+</table>
+<p>The first version of this table said <strong>0.66</strong> at 32 requests, and I spent days on it: <code>nsys</code> traces, a roofline, replaying real routing, schedule sweeps that all plateaued. It was an artifact. The first op wrote the gate/up result as an f32 buffer; that buffer came out of the KV cache, vLLM ran out of room and preempted, and the throughput of the <em>run</em> dropped by a third while every kernel was as fast as before. Once the op no longer needed the buffer the same measurement gave 0.93. The lesson is in the <a href="08-w4a8-beats-marlin.html">W4A8 post</a> too: before diagnosing a gap in vLLM throughput, compare the reported KV cache size and the preemptions of both runs.</p>
+<h2 id="prefill-058-to-088">Prefill: 0.58 to 0.88<a class="headerlink" href="#prefill-058-to-088" title="Permanent link">#</a></h2>
+<p>Everything above is decode. Nobody had measured prefill (16 prompts of 1275 tokens, 1024-token steps): vLLM's Marlin MoE did 12117 / 11809 tokens/s and this op 6873 / 6944, <strong>0.58</strong>. Two causes, both fixed:</p>
+<ul>
+<li>The op processed large batches in chunks of 256 tokens to bound the f32 gate/up buffer, and every chunk reads all 64 experts' weights again (about 200 MB a layer). The SwiGLU epilogue now stores <code>silu(gate) * up</code> straight into its own f16 output (<code>quantforge.swiglu_out</code>, a second function argument the fusion pass fills): no f32 buffer, no conversion kernel, so the chunk grew to 512 and the weights are read half as often.</li>
+<li>The grouped kernels reused the dense row-count schedules, which put a 64-row block inside a 128-row problem (the weights were read twice) with the wrong warp tiles. A sweep over block, warp and K tiles with the read-flush found one family (K tile 64, one stage, look-ahead 1, 128-column blocks) 17 to 27 % faster than the dense schedule; the row tile is 16, 32 or 64 by the average number of rows per expert (128 never won).</li>
+</ul>
+<p>Prefill is now 10616 / 10518 tokens/s, <strong>0.88</strong> of Marlin MoE, and the generated text is identical to Marlin MoE's on four prompts (first-token log-probabilities within 0.001).</p>
+<h2 id="a-path-i-measured-and-did-not-build">A path I measured and did not build<a class="headerlink" href="#a-path-i-measured-and-did-not-build" title="Permanent link">#</a></h2>
+<p>An INT8 grouped kernel (the W4A8 kernel through the same pass) is 5 to 6 % faster than the grouped W4A16 one at 256 tokens (both near the 192 GB/s of the memory) and 14 to 15 % faster at 512. But it needs a quantisation kernel before each grouped GEMM and an f16 gate/up buffer plus a SwiGLU-and-requantise kernel between them, about 0.15 to 0.2 ms of traffic per layer, which eats most of the 0.34 ms gain: prefill would go from 0.88 to about 0.92, not past 1, for a new online-quantisation loader in vLLM. Not built.</p>
+<p>Limits: one model run end to end (OLMoE), 4-bit silu-gated experts, no expert parallelism, shared experts untested; Mixtral, Qwen-MoE and Qwen3-MoE shapes compile into the kernel pack but were not run.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

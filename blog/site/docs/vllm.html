@@ -17,7 +17,9 @@
 <ul>
 <li><a href="#end-to-end-on-a-real-model">End-to-end on a real model</a></li>
 <li><a href="#inside-vllm-plugin">Inside vLLM (plugin)</a></li>
+<li><a href="#mixture-of-experts-models-quantizationquantforge">Mixture-of-experts models (quantization="quantforge")</a></li>
 <li><a href="#online-w4a8-in-vllm-quantizationquantforge_w4a8-experimental">Online W4A8 in vLLM (quantization="quantforge_w4a8", experimental)</a></li>
+<li><a href="#hadamard-rotation-of-w4a8-new-in-050">Hadamard rotation of W4A8 (new in 0.5.0)</a></li>
 <li><a href="#w4a8-checkpoints-for-vllm-gptq-quality-loads-in-seconds">W4A8 checkpoints for vLLM (GPTQ quality, loads in seconds)</a></li>
 <li><a href="#other-models-from-a-hugging-face-cache">Other models (from a Hugging Face cache)</a></li>
 </ul>
@@ -458,8 +460,57 @@ layers, no AWQ without zero points. Other checkpoint formats (Qwen2.5-0.5B, the 
 <p>K-folding changes nothing for the 3B model (71 tokens/s with and without it): its narrow layers (2048 outputs) did not gain enough to be folded. <strong>Memory:</strong> a first run of the 3B model failed to start
 on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
 22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).</p>
+<h2 id="mixture-of-experts-models-quantizationquantforge">Mixture-of-experts models (<code>quantization="quantforge"</code>)<a class="headerlink" href="#mixture-of-experts-models-quantizationquantforge" title="Permanent link">#</a></h2>
+<p>A MoE layer is many small GEMMs with the same shape and different weights. The compiler gets one more feature for it (<code>ExpertBatchPass.cpp</code>, pipeline options
+<code>expert-problems</code> / <code>expert-roles</code>): the ordinary dense kernel is launched with <code>grid.z</code> = a list of <em>row-block problems</em>, takes the expert of each from a device <code>int32</code> array
+(<code>meta[z]</code>; a negative entry is padding and the block returns at once) and advances its weight / scale / zero-point pointers by that expert's slab, its activation / output
+pointers by the problem's slab. Rows are sorted by expert and padded to the row tile, so every row block belongs to one expert; everything has static shapes and no host
+synchronisation (CUDA graphs capture it). <code>quantforge.moe</code> wraps it: three small CUDA kernels (<code>runtime/moe_kernels.cu</code>: routing, gather, combine) around two grouped GEMMs (gate/up with the fused
+SwiGLU epilogue, then down); <code>QuantForgeMoEMethod</code> in the vLLM plugin takes vLLM's own MoE weight loader and router and replaces only the expert computation (vLLM 0.25.1 and 0.34.0, 4-bit GPTQ / AWQ, silu-gated experts, no expert parallelism).</p>
+<p>Measured on OLMoE-1B-7B GPTQ (64 experts, top-8, 3.7 GiB; the checkpoint quantises the router too, which vLLM cannot load, so the router was dequantised to fp16 in a local copy used by both sides),
+RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache not limiting:</p>
+<table>
+<thead>
+<tr>
+<th>concurrent requests</th>
+<th style="text-align: right;">1</th>
+<th style="text-align: right;">8</th>
+<th style="text-align: right;">16</th>
+<th style="text-align: right;">32</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Marlin MoE (vLLM), tokens/s</td>
+<td style="text-align: right;">197</td>
+<td style="text-align: right;">814</td>
+<td style="text-align: right;">1556</td>
+<td style="text-align: right;">2536</td>
+</tr>
+<tr>
+<td>QuantForge, tokens/s</td>
+<td style="text-align: right;">189</td>
+<td style="text-align: right;">771</td>
+<td style="text-align: right;">1475</td>
+<td style="text-align: right;">2354</td>
+</tr>
+<tr>
+<td>ratio</td>
+<td style="text-align: right;"><strong>0.96</strong></td>
+<td style="text-align: right;"><strong>0.95</strong></td>
+<td style="text-align: right;"><strong>0.95</strong></td>
+<td style="text-align: right;"><strong>0.93</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(mean of four interleaved rounds for 16 and 32 requests, two for 1 and 8). An earlier version of this section said 0.66x at 32 requests: that run had a smaller KV cache (the f32 gate/up buffer of this op, which no longer exists, took memory from it) and vLLM preempted; with the buffer gone the same measurement gives 0.93x.</p>
+<p>Prefill (16 prompts of ~1275 tokens, 1024-token steps; vLLM's Marlin MoE 12117 / 11809 tokens/s): this op ran at 6873 / 6944 (0.58x), now 10616 / 10518 (0.88x). What changed it: the gate/up kernel writes <code>silu(gate) * up</code> as f16 itself (<code>quantforge.swiglu_out</code>,
+<code>GroupedGemm(kind="swiglu16")</code>: no f32 buffer, no conversion kernel, so the chunks could grow from 256 to 512 tokens and every expert's weights are read half as often), and the grouped kernels got their own schedules for 32 / 64-row tiles (a sweep over
+64-256-column blocks, warp tiles, K tiles, stages: K tile 64, one stage, look-ahead 1, 128-column blocks, 17-27 % faster than the dense schedule of the same row count, which also read the weights twice per 128-row problem); the row tile is 16 / 32 / 64 by rows per expert (128 never won).</p>
+<p>The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). Real decode routing is clustered (14.8 distinct experts per layer for 32 requests, 27 row blocks because experts with more than 16 tokens run as several blocks); the 16-row tile stays best there (32- / 64-row tiles measured slower). <code>QUANTFORGE_MOE_ROWS</code> forces the row tile for experiments. Only this one model was run end to end;
+<code>pack build</code> records the grouped kernels of any MoE config (Mixtral, Qwen-MoE, Qwen3-MoE shapes compile, they were not run). Shared experts (Qwen-MoE) go through the dense layers and were not tested.</p>
 <h2 id="online-w4a8-in-vllm-quantizationquantforge_w4a8-experimental">Online W4A8 in vLLM (<code>quantization="quantforge_w4a8"</code>, experimental)<a class="headerlink" href="#online-w4a8-in-vllm-quantizationquantforge_w4a8-experimental" title="Permanent link">#</a></h2>
-<p>An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, <code>quant.w4a8_quantize</code>) while vLLM loads it: <code>LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")</code>.
+<p>An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, <code>quant.w4a8_quantize</code>, after the Hadamard rotation of <a href="#hadamard-rotation-of-w4a8-new-in-050">"Hadamard rotation of W4A8"</a>; <code>quantforge_w4a8_plain</code> skips it, <code>quantforge_w4a8_g64</code> uses groups of 64) while vLLM loads it: <code>LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")</code>.
 Every linear layer whose sizes are multiples of 128 calls <code>torch.ops.quantforge.w4a8_hybrid</code> (<code>w4a8_op.py</code>): above 16 rows the compiled W4A8 kernel on the INT8 tensor cores (the per-token activation quantisation is the compiled
 <code>_int8_quantize_tokens</code>; with an eager one the prefill was half as fast), up to 16 rows the W4A16 decode kernels (with K-folding), both from the same weight; the branch is inside the op, so <code>torch.compile</code> and CUDA graphs see none.
 Measured on vLLM 0.25.1 (RTX 4050; <code>benchmarks/vllm_prefill.py</code>: prefill of 16 prompts of 975 tokens, decode of 1 / 16 requests; tokens/s, best of 3):</p>
@@ -523,8 +574,120 @@ Measured on vLLM 0.25.1 (RTX 4050; <code>benchmarks/vllm_prefill.py</code>: pref
 <p>So the prefill is at the level of fp16 / Marlin (1.05x on the 1.5B) and 1.6-1.7x the W4A16 plugin, the decode is the W4A16 kernels' (0.80-0.85x of Marlin). It is not a clear win over Marlin: its advantages are that it quantises a plain checkpoint and
 that the prefill GEMMs run on the INT8 tensor cores; its costs are that the weights are kept in both layouts (about one byte per weight, the memory of INT8 rather than of INT4), the quantisation is round-to-nearest (no GPTQ; perplexity of the 0.5B
 23.7 against 20.5 with GPTQ), and it was tested on vLLM 0.25.1 and 0.34.0 (torch 2.14; same text, the same speed: 0.5B prefill 37370 tokens/s against 33998 for Marlin, decode 252 / 3911 against 300 / 4481; all the W4A8, checkpoint and plugin tests pass, slow ones included). Tests: <code>test/E2E/test_w4a8_op.py</code> (both paths against the dequantised reference, <code>torch.compile(fullgraph=True)</code>, generation under vLLM with <code>QUANTFORGE_SLOW_TESTS=1</code>).</p>
+<h2 id="hadamard-rotation-of-w4a8-new-in-050">Hadamard rotation of W4A8 (new in 0.5.0)<a class="headerlink" href="#hadamard-rotation-of-w4a8-new-in-050" title="Permanent link">#</a></h2>
+<p>INT8 per-token activation quantisation is hurt by outlier channels, and 4-bit weights by outlier weights. Both are fixed in the same way as in QuaRot / SpinQuant: multiply the input by an orthonormal matrix
+<code>B</code> (block diagonal, one 128 x 128 Walsh-Hadamard block per group of 128 inputs) and the weight by the same, <code>(x B)(W B)^T = x W^T</code>, so the layer is unchanged in exact arithmetic but both operands are flatter when they are quantised.
+Here <code>W B</code> is computed once when the weights are quantised (online at load, or in GPTQ with the Hessian rotated to <code>B^T H B</code>), and the activation side costs one pass over the activations: inside the INT8
+quantisation kernel above 64 rows (<code>quantize_rows_rot</code>: the rotated row waits in shared memory for its scale, bit-identical to rotating and then quantising), as a small kernel below. 2-4 % of the decode step at 1-64 requests, 1-2 % above.</p>
+<p>Wikitext-2 perplexity (<code>benchmarks/vllm_ppl.py</code>, the kernels vLLM really runs; fake-quantisation of the same experiment: <code>research/rotation_ppl.py</code>):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">W4A8, no rotation</th>
+<th style="text-align: right;">W4A8 rotated</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-1.5B, online round-to-nearest</td>
+<td style="text-align: right;">11.932</td>
+<td style="text-align: right;">13.949</td>
+<td style="text-align: right;"><strong>13.395</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B, online round-to-nearest</td>
+<td style="text-align: right;">18.10</td>
+<td style="text-align: right;">23.148</td>
+<td style="text-align: right;"><strong>21.195</strong></td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B-Instruct (another family), online round-to-nearest</td>
+<td style="text-align: right;">17.188</td>
+<td style="text-align: right;">20.843</td>
+<td style="text-align: right;"><strong>18.953</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-1.5B, GPTQ checkpoint</td>
+<td style="text-align: right;">11.932</td>
+<td style="text-align: right;">12.864</td>
+<td style="text-align: right;"><strong>12.331</strong></td>
+</tr>
+</tbody>
+</table>
+<p>What the simulation says and a rotation of 128 does not: the damage done by the INT8 activations (+0.42 / +0.63 on the two models) all but disappears (+0.01 / +0.04 on top of the rotated W4 weights); the effect on the 4-bit weights themselves
+depends on the block size without a clear rule (1.5B, W4 only: no rotation 13.512; blocks of 16 / 32 / 64 / 128 / 256: 13.550 / 13.710 / 13.184 / 13.600 / 13.540), so the block was fixed at 128, the group size of the kernels, rather than tuned on this model.
+<code>quantization="quantforge_w4a8"</code> rotates by default; <code>quantforge_w4a8_plain</code> is the old method (a different name because vLLM's compile cache is keyed by it, a switch that changes the graph must not be an environment variable);
+a rotated checkpoint says <code>"rotated": true</code> in its <code>quantization_config</code>. Not applicable to the GPTQ / AWQ W4A16 checkpoints of other people (their weights are not in the rotated basis).
+<strong>Other models, and where the rotation hurts</strong> (vLLM perplexity of the online round-to-nearest W4A8, wikitext-2, window 512; fp16 in the first column where the model fits the 6 GB card):</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">no rotation (<code>_plain</code>)</th>
+<th style="text-align: right;">rotated everywhere</th>
+<th style="text-align: right;">rotated, early <code>down_proj</code> excluded (the default)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">11.932</td>
+<td style="text-align: right;">13.949</td>
+<td style="text-align: right;">13.395</td>
+<td style="text-align: right;"><strong>13.376</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">18.10</td>
+<td style="text-align: right;">23.148</td>
+<td style="text-align: right;">21.195</td>
+<td style="text-align: right;">21.395</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B</td>
+<td style="text-align: right;">17.188</td>
+<td style="text-align: right;">20.843</td>
+<td style="text-align: right;">18.953</td>
+<td style="text-align: right;">18.987</td>
+</tr>
+<tr>
+<td>Phi-3.5-mini</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;">9.472</td>
+<td style="text-align: right;">9.007</td>
+<td style="text-align: right;"><strong>8.718</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-3B</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;">12.767</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;"><strong>11.830</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">18.353</td>
+<td style="text-align: right;">22.930</td>
+<td style="text-align: right;">22.257</td>
+<td style="text-align: right;"><strong>21.539</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-3B</td>
+<td style="text-align: right;">-</td>
+<td style="text-align: right;">16.640</td>
+<td style="text-align: right;"><strong>17.752</strong> (worse)</td>
+<td style="text-align: right;">16.658</td>
+</tr>
+</tbody>
+</table>
+<p>The Llama-3.2-3B failure is one layer: the input of the <code>down_proj</code> of layer 1 has a token 530 times the median norm (a massive activation, the attention sink) and the rotation, which spreads that single channel over its block of 128, raises that layer's output error from 0.054 to 0.080 and the model's perplexity by 1.1 (rotating only that <code>down_proj</code> gives 17.71, rotating everything else 16.74). Nothing in the weights flags such a layer (column norms are ordinary), so the online method, which has no activations, leaves the <code>down_proj</code> of the first four decoder layers unrotated (<code>vllm_plugin._early_down_proj</code>): the seven models above are the evidence for that rule, not a proof for other families. Quantising with GPTQ has calibration data, so there the decision is made per layer (<code>gptq._rotation_helps</code>: the output error of the rotated and the plain quantisation on a few tokens of every window, including the one of largest norm) and the layers that stay plain are listed in <code>config.json</code> (<code>unrotated_layers</code>; Llama-3.2-3B: layer 1 <code>down_proj</code> and layer 23 <code>o_proj</code>): GPTQ W4A8 of Llama-3.2-3B 16.537 plain, 16.377 with the per-layer decision.</p>
+<p><strong>Groups of 64</strong> (<code>quantization="quantforge_w4a8_g64"</code> online, or <code>make_w4a8_checkpoint.py --group 64</code>, the checkpoint carries <code>"group_size": 64</code>): the integer group scale of the format (1..16) is its coarse part, and halving the group helps: Qwen2.5-1.5B online 13.395 -&gt; <strong>13.186</strong>; GPTQ checkpoint 12.331 -&gt; <strong>12.253</strong> (the calibrated weights gain less). The INT8 kernel pays 2-3 % for the doubled scale / zero-point traffic (vLLM, 1.5B GPTQ checkpoint, tokens/s at 1 / 16 / 64 / 128 / 256 requests: 131 / 1958 / 5727 / 7390 / 9114 for group 128 against 128 / 1909 / 5624 / 7270 / 8964 for group 64, Marlin 131-141 / 1933-2090 / 5439-5847 / 7043-7242 / 7796-7875 in the two runs, which are noisy). Group 128 stays the default; groups of 32 compile and are exact but cost 4-10 % (CHANGELOG).</p>
+<p>Measured on two Qwen2.5 sizes and OLMo-2 1B only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).</p>
 <h2 id="w4a8-checkpoints-for-vllm-gptq-quality-loads-in-seconds">W4A8 checkpoints for vLLM (GPTQ quality, loads in seconds)<a class="headerlink" href="#w4a8-checkpoints-for-vllm-gptq-quality-loads-in-seconds" title="Permanent link">#</a></h2>
-<p><code>benchmarks/make_w4a8_checkpoint.py &lt;model&gt; &lt;out_dir&gt; --train &lt;wikitext-2 train parquet&gt;</code> quantises a Hugging Face model with the GPTQ of this format (<code>quantize_model_gptq(..., fmt="w4a8")</code>; <code>--rtn</code> for round-to-nearest) and writes it with
+<p><code>benchmarks/make_w4a8_checkpoint.py &lt;model&gt; &lt;out_dir&gt; --train &lt;wikitext-2 train parquet&gt;</code> quantises a Hugging Face model with the GPTQ of this format (<code>quantize_model_gptq(..., fmt="w4a8")</code>; <code>--rtn</code> for round-to-nearest; <code>--rotate</code> for the Hadamard rotation, decided per layer; <code>--group 64</code>) and writes it with
 <code>quantforge.w4a8_checkpoint.save_w4a8</code>: per decoder linear layer <code>weight</code> (int8 <code>[N, K/2]</code>, the <code>pack_k8</code> layout), <code>group_scale</code> / <code>group_zero</code> (int8 <code>[N, K/128]</code>), <code>w_scale</code> (f32 <code>[N]</code>), everything else dense fp16, and
 <code>quantization_config = {"quant_method": "quantforge_w4a8"}</code> in <code>config.json</code>. <code>LLM("out_dir", quantization="quantforge_w4a8")</code> then loads the quantised tensors as they are (the loader shards them like any other layer): no fp16 copy, no round-to-nearest
 step. Qwen2.5-3B (GPTQ, perplexity 12.54 against 13.47 for the online round-to-nearest): 1.99 GiB, <strong>loads in 2 s</strong> (25 s online), prefill 6678 tokens/s, decode 65 / 994 at 1 / 16 requests (compact mode), the same speed as the online path.
@@ -613,7 +776,7 @@ gap to fp16 is the round-to-nearest quantiser's. The 3 B and 3.8 B models only r
 card: 3.1 / 3.2 / 2.6 GB of GPU memory at peak (their fp16 weights are 5.6 – 7.3 GB). Phi-3.5's CUDA-graph
 capture fails inside Hugging Face's LongRoPE code (a data-dependent <code>if</code> on a GPU tensor), not in the
 kernels; its numbers above are from <code>generate</code>. Models with a fused <code>qkv_proj</code> / <code>gate_up_proj</code> (Phi-3)
-are handled, models whose <code>in_features</code> is not a multiple of 128 are rejected.</p><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/06-inside-vllm.html">QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went</a></li></ul></aside><div class="pager"><a href="runtime.html">&larr; Runtime and PyTorch op</a><a href="results.html">Results &rarr;</a></div></article></div>
+are handled, models whose <code>in_features</code> is not a multiple of 128 are rejected.</p><aside class="related"><h2>Related posts</h2><ul><li><a href="../posts/06-inside-vllm.html">QuantForge inside vLLM: a fair end-to-end comparison, and where the 20 to 30 percent went</a></li><li><a href="../posts/08-w4a8-beats-marlin.html">Faster than Marlin only on the INT8 tensor cores: what W4A16 could not do and what W4A8 took</a></li><li><a href="../posts/09-hadamard-rotation.html">A Hadamard rotation makes W4A8 more accurate than W4A16, and one layer of Llama-3.2-3B breaks it</a></li><li><a href="../posts/10-moe-grouped-gemm.html">Mixture-of-experts as one kernel launch, a prefill gap nobody had measured, and a 0.66x that was an artifact</a></li></ul></aside><div class="pager"><a href="runtime.html">&larr; Runtime and PyTorch op</a><a href="results.html">Results &rarr;</a></div></article></div>
 </main>
 <footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
 </body>

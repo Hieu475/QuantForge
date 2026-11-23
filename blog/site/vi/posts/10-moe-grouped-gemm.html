@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixture-of-experts thành một lần launch kernel, một khoảng trống prefill chưa ai đo, và con số 0,66x chỉ là hiện vật - QuantForge Notes</title>
+<meta name="description" content="GEMM W4A16 theo nhóm qua hai pass của compiler (expert của mỗi khối hàng đọc từ mảng trên device, không đồng bộ với host), các số MoE đầu-cuối đầu tiên, prefill chỉ đạt 0,58 của Marlin MoE cho đến khi có hai bản sửa, và một chẩn đoán đuổi theo khoảng trống mà thực ra là KV cache.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../../docs/index.html">Tài liệu (EN)</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/10-moe-grouped-gemm.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>Mixture-of-experts thành một lần launch kernel, một khoảng trống prefill chưa ai đo, và con số 0,66x chỉ là hiện vật</h1><p class="lede">GEMM W4A16 theo nhóm qua hai pass của compiler (expert của mỗi khối hàng đọc từ mảng trên device, không đồng bộ với host), các số MoE đầu-cuối đầu tiên, prefill chỉ đạt 0,58 của Marlin MoE cho đến khi có hai bản sửa, và một chẩn đoán đuổi theo khoảng trống mà thực ra là KV cache.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#phia-compiler">Phía compiler</a></li>
+<li><a href="#cai-a-o-va-mot-con-so-sai">Cái đã đo, và một con số sai</a></li>
+<li><a href="#prefill-058-len-088">Prefill: 0,58 lên 0,88</a></li>
+<li><a href="#mot-uong-a-o-ma-khong-xay">Một đường đã đo mà không xây</a></li>
+</ul>
+</div>
+</details><p>Một layer mixture-of-experts là nhiều GEMM nhỏ cùng shape, khác weight. Launch một kernel cho mỗi expert làm phí GPU và buộc đồng bộ với host, mà CUDA graph cần shape tĩnh; lối ra là sắp các hàng theo expert, đệm đến cỡ tile hàng và chạy <strong>một</strong> kernel có <code>grid.z</code> là danh sách các bài toán khối hàng.</p>
+<h2 id="phia-compiler">Phía compiler<a class="headerlink" href="#phia-compiler" title="Permanent link">#</a></h2>
+<p>Hai pass (<code>ExpertBatchPass.cpp</code>, tùy chọn pipeline <code>expert-problems</code> và <code>expert-roles</code>) biến kernel dense thông thường thành kernel theo nhóm: <code>grid.z</code> trở thành chỉ số bài toán; kernel nhận thêm một đối số, mảng <code>int32</code> <code>meta</code> giữ expert của từng bài toán; một phần tử âm là đệm và block thoát ngay; mọi đối số weight, scale và zero point dịch đi <code>meta[z]</code> slab, còn đối số activation và đầu ra dịch đi <code>z</code> slab hàng. Mọi shape đều tĩnh và không có gì chờ host. Quanh hai GEMM theo nhóm (gate/up với epilogue SwiGLU, rồi down) là ba kernel CUDA nhỏ lo định tuyến, gom và kết hợp; plugin vLLM (<code>QuantForgeMoEMethod</code>) dùng bộ nạp weight và router của chính vLLM và chỉ thay phần tính expert.</p>
+<h2 id="cai-a-o-va-mot-con-so-sai">Cái đã đo, và một con số sai<a class="headerlink" href="#cai-a-o-va-mot-con-so-sai" title="Permanent link">#</a></h2>
+<p>OLMoE-1B-7B (64 expert, top-8), bước decode so với Marlin MoE của vLLM:</p>
+<figure class="viz"><div class="viz-title">OLMoE-1B-7B so với Marlin MoE của vLLM (1,0 = Marlin MoE, càng cao càng tốt)</div><svg class="chart" viewBox="0 0 760 222" role="img" aria-label="OLMoE-1B-7B so với Marlin MoE của vLLM (1,0 = Marlin MoE, càng cao càng tốt)"><line class="grid" x1="170.0" y1="12" x2="170.0" y2="200"/><text class="tick" x="170.0" y="216" text-anchor="middle">0x</text><line class="grid" x1="274.0" y1="12" x2="274.0" y2="200"/><text class="tick" x="274.0" y="216" text-anchor="middle">0.25x</text><line class="grid" x1="378.0" y1="12" x2="378.0" y2="200"/><text class="tick" x="378.0" y="216" text-anchor="middle">0.5x</text><line class="grid" x1="482.0" y1="12" x2="482.0" y2="200"/><text class="tick" x="482.0" y="216" text-anchor="middle">0.75x</text><line class="grid" x1="586.0" y1="12" x2="586.0" y2="200"/><text class="tick" x="586.0" y="216" text-anchor="middle">1x</text><line class="grid" x1="690.0" y1="12" x2="690.0" y2="200"/><text class="tick" x="690.0" y="216" text-anchor="middle">1.25x</text><text class="lab" x="160" y="32.4" text-anchor="end">decode, 1 request</text><path class="s1" d="M170 18 H565.4 a4 4 0 0 1 4 4 V34 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 1 request: 0.96x</title></path><text class="val" x="577.4" y="32.4">0.96x</text><text class="lab" x="160" y="62.4" text-anchor="end">decode, 8 request</text><path class="s1" d="M170 48 H561.2 a4 4 0 0 1 4 4 V64 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 8 request: 0.95x</title></path><text class="val" x="573.2" y="62.4">0.95x</text><text class="lab" x="160" y="92.4" text-anchor="end">decode, 16 request</text><path class="s1" d="M170 78 H561.2 a4 4 0 0 1 4 4 V94 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 16 request: 0.95x</title></path><text class="val" x="573.2" y="92.4">0.95x</text><text class="lab" x="160" y="122.4" text-anchor="end">decode, 32 request</text><path class="s1" d="M170 108 H552.9 a4 4 0 0 1 4 4 V124 a4 4 0 0 1 -4 4 H170 Z"><title>decode, 32 request: 0.93x</title></path><text class="val" x="564.9" y="122.4">0.93x</text><text class="lab" x="160" y="152.4" text-anchor="end">prefill, hiện tại</text><path class="s1" d="M170 138 H532.1 a4 4 0 0 1 4 4 V154 a4 4 0 0 1 -4 4 H170 Z"><title>prefill, hiện tại: 0.88x</title></path><text class="val" x="544.1" y="152.4">0.88x</text><text class="lab" x="160" y="182.4" text-anchor="end">prefill, bản đầu</text><path class="s1" d="M170 168 H407.3 a4 4 0 0 1 4 4 V184 a4 4 0 0 1 -4 4 H170 Z"><title>prefill, bản đầu: 0.58x</title></path><text class="val" x="419.3" y="182.4">0.58x</text><line class="ref" x1="586.0" y1="10" x2="586.0" y2="200"/><text class="reflab" x="591.0" y="10">Marlin = 1.0</text></svg><figcaption>Decode: thời gian bước decode thuần khi KV cache không giới hạn. Prefill: 16 prompt 1275 token, bước 1024 token.</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>request đồng thời</th>
+<th style="text-align: right;">1</th>
+<th style="text-align: right;">8</th>
+<th style="text-align: right;">16</th>
+<th style="text-align: right;">32</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Marlin MoE, token/s</td>
+<td style="text-align: right;">197</td>
+<td style="text-align: right;">814</td>
+<td style="text-align: right;">1556</td>
+<td style="text-align: right;">2536</td>
+</tr>
+<tr>
+<td>QuantForge, token/s</td>
+<td style="text-align: right;">189</td>
+<td style="text-align: right;">771</td>
+<td style="text-align: right;">1475</td>
+<td style="text-align: right;">2354</td>
+</tr>
+<tr>
+<td>tỉ lệ</td>
+<td style="text-align: right;">0,96</td>
+<td style="text-align: right;">0,95</td>
+<td style="text-align: right;">0,95</td>
+<td style="text-align: right;">0,93</td>
+</tr>
+</tbody>
+</table>
+<p>Phiên bản đầu của bảng này ghi <strong>0,66</strong> ở 32 request, và tôi đã dành nhiều ngày cho nó: trace <code>nsys</code>, roofline, phát lại định tuyến thật, các lần quét schedule đều đứng yên. Nó là hiện vật. Op đầu tiên ghi kết quả gate/up ra một buffer f32; buffer đó lấy từ KV cache, vLLM hết chỗ và preempt, và throughput của <em>cả lần chạy</em> giảm một phần ba trong khi mọi kernel nhanh như trước. Khi op không cần buffer đó nữa thì cùng phép đo cho 0,93. Bài học cũng nằm trong <a href="08-w4a8-beats-marlin.html">bài W4A8</a>: trước khi chẩn đoán một khoảng trống throughput trong vLLM, hãy so kích thước KV cache được báo và số lần preempt của hai lần chạy.</p>
+<h2 id="prefill-058-len-088">Prefill: 0,58 lên 0,88<a class="headerlink" href="#prefill-058-len-088" title="Permanent link">#</a></h2>
+<p>Mọi thứ ở trên là decode. Chưa ai đo prefill (16 prompt 1275 token, bước 1024 token): Marlin MoE của vLLM đạt 12117 / 11809 token/s còn op này 6873 / 6944, tức <strong>0,58</strong>. Hai nguyên nhân, cả hai đã sửa:</p>
+<ul>
+<li>Op xử lý batch lớn theo từng đoạn 256 token để chặn buffer gate/up f32, và mỗi đoạn lại đọc weight của cả 64 expert (khoảng 200 MB mỗi layer). Epilogue SwiGLU giờ ghi <code>silu(gate) * up</code> thẳng vào đầu ra f16 riêng của nó (<code>quantforge.swiglu_out</code>, một đối số hàm thứ hai mà pass gộp điền vào): không buffer f32, không kernel chuyển đổi, nên đoạn tăng lên 512 và weight được đọc ít hơn một nửa số lần.</li>
+<li>Các kernel theo nhóm dùng lại schedule theo số hàng của kernel dense, vốn đặt khối 64 hàng trong bài toán 128 hàng (weight bị đọc hai lần) với warp tile sai. Một lần quét tile block, warp và K với flush bằng đọc tìm ra một họ (tile K 64, một stage, nhìn trước 1, khối 128 cột) nhanh hơn schedule dense 17 đến 27 %; tile hàng là 16, 32 hoặc 64 theo số hàng trung bình mỗi expert (128 chưa bao giờ thắng).</li>
+</ul>
+<p>Prefill giờ là 10616 / 10518 token/s, <strong>0,88</strong> của Marlin MoE, và văn bản sinh ra giống hệt Marlin MoE trên bốn prompt (log-xác suất token đầu lệch dưới 0,001).</p>
+<h2 id="mot-uong-a-o-ma-khong-xay">Một đường đã đo mà không xây<a class="headerlink" href="#mot-uong-a-o-ma-khong-xay" title="Permanent link">#</a></h2>
+<p>Kernel INT8 theo nhóm (kernel W4A8 qua cùng pass) nhanh hơn kernel W4A16 theo nhóm 5 đến 6 % ở 256 token (cả hai gần 192 GB/s của bộ nhớ) và 14 đến 15 % ở 512. Nhưng nó cần một kernel lượng tử hóa trước mỗi GEMM theo nhóm và một buffer gate/up f16 cộng một kernel SwiGLU-và-lượng-tử-lại ở giữa, khoảng 0,15 đến 0,2 ms lưu lượng mỗi layer, ăn gần hết phần lợi 0,34 ms: prefill sẽ từ 0,88 lên khoảng 0,92, chưa vượt 1, để đổi lấy một bộ nạp lượng tử hóa online mới trong vLLM. Không xây.</p>
+<p>Giới hạn: một model chạy đầu-cuối (OLMoE), expert 4 bit dùng silu-gated, không có expert parallelism, shared expert chưa thử; shape Mixtral, Qwen-MoE và Qwen3-MoE biên dịch được vào kernel pack nhưng chưa chạy.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

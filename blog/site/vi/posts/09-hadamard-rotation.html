@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phép quay Hadamard làm W4A8 chính xác hơn W4A16, và một layer của Llama-3.2-3B làm nó hỏng - QuantForge Notes</title>
+<meta name="description" content="Quay đầu vào của mọi layer tuyến tính (và weight của nó) bằng ma trận Hadamard theo khối xóa gần hết thiệt hại do activation INT8 và còn tự trả lại bằng độ chính xác. Nó làm gì trên bảy model, layer nơi nó thất bại, quyết định theo từng layer sửa được, và những ý tưởng không hiệu quả.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../../docs/index.html">Tài liệu (EN)</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/09-hadamard-rotation.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>Phép quay Hadamard làm W4A8 chính xác hơn W4A16, và một layer của Llama-3.2-3B làm nó hỏng</h1><p class="lede">Quay đầu vào của mọi layer tuyến tính (và weight của nó) bằng ma trận Hadamard theo khối xóa gần hết thiệt hại do activation INT8 và còn tự trả lại bằng độ chính xác. Nó làm gì trên bảy model, layer nơi nó thất bại, quyết định theo từng layer sửa được, và những ý tưởng không hiệu quả.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#phien-ban-u-re">Phiên bản đủ rẻ</a></li>
+<li><a href="#no-mang-lai-gi">Nó mang lại gì</a></li>
+<li><a href="#layer-lam-no-hong">Layer làm nó hỏng</a></li>
+<li><a href="#nhung-thu-khong-hieu-qua">Những thứ không hiệu quả</a></li>
+<li><a href="#hai-loi-ang-mot-oan">Hai lỗi đáng một đoạn</a></li>
+</ul>
+</div>
+</details><p>Lượng tử hóa activation INT8 theo token là cái giá của <a href="08-w4a8-beats-marlin.html">đường W4A8</a> nhanh hơn, và người trả giá là các kênh ngoại lai: một kênh lớn quyết định scale của token và phần còn lại của hàng mất độ phân giải. Cách chữa quen thuộc từ QuaRot và SpinQuant là nhân đầu vào với một ma trận trực chuẩn <code>B</code> và weight với cùng ma trận đó, <code>(xB)(WB)^T = xW^T</code>, để layer không đổi về mặt toán học nhưng cả hai vế đều phẳng hơn khi được lượng tử hóa.</p>
+<h2 id="phien-ban-u-re">Phiên bản đủ rẻ<a class="headerlink" href="#phien-ban-u-re" title="Permanent link">#</a></h2>
+<p>Quay đầy đủ một layer rộng 4096 là một phép nhân 4096 x 4096. Một <strong>ma trận Walsh-Hadamard chéo khối</strong>, mỗi khối 128 x 128 cho mỗi nhóm 128 đầu vào, là một butterfly: 7 tầng cộng và trừ cho mỗi khối, không có phép nhân. <code>WB</code> được tính một lần khi lượng tử hóa weight (lúc nạp, hoặc trong GPTQ với Hessian được quay thành <code>B^T H B</code>). Ở phía activation, một warp biến đổi một khối bằng shuffle, và trên 64 hàng phép biến đổi nằm <em>ngay trong kernel lượng tử hóa INT8</em>: hàng đã quay chờ trong shared memory để lấy scale, nên không tốn thêm một lượt đọc activation (kernel gộp giống từng bit với việc quay rồi mới lượng tử hóa, và có test). Chi phí đo được: 2 đến 4 % của một bước decode ở 1 đến 64 request, 1 đến 2 % ở trên đó.</p>
+<h2 id="no-mang-lai-gi">Nó mang lại gì<a class="headerlink" href="#no-mang-lai-gi" title="Permanent link">#</a></h2>
+<p>Perplexity Wikitext-2 qua vLLM (kernel thật sự chạy; weight round-to-nearest online, activation INT8):</p>
+<figure class="viz"><div class="viz-title">Perplexity Wikitext-2 của W4A8 online qua vLLM (càng thấp càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>W4A8</span><span class="lg"><i class="sw s2"></i>W4A8 rotated</span><span class="lg"><i class="sw mk"></i>fp16</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Perplexity Wikitext-2 của W4A8 online qua vLLM (càng thấp càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">5.6</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">11.2</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">16.8</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">22.4</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">28</text><path class="s1" d="M104.2 268 V148.5 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - W4A8: 13.9</title></path><text class="val" x="121.2" y="139.5" text-anchor="middle">13.9</text><path class="s2" d="M140.2 268 V153.5 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - W4A8 rotated: 13.4</title></path><text class="val" x="157.2" y="144.5" text-anchor="middle">13.4</text><line class="marker" x1="99.2" y1="162.3" x2="179.2" y2="162.3"><title>Qwen2.5
+1.5B - fp16: 11.932</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M278.8 268 V67.0 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - W4A8: 23.1</title></path><text class="val" x="295.8" y="58.0" text-anchor="middle">23.1</text><path class="s2" d="M314.8 268 V82.5 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - W4A8 rotated: 21.4</title></path><text class="val" x="331.8" y="73.5" text-anchor="middle">21.4</text><line class="marker" x1="273.8" y1="107.7" x2="353.8" y2="107.7"><title>Qwen2.5
+0.5B - fp16: 18.1</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M453.2 268 V87.4 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - W4A8: 20.8</title></path><text class="val" x="470.2" y="78.4" text-anchor="middle">20.8</text><path class="s2" d="M489.2 268 V103.8 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - W4A8 rotated: 19.0</title></path><text class="val" x="506.2" y="94.8" text-anchor="middle">19.0</text><line class="marker" x1="448.2" y1="115.8" x2="528.2" y2="115.8"><title>OLMo-2
+1B - fp16: 17.188</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V68.9 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - W4A8: 22.9</title></path><text class="val" x="644.8" y="59.9" text-anchor="middle">22.9</text><path class="s2" d="M663.8 268 V81.2 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - W4A8 rotated: 21.5</title></path><text class="val" x="680.8" y="72.2" text-anchor="middle">21.5</text><line class="marker" x1="622.8" y1="105.4" x2="702.8" y2="105.4"><title>Llama-3.2
+1B - fp16: 18.353</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>Weight 4 bit round-to-nearest, activation INT8, cửa sổ 512 token. Đường ngang là model fp16; các cột có quay giữ down_proj của bốn layer đầu không quay.</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>W4A8</th><th>W4A8 rotated</th><th>fp16</th></tr></thead><tbody><tr><th>Qwen2.5 1.5B</th><td>13.9</td><td>13.4</td><td>11.932</td></tr><tr><th>Qwen2.5 0.5B</th><td>23.1</td><td>21.4</td><td>18.1</td></tr><tr><th>OLMo-2 1B</th><td>20.8</td><td>19.0</td><td>17.188</td></tr><tr><th>Llama-3.2 1B</th><td>22.9</td><td>21.5</td><td>18.353</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">W4A8, không quay</th>
+<th style="text-align: right;">W4A8, quay (mặc định)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">11,932</td>
+<td style="text-align: right;">13,949</td>
+<td style="text-align: right;"><strong>13,376</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">18,10</td>
+<td style="text-align: right;">23,148</td>
+<td style="text-align: right;">21,395</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B</td>
+<td style="text-align: right;">17,188</td>
+<td style="text-align: right;">20,843</td>
+<td style="text-align: right;">18,987</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">18,353</td>
+<td style="text-align: right;">22,930</td>
+<td style="text-align: right;"><strong>21,539</strong></td>
+</tr>
+<tr>
+<td>Phi-3.5-mini</td>
+<td style="text-align: right;">không vừa bộ nhớ</td>
+<td style="text-align: right;">9,472</td>
+<td style="text-align: right;"><strong>8,718</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-3B</td>
+<td style="text-align: right;">không vừa bộ nhớ</td>
+<td style="text-align: right;">12,767</td>
+<td style="text-align: right;"><strong>11,830</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-3B</td>
+<td style="text-align: right;">không vừa bộ nhớ</td>
+<td style="text-align: right;">16,640</td>
+<td style="text-align: right;">16,658</td>
+</tr>
+</tbody>
+</table>
+<p>Với weight GPTQ (Qwen2.5-1.5B, hiệu chỉnh trên wikitext-2 train nên số tuyệt đối hơi đẹp): W4A16 12,605, W4A8 12,864, <strong>W4A8 quay 12,331</strong>. Thiệt hại do activation INT8, +0,42 và +0,63 perplexity trên hai cỡ Qwen trong mô phỏng lượng tử hóa giả, giảm còn +0,01 và +0,04 trên nền weight 4 bit đã quay; và một checkpoint W4A8 có quay chính xác hơn cả checkpoint W4A16 không quay. Giảm nửa nhóm của các scale nguyên xuống 64 (<code>quantforge_w4a8_g64</code>) cho thêm 0,21 online và 0,08 với GPTQ, đổi lại 2 đến 3 % tốc độ.</p>
+<h2 id="layer-lam-no-hong">Layer làm nó hỏng<a class="headerlink" href="#layer-lam-no-hong" title="Permanent link">#</a></h2>
+<p>Quay <em>mọi thứ</em> làm Llama-3.2-3B tệ đi: 16,640 thành <strong>17,752</strong>. Chỉ quay các layer có K bằng 8192 cho 17,71, chỉ quay các layer còn lại cho 16,74, nên thủ phạm là các <code>down_proj</code>; một bảng sai số theo từng layer trên activation thật (forward trên CPU, kernel thật trên GPU) chỉ ra đúng một layer:</p>
+<table>
+<thead>
+<tr>
+<th><code>down_proj</code> layer 1 của Llama-3.2-3B</th>
+<th style="text-align: right;">sai số đầu ra tương đối</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>W4A8 thường</td>
+<td style="text-align: right;">0,054</td>
+</tr>
+<tr>
+<td>đã quay</td>
+<td style="text-align: right;">0,080</td>
+</tr>
+</tbody>
+</table>
+<p>Đầu vào của nó có một token với <strong>chuẩn gấp 530 lần trung vị</strong>, chính là attention sink. Phép quay dàn kênh khổng lồ duy nhất đó ra cả khối 128, và token duy nhất mà model phụ thuộc vào giờ bị lượng tử hóa với sai số trải đều cả hàng. Không có gì trong weight đánh dấu một layer như vậy (chuẩn cột bình thường), nên không có cách nào biết nếu thiếu activation. Hai cách sửa:</p>
+<ul>
+<li><strong>GPTQ có dữ liệu hiệu chỉnh</strong>, nên nó quyết định theo từng layer: với mỗi nhóm layer tuyến tính chung đầu vào, nó so sai số đầu ra của lượng tử hóa có quay và không quay trên vài token của mỗi cửa sổ, gồm cả token có chuẩn lớn nhất, rồi ghi các layer giữ nguyên vào <code>config.json</code> (<code>unrotated_layers</code>; với Llama-3.2-3B là <code>layers.1.mlp.down_proj</code> và <code>layers.23.self_attn.o_proj</code>). GPTQ W4A8 của bản 3B: 16,537 không quay, 16,377 khi quyết định theo layer.</li>
+<li><strong>Lượng tử hóa online không có dữ liệu</strong>, nên nó theo một quy tắc: <code>down_proj</code> của bốn layer decoder đầu tiên không được quay. Bảng trên là bằng chứng cho quy tắc đó, bảy model, và nó là quy tắc chứ không phải chứng minh: với họ model tôi chưa chạy, <code>quantforge_w4a8_plain</code> là mốc để so sánh.</li>
+</ul>
+<h2 id="nhung-thu-khong-hieu-qua">Những thứ không hiệu quả<a class="headerlink" href="#nhung-thu-khong-hieu-qua" title="Permanent link">#</a></h2>
+<ul>
+<li><strong>Chọn phép quay riêng cho từng layer</strong> trong số các ứng viên rẻ (đơn vị, đổi dấu ngẫu nhiên, hoán vị kênh) theo sai số đầu ra trên token hiệu chỉnh: 13,612 so với 13,606 của Hadamard cố định. Phần còn thiếu so với fp16 là weight 4 bit, không phải cơ sở quay.</li>
+<li><strong>Activation FP8 (E4M3) thay INT8</strong> trên lõi tensor Ada: không xây. Với phép quay, activation INT8 chỉ tốn +0,01 đến +0,04 perplexity, tốc độ FP8 và INT8 trên chip này như nhau, và dialect NVVM của LLVM 18 không có mma FP8.</li>
+<li><strong>Weight 3 bit</strong> với phép quay và tìm clip: GPTQ 17,2 thường, 14,6 có quay, 13,6 có quay và clip, so với 13,1 / 12,5 / 12,4 ở 4 bit cùng dữ liệu hiệu chỉnh. Model 3 bit ngang checkpoint GPTQ 4 bit công khai của Marlin, nhưng so với 4 bit cùng hiệu chỉnh thì tốn thêm 0,5 đến 1,2 perplexity để bớt 25 % byte, và kernel không có giải nén 3 bit (hai mặt phẳng bit đọc bằng <code>tensor.extract</code> sẽ chậm hơn kernel decode 4 bit). 2 bit không dùng được.</li>
+<li><strong>Tìm clip cho scale theo kênh</strong> của định dạng thật: -0,08, +0,08 và -0,26 trên ba model, nên để tắt.</li>
+<li><strong>KV cache fp8</strong> (của chính vLLM): nó nhân đôi dung lượng KV (90k lên 171k token trên card 6 GB) và làm hỏng Qwen2.5 với scale mặc định (12,33 lên 24,96; Marlin 13,64 lên 28,73), đó là chuyện attention của vLLM.</li>
+</ul>
+<h2 id="hai-loi-ang-mot-oan">Hai lỗi đáng một đoạn<a class="headerlink" href="#hai-loi-ang-mot-oan" title="Permanent link">#</a></h2>
+<p>Cache biên dịch của vLLM được khóa theo <em>tên</em> phương thức lượng tử hóa, không theo biến môi trường. Công tắc quay đầu tiên của tôi là một biến môi trường; lần chạy thứ hai dùng lại đồ thị đã biên dịch của lần đầu, và perplexity ra 10^7. Cách sửa là một thiết lập làm đổi đồ thị được trace phải là một tên lượng tử hóa khác (<code>quantforge_w4a8_plain</code>, <code>quantforge_w4a8_g64</code>). Và hàm giả (fake) của một custom op phải trả về stride của kết quả thật: <code>empty_like</code> của đầu vào không liên tục thì không, và kết quả sai một cách im lặng dưới <code>torch.compile</code>.</p></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>

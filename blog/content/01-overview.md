@@ -89,7 +89,7 @@ What the table says:
 
 * **Decode (M up to 16)**: at 4096 x 4096 the generated kernel is **on par with Marlin** (0.99 to 1.01x, about 50 microseconds, which is the DRAM limit: `ncu` measures 9.2 MB read for 8.65 MB of weights and scales, about 184 GB/s); on the wide 4096 x 11008 shapes it reaches 93 to 94 percent (it was 85 percent until a wave-aware K tile was added, see [the decode post](02-decode-instruction-bound.html)), on 1 x 11008 x 4096 97 percent. (An earlier version of this post reported 1.30x at 4096 x 4096; that figure did not survive re-measurement, see [the decode post](02-decode-instruction-bound.html).)
 * **Prefill (M of 512 and more)**: 85 to 86 percent of Marlin, about 20 to 25 percent slower than cuBLAS fp16, which reads four times the bytes but has no dequantisation to do: the kernel is compute-bound there and the dequantisation competes with the Tensor Cores for issue slots.
-* **M between 32 and 256** is the weak spot, 13 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail.
+* **M between 32 and 256** is the weak spot, 13 to 33 percent behind. [A separate post](04-mid-batch-postmortem.html) investigates it in detail. *(Update, 0.5.0: end to end in vLLM the exact W4A16 path is at 0.80 to 0.89 of Marlin from 32 requests, and the INT8-activation W4A8 path passes Marlin from about 128 requests, see [the W4A8 post](08-w4a8-beats-marlin.html).)*
 
 ### Against other kernels
 

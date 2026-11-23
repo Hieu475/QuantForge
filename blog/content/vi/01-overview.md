@@ -89,7 +89,7 @@ Bảng nói lên điều gì:
 
 * **Decode (M tới 16)**: ở 4096 x 4096 kernel sinh ra **ngang Marlin** (0.99 đến 1.01x, khoảng 50 micro giây, đúng là giới hạn DRAM: `ncu` đo được 9.2 MB đọc cho 8.65 MB weight và scale, khoảng 184 GB/s); với shape rộng 4096 x 11008 đạt 93 đến 94 phần trăm (trước đây là 85 phần trăm, cho đến khi thêm K tile nhận biết wave, xem [bài về decode](02-decode-instruction-bound.html)), với 1 x 11008 x 4096 đạt 97 phần trăm. (Phiên bản đầu của bài này báo 1.30x ở 4096 x 4096; con số đó không qua được lần đo lại, xem [bài về decode](02-decode-instruction-bound.html).)
 * **Prefill (M từ 512 trở lên)**: 85 đến 86 phần trăm của Marlin, chậm hơn cuBLAS fp16 khoảng 20 đến 25 phần trăm, trong khi cuBLAS đọc nhiều gấp bốn lần byte nhưng không phải dequantise: ở đây kernel bị giới hạn bởi tính toán và dequantisation tranh slot issue với Tensor Core.
-* **M từ 32 đến 256** là điểm yếu, chậm hơn 13 đến 33 phần trăm. [Một bài riêng](04-mid-batch-postmortem.html) điều tra chi tiết.
+* **M từ 32 đến 256** là điểm yếu, chậm hơn 13 đến 33 phần trăm. [Một bài riêng](04-mid-batch-postmortem.html) điều tra chi tiết. *(Cập nhật, 0.5.0: đầu-cuối trong vLLM, đường W4A16 chính xác ở mức 0,80 đến 0,89 của Marlin từ 32 request, và đường W4A8 với activation INT8 vượt Marlin từ khoảng 128 request, xem [bài về W4A8](08-w4a8-beats-marlin.html).)*
 
 ### So với các kernel khác
 

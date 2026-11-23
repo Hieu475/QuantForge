@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Hadamard rotation makes W4A8 more accurate than W4A16, and one layer of Llama-3.2-3B breaks it - QuantForge Notes</title>
+<meta name="description" content="Rotating the input of every linear layer (and its weight) by a block Hadamard matrix removes almost all of the INT8-activation loss and pays for itself in accuracy. What it did on seven models, the layer where it fails, the per-layer decision that fixes it, and the ideas that did not work.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Posts</a><a href="../docs/index.html">Docs</a><a href="../about.html">About</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../vi/posts/09-hadamard-rotation.html" hreflang="vi">Tiếng Việt</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>A Hadamard rotation makes W4A8 more accurate than W4A16, and one layer of Llama-3.2-3B breaks it</h1><p class="lede">Rotating the input of every linear layer (and its weight) by a block Hadamard matrix removes almost all of the INT8-activation loss and pays for itself in accuracy. What it did on seven models, the layer where it fails, the per-layer decision that fixes it, and the ideas that did not work.</p><details class="toc"><summary>Contents</summary><div class="toc">
+<ul>
+<li><a href="#the-version-that-is-cheap-enough">The version that is cheap enough</a></li>
+<li><a href="#what-it-buys">What it buys</a></li>
+<li><a href="#the-layer-that-breaks-it">The layer that breaks it</a></li>
+<li><a href="#things-that-did-not-work">Things that did not work</a></li>
+<li><a href="#two-bugs-worth-the-paragraph">Two bugs worth the paragraph</a></li>
+</ul>
+</div>
+</details><p>INT8 per-token activation quantisation is the price of the faster <a href="08-w4a8-beats-marlin.html">W4A8 path</a>, and it is paid by outlier channels: one large channel sets the token's scale and the rest of the row loses its resolution. The cure known from QuaRot and SpinQuant is to multiply the input by an orthonormal matrix <code>B</code> and the weight by the same, <code>(xB)(WB)^T = xW^T</code>, so that the layer is unchanged in exact arithmetic but both operands are flatter when they are quantised.</p>
+<h2 id="the-version-that-is-cheap-enough">The version that is cheap enough<a class="headerlink" href="#the-version-that-is-cheap-enough" title="Permanent link">#</a></h2>
+<p>A full rotation of a 4096-wide layer is a 4096 x 4096 product. A <strong>block-diagonal Walsh-Hadamard matrix</strong>, one 128 x 128 block per group of 128 inputs, is a butterfly: 7 stages of adds and subtracts per block, no multiplications. <code>WB</code> is computed once when the weights are quantised (at load, or inside GPTQ with the Hessian rotated to <code>B^T H B</code>). On the activation side one warp transforms a block with shuffles, and above 64 rows the transform is <em>inside the INT8 quantisation kernel</em>: the rotated row waits in shared memory for its scale, so the cost is no extra pass over the activations (the fused kernel is bit-identical to rotating and then quantising, which is tested). Measured cost: 2 to 4 % of the decode step at 1 to 64 requests, 1 to 2 % above.</p>
+<h2 id="what-it-buys">What it buys<a class="headerlink" href="#what-it-buys" title="Permanent link">#</a></h2>
+<p>Wikitext-2 perplexity through vLLM (the kernels that really run; online round-to-nearest weights, INT8 activations):</p>
+<figure class="viz"><div class="viz-title">Wikitext-2 perplexity of online W4A8 through vLLM (lower is better)</div><div class="legend"><span class="lg"><i class="sw s1"></i>W4A8</span><span class="lg"><i class="sw s2"></i>W4A8 rotated</span><span class="lg"><i class="sw mk"></i>fp16</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Wikitext-2 perplexity of online W4A8 through vLLM (lower is better)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">5.6</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">11.2</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">16.8</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">22.4</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">28</text><path class="s1" d="M104.2 268 V148.5 a4 4 0 0 1 4 -4 H134.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - W4A8: 13.9</title></path><text class="val" x="121.2" y="139.5" text-anchor="middle">13.9</text><path class="s2" d="M140.2 268 V153.5 a4 4 0 0 1 4 -4 H170.2 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+1.5B - W4A8 rotated: 13.4</title></path><text class="val" x="157.2" y="144.5" text-anchor="middle">13.4</text><line class="marker" x1="99.2" y1="162.3" x2="179.2" y2="162.3"><title>Qwen2.5
+1.5B - fp16: 11.932</title></line><text class="lab" x="139.2" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="139.2" y="300" text-anchor="middle">1.5B</text><path class="s1" d="M278.8 268 V67.0 a4 4 0 0 1 4 -4 H308.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - W4A8: 23.1</title></path><text class="val" x="295.8" y="58.0" text-anchor="middle">23.1</text><path class="s2" d="M314.8 268 V82.5 a4 4 0 0 1 4 -4 H344.8 a4 4 0 0 1 4 4 V268 Z"><title>Qwen2.5
+0.5B - W4A8 rotated: 21.4</title></path><text class="val" x="331.8" y="73.5" text-anchor="middle">21.4</text><line class="marker" x1="273.8" y1="107.7" x2="353.8" y2="107.7"><title>Qwen2.5
+0.5B - fp16: 18.1</title></line><text class="lab" x="313.8" y="286" text-anchor="middle">Qwen2.5</text><text class="lab" x="313.8" y="300" text-anchor="middle">0.5B</text><path class="s1" d="M453.2 268 V87.4 a4 4 0 0 1 4 -4 H483.2 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - W4A8: 20.8</title></path><text class="val" x="470.2" y="78.4" text-anchor="middle">20.8</text><path class="s2" d="M489.2 268 V103.8 a4 4 0 0 1 4 -4 H519.2 a4 4 0 0 1 4 4 V268 Z"><title>OLMo-2
+1B - W4A8 rotated: 19.0</title></path><text class="val" x="506.2" y="94.8" text-anchor="middle">19.0</text><line class="marker" x1="448.2" y1="115.8" x2="528.2" y2="115.8"><title>OLMo-2
+1B - fp16: 17.188</title></line><text class="lab" x="488.2" y="286" text-anchor="middle">OLMo-2</text><text class="lab" x="488.2" y="300" text-anchor="middle">1B</text><path class="s1" d="M627.8 268 V68.9 a4 4 0 0 1 4 -4 H657.8 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - W4A8: 22.9</title></path><text class="val" x="644.8" y="59.9" text-anchor="middle">22.9</text><path class="s2" d="M663.8 268 V81.2 a4 4 0 0 1 4 -4 H693.8 a4 4 0 0 1 4 4 V268 Z"><title>Llama-3.2
+1B - W4A8 rotated: 21.5</title></path><text class="val" x="680.8" y="72.2" text-anchor="middle">21.5</text><line class="marker" x1="622.8" y1="105.4" x2="702.8" y2="105.4"><title>Llama-3.2
+1B - fp16: 18.353</title></line><text class="lab" x="662.8" y="286" text-anchor="middle">Llama-3.2</text><text class="lab" x="662.8" y="300" text-anchor="middle">1B</text></svg><figcaption>Round-to-nearest 4-bit weights, INT8 activations, windows of 512 tokens. The line is the fp16 model; the rotated bars leave the down_proj of the first four layers unrotated.</figcaption><details class='tv'><summary>Table view</summary><table><thead><tr><th></th><th>W4A8</th><th>W4A8 rotated</th><th>fp16</th></tr></thead><tbody><tr><th>Qwen2.5 1.5B</th><td>13.9</td><td>13.4</td><td>11.932</td></tr><tr><th>Qwen2.5 0.5B</th><td>23.1</td><td>21.4</td><td>18.1</td></tr><tr><th>OLMo-2 1B</th><td>20.8</td><td>19.0</td><td>17.188</td></tr><tr><th>Llama-3.2 1B</th><td>22.9</td><td>21.5</td><td>18.353</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th style="text-align: right;">fp16</th>
+<th style="text-align: right;">W4A8, no rotation</th>
+<th style="text-align: right;">W4A8, rotated (default)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen2.5-1.5B</td>
+<td style="text-align: right;">11.932</td>
+<td style="text-align: right;">13.949</td>
+<td style="text-align: right;"><strong>13.376</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B</td>
+<td style="text-align: right;">18.10</td>
+<td style="text-align: right;">23.148</td>
+<td style="text-align: right;">21.395</td>
+</tr>
+<tr>
+<td>OLMo-2-0425-1B</td>
+<td style="text-align: right;">17.188</td>
+<td style="text-align: right;">20.843</td>
+<td style="text-align: right;">18.987</td>
+</tr>
+<tr>
+<td>Llama-3.2-1B</td>
+<td style="text-align: right;">18.353</td>
+<td style="text-align: right;">22.930</td>
+<td style="text-align: right;"><strong>21.539</strong></td>
+</tr>
+<tr>
+<td>Phi-3.5-mini</td>
+<td style="text-align: right;">does not fit</td>
+<td style="text-align: right;">9.472</td>
+<td style="text-align: right;"><strong>8.718</strong></td>
+</tr>
+<tr>
+<td>Qwen2.5-3B</td>
+<td style="text-align: right;">does not fit</td>
+<td style="text-align: right;">12.767</td>
+<td style="text-align: right;"><strong>11.830</strong></td>
+</tr>
+<tr>
+<td>Llama-3.2-3B</td>
+<td style="text-align: right;">does not fit</td>
+<td style="text-align: right;">16.640</td>
+<td style="text-align: right;">16.658</td>
+</tr>
+</tbody>
+</table>
+<p>With GPTQ weights (Qwen2.5-1.5B, calibrated on wikitext-2 train, so the numbers are flattering in absolute terms): W4A16 12.605, W4A8 12.864, <strong>W4A8 rotated 12.331</strong>. The loss of INT8 activations, +0.42 and +0.63 perplexity on the two Qwen sizes in a fake-quantised simulation, falls to +0.01 and +0.04 on top of the rotated 4-bit weights; and a rotated W4A8 checkpoint is more accurate than the unrotated W4A16 one. Halving the group of the integer scales to 64 (<code>quantforge_w4a8_g64</code>) gains another 0.21 online and 0.08 with GPTQ for 2 to 3 % speed.</p>
+<h2 id="the-layer-that-breaks-it">The layer that breaks it<a class="headerlink" href="#the-layer-that-breaks-it" title="Permanent link">#</a></h2>
+<p>Rotating <em>everything</em> made Llama-3.2-3B worse: 16.640 became <strong>17.752</strong>. Rotating only layers with a K of 8192 gave 17.71, rotating only the others 16.74, so it was the <code>down_proj</code> layers; a per-layer error table on real activations (CPU forward, the real kernels on the GPU) pointed at one:</p>
+<table>
+<thead>
+<tr>
+<th>layer 1 <code>down_proj</code> of Llama-3.2-3B</th>
+<th style="text-align: right;">relative output error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>plain W4A8</td>
+<td style="text-align: right;">0.054</td>
+</tr>
+<tr>
+<td>rotated</td>
+<td style="text-align: right;">0.080</td>
+</tr>
+</tbody>
+</table>
+<p>Its input has a token with <strong>530 times the median norm</strong>, the attention sink. A rotation spreads that single huge channel over the whole block of 128, and the one token whose value the model depends on is now quantised with a row-wide error. Nothing in the weights flags such a layer (column norms are ordinary), so there is no way to know without activations. Two fixes:</p>
+<ul>
+<li><strong>GPTQ has calibration data</strong>, so it decides per layer: for every group of linears that share an input it compares the output error of the rotated and the plain quantisation on a few tokens of every window, including the one of largest norm, and lists the layers that stay plain in <code>config.json</code> (<code>unrotated_layers</code>; for Llama-3.2-3B, <code>layers.1.mlp.down_proj</code> and <code>layers.23.self_attn.o_proj</code>). GPTQ W4A8 of the 3B: 16.537 plain, 16.377 decided per layer.</li>
+<li><strong>Online quantisation has none</strong>, so it follows a rule: the <code>down_proj</code> of the first four decoder layers stays unrotated. The table above is the evidence for it, seven models, and it is a rule, not a proof: on a model family I have not run, <code>quantforge_w4a8_plain</code> is the baseline to compare with.</li>
+</ul>
+<h2 id="things-that-did-not-work">Things that did not work<a class="headerlink" href="#things-that-did-not-work" title="Permanent link">#</a></h2>
+<ul>
+<li><strong>Choosing a rotation per layer</strong> among cheap candidates (identity, random sign flips, a channel permutation) by the output error on calibration tokens: 13.612 against 13.606 for the fixed Hadamard. What is left of the gap to fp16 is the 4-bit weights, not the basis.</li>
+<li><strong>FP8 (E4M3) activations instead of INT8</strong> on the Ada tensor cores: not built. With the rotation the INT8 activations cost only +0.01 to +0.04 perplexity, the FP8 and INT8 rates are the same on this chip, and LLVM 18's NVVM dialect has no FP8 mma.</li>
+<li><strong>3-bit weights</strong> with the rotation and a clip search: GPTQ 17.2 plain, 14.6 rotated, 13.6 rotated with clipping, against 13.1 / 12.5 / 12.4 for 4 bits on the same calibration. The 3-bit model matches the public Marlin 4-bit GPTQ checkpoint, but against 4 bits with the same calibration it costs 0.5 to 1.2 perplexity for 25 % fewer bytes, and the kernels have no 3-bit unpack (two bit planes read by <code>tensor.extract</code> would be slower than the 4-bit decode kernel). 2 bits is unusable.</li>
+<li><strong>A clip search on the channel scale</strong> of the real format: -0.08, +0.08 and -0.26 on three models, so it stays off.</li>
+<li><strong>fp8 KV cache</strong> (vLLM's own): it doubles the KV capacity (90k to 171k tokens on the 6 GB card) and breaks Qwen2.5 with the default scale (12.33 to 24.96; Marlin 13.64 to 28.73), which is vLLM's attention domain.</li>
+</ul>
+<h2 id="two-bugs-worth-the-paragraph">Two bugs worth the paragraph<a class="headerlink" href="#two-bugs-worth-the-paragraph" title="Permanent link">#</a></h2>
+<p>vLLM's compile cache is keyed by the quantisation <em>name</em>, not by environment variables. My first rotation switch was an environment variable; the second run reused the first run's compiled graph, and the perplexity came out at 10^7. The fix is that a setting that changes the traced graph is a different quantisation name (<code>quantforge_w4a8_plain</code>, <code>quantforge_w4a8_g64</code>). And a custom op's fake implementation must return the strides of the real output: <code>empty_like</code> of a non-contiguous input does not, and the result is silently wrong under <code>torch.compile</code>.</p></article>
+</main>
+<footer><div class="wrap">QuantForge is open source under the Apache License 2.0 with LLVM Exceptions. Measurements: one RTX 4050 Laptop GPU (sm_89, 6 GB).</div></footer>
+</body>
+</html>

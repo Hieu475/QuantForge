@@ -136,6 +136,24 @@ T = {
         "vi": ("Perplexity Wikitext-2 của các model đã lượng tử hóa (càng thấp càng tốt)",
                "Toàn bộ tập test Wikitext-2 (564-584 cửa sổ 512 token); GPTQ hiệu chỉnh trên 128 cửa sổ 512 token từ tập train; head INT8 ở cả hai biến thể."),
     },
+    "w4a8_vs_marlin": {
+        "en": ("Decode throughput against Marlin in vLLM (1.0 = Marlin, higher is better)",
+               "Qwen2.5-1.5B, same INT4 weights, RTX 4050 Laptop, interleaved runs. W4A16 is the exact-numerics path; W4A8 uses INT8 activations (Hadamard-rotated, default)."),
+        "vi": ("Throughput decode so với Marlin trong vLLM (1,0 = Marlin, càng cao càng tốt)",
+               "Qwen2.5-1.5B, cùng weight INT4, RTX 4050 Laptop, chạy xen kẽ. W4A16 là đường số học chính xác; W4A8 dùng activation INT8 (có quay Hadamard, mặc định)."),
+    },
+    "rot_ppl": {
+        "en": ("Wikitext-2 perplexity of online W4A8 through vLLM (lower is better)",
+               "Round-to-nearest 4-bit weights, INT8 activations, windows of 512 tokens. The line is the fp16 model; the rotated bars leave the down_proj of the first four layers unrotated."),
+        "vi": ("Perplexity Wikitext-2 của W4A8 online qua vLLM (càng thấp càng tốt)",
+               "Weight 4 bit round-to-nearest, activation INT8, cửa sổ 512 token. Đường ngang là model fp16; các cột có quay giữ down_proj của bốn layer đầu không quay."),
+    },
+    "moe_ratio": {
+        "en": ("OLMoE-1B-7B against vLLM's Marlin MoE (1.0 = Marlin MoE, higher is better)",
+               "Decode: pure decode-step time with the KV cache not limiting. Prefill: 16 prompts of 1275 tokens in 1024-token steps."),
+        "vi": ("OLMoE-1B-7B so với Marlin MoE của vLLM (1,0 = Marlin MoE, càng cao càng tốt)",
+               "Decode: thời gian bước decode thuần khi KV cache không giới hạn. Prefill: 16 prompt 1275 token, bước 1024 token."),
+    },
 }
 LEG = {"en": {"fp16": "fp16 (Hugging Face)", "qf": "QuantForge INT4 + INT8 head", "ref": "fp16 reference", "rtn": "RTN INT4", "gptq": "GPTQ INT4"},
        "vi": {"fp16": "fp16 (Hugging Face)", "qf": "QuantForge INT4 + head INT8", "ref": "mốc fp16", "rtn": "RTN INT4", "gptq": "GPTQ INT4"}}
@@ -158,6 +176,20 @@ def chart(name):
         return grouped_chart(ttl, ["Qwen2.5\n0.5B", "Qwen2.5\n1.5B", "Llama-3.2\n1B", "OLMo-2\n1B"],
                              [(lg["rtn"], [22.91, 14.30, 22.28, 19.02]), (lg["gptq"], [20.45, 13.38, 20.21, 18.13])],
                              25, decimals=2, markers=[18.79, 12.66, 17.91, 17.24], marker_label=lg["ref"], note=note)
+    if name == "w4a8_vs_marlin":
+        return grouped_chart(ttl, ["1", "16", "32", "64", "128", "192", "256"],
+                             [("W4A16", [0.94, 0.94, 0.89, 0.84, 0.80, 0.86, 0.85]), ("W4A8 rotated", [0.92, 0.93, 0.97, 0.98, 1.01, 1.11, 1.16])],
+                             1.4, decimals=2, markers=[1.0] * 7, marker_label="Marlin", note=note)
+    if name == "rot_ppl":
+        return grouped_chart(ttl, ["Qwen2.5\n1.5B", "Qwen2.5\n0.5B", "OLMo-2\n1B", "Llama-3.2\n1B"],
+                             [("W4A8", [13.949, 23.148, 20.843, 22.930]), ("W4A8 rotated", [13.376, 21.395, 18.987, 21.539])],
+                             28, decimals=1, markers=[11.932, 18.10, 17.188, 18.353], marker_label="fp16", note=note)
+    if name == "moe_ratio":
+        return hbar_chart(ttl, [("decode, 1 request", 0.96), ("decode, 8 requests", 0.95), ("decode, 16 requests", 0.95), ("decode, 32 requests", 0.93),
+                                ("prefill, now", 0.88), ("prefill, first version", 0.58)] if LANG == "en" else
+                               [("decode, 1 request", 0.96), ("decode, 8 request", 0.95), ("decode, 16 request", 0.95), ("decode, 32 request", 0.93),
+                                ("prefill, hiện tại", 0.88), ("prefill, bản đầu", 0.58)],
+                          1.25, ref=1.0, unit="x", decimals=2, label_w=170, note=note)
     raise KeyError(name)
 
 

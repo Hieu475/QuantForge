@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nhanh hơn Marlin chỉ khi dùng lõi INT8: W4A16 không làm được gì, và W4A8 tốn những gì - QuantForge Notes</title>
+<meta name="description" content="Đường W4A16 giữ số học chính xác vẫn ở mức 0,8 đến 0,94 của Marlin từ 32 request trở lên, dù thử mọi cách; kernel INT4 cho weight và INT8 cho activation với schedule đã đo vượt Marlin từ khoảng 128 request đồng thời. Các kết quả âm, và ba cái bẫy khi đo đã tốn nhiều ngày.">
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../index.html">QuantForge Notes</a>
+  <nav><a href="../index.html">Bài viết</a><a href="../../docs/index.html">Tài liệu (EN)</a><a href="../about.html">Giới thiệu</a><a href="https://github.com/Hieu475">GitHub</a><a class="langsw" href="../../posts/08-w4a8-beats-marlin.html" hreflang="en">English</a></nav>
+</div></header>
+<main class="wrap">
+<article class="post"><p class="meta">2026-11-23 &middot; Hieu475</p><h1>Nhanh hơn Marlin chỉ khi dùng lõi INT8: W4A16 không làm được gì, và W4A8 tốn những gì</h1><p class="lede">Đường W4A16 giữ số học chính xác vẫn ở mức 0,8 đến 0,94 của Marlin từ 32 request trở lên, dù thử mọi cách; kernel INT4 cho weight và INT8 cho activation với schedule đã đo vượt Marlin từ khoảng 128 request đồng thời. Các kết quả âm, và ba cái bẫy khi đo đã tốn nhiều ngày.</p><details class="toc"><summary>Mục lục</summary><div class="toc">
+<ul>
+<li><a href="#nhung-gi-khong-lap-uoc-khoang-trong-w4a16">Những gì không lấp được khoảng trống W4A16</a></li>
+<li><a href="#oi-phep-tinh-w4a8">Đổi phép tính: W4A8</a></li>
+<li><a href="#ba-cai-bay-khi-o">Ba cái bẫy khi đo</a></li>
+</ul>
+</div>
+</details><p><a href="06-inside-vllm.html">Bài về vLLM</a> kết thúc với một khoảng trống: ở 32 đến 256 request đồng thời, kernel W4A16 do compiler sinh ra chậm hơn Marlin. Bài này kể từ đó đến nay: một danh sách những thứ không lấp được khoảng trống, một thứ đã lấp được (bằng cách đổi phép tính chứ không phải schedule), và các lỗi trong phép đo trên đường đi.</p>
+<h2 id="nhung-gi-khong-lap-uoc-khoang-trong-w4a16">Những gì không lấp được khoảng trống W4A16<a class="headerlink" href="#nhung-gi-khong-lap-uoc-khoang-trong-w4a16" title="Permanent link">#</a></h2>
+<p>Tỉ lệ so với Marlin trong vLLM, Qwen2.5-1.5B, cùng weight, chạy xen kẽ: <strong>0,94, 0,94, 0,89, 0,84, 0,80, 0,86, 0,85</strong> ở 1, 16, 32, 64, 128, 192 và 256 request đồng thời. Profiler giải thích hình dạng đó:</p>
+<table>
+<thead>
+<tr>
+<th>128 x 4096 x 4096, weight lạnh (<code>ncu</code>)</th>
+<th style="text-align: right;">Marlin</th>
+<th style="text-align: right;">W4A16 do compiler sinh</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>thời gian</td>
+<td style="text-align: right;">115 us</td>
+<td style="text-align: right;">154 us</td>
+</tr>
+<tr>
+<td>thanh ghi mỗi thread</td>
+<td style="text-align: right;">255</td>
+<td style="text-align: right;">124</td>
+</tr>
+<tr>
+<td>block cùng cư trú mỗi SM</td>
+<td style="text-align: right;">1 (persistent)</td>
+<td style="text-align: right;">khoảng 3</td>
+</tr>
+<tr>
+<td>băng thông DRAM</td>
+<td style="text-align: right;">50 %</td>
+<td style="text-align: right;">36 %</td>
+</tr>
+</tbody>
+</table>
+<p>Cả hai kernel đều bị giới hạn bởi độ trễ; Marlin giữ nhiều byte đang bay hơn với ít block nhưng to hơn, và nạp mảnh B thẳng từ bộ nhớ toàn cục vào thanh ghi (weight được xáo trước cho việc đó). Những thứ tôi đã thử mà không làm khoảng trống nhúc nhích: quét tile block, warp và K cho từng shape; split-K với atomics ở 128 hàng (165 us so với 155 us: thêm block không giúp gì, nên không phải do lượng tử hóa wave); một kernel duy nhất cho việc đệm hàng thay vì ba lần launch nhỏ (nằm trong nhiễu); tỉ lệ bộ nhớ giao cho vLLM (tỉ lệ y hệt ở 0,7 và 0,78, nên không phải hiệu ứng KV cache). Phần còn lại là định dạng weight, tức là bố cục khác và đường giải lượng tử khác, và tôi chưa làm.</p>
+<h2 id="oi-phep-tinh-w4a8">Đổi phép tính: W4A8<a class="headerlink" href="#oi-phep-tinh-w4a8" title="Permanent link">#</a></h2>
+<p>Lõi tensor INT8 làm gấp đôi việc của lõi fp16, và weight INT4 vẫn là lưu lượng weight duy nhất. Kernel (<code>W4A8GemmDq</code>) mở nibble thành int8 khi tile được đưa vào shared memory, cộng dồn int32 trên toàn K và áp một scale float cho mỗi kênh đầu ra ở epilogue. Định dạng là lượng tử hóa lũy tiến của QServe: INT8 theo kênh đầu ra, rồi INT4 theo nhóm 128 với scale và zero point <em>nguyên</em>, chọn sao cho <code>(q - z) * s</code> nằm trong int8 và phép tính 8 bit của kernel không tràn. Ba thứ làm nó nhanh chứ không chỉ đúng:</p>
+<ul>
+<li><strong>Scale K-major có thêm một hàng đệm.</strong> 8 kênh đầu ra mà một thread giải lượng tử có 8 byte scale liền nhau theo thứ tự <code>[K/128, N]</code>, một lần nạp vector thay vì 8 byte cách nhau 32: nhanh hơn 3 đến 5 %. Các lần nạp trước của pipeline đọc scale của nhóm sau nhóm cuối, nên buffer có thêm một hàng toàn số 0 (bản đầu đọc quá cuối tensor).</li>
+<li><strong>Một planner biết đo.</strong> Quy tắc schedule đã được chỉnh trên các layer có N &lt;= 2048; ở 64 x 4096 x 4096 nó chạy 115 us trong khi schedule khác chạy 65 us. <code>int8_plan</code> đo một nhúm ứng viên cho mỗi (rows, K, N) đúng một lần, lưu cái thắng, và op chỉ tra cứu. Kernel pack mang theo các quyết định.</li>
+<li><strong>Kernel lượng tử hóa activation bản địa.</strong> Lượng tử hóa activation theo token từng là một cặp kernel qua <code>torch.compile</code> cộng hai lần copy đệm; giờ một kernel CUDA lo amax, scale, làm tròn và đệm. Nó phải giống từng bit với biểu thức torch mà nó thay, và lúc đầu thì không: torch chia cho một số vô hướng bằng cách nhân với nghịch đảo float, và làm tròn half-to-even.</li>
+</ul>
+<figure class="viz"><div class="viz-title">Throughput decode so với Marlin trong vLLM (1,0 = Marlin, càng cao càng tốt)</div><div class="legend"><span class="lg"><i class="sw s1"></i>W4A16</span><span class="lg"><i class="sw s2"></i>W4A8 rotated</span><span class="lg"><i class="sw mk"></i>Marlin</span></div><svg class="chart" viewBox="0 0 760 330" role="img" aria-label="Throughput decode so với Marlin trong vLLM (1,0 = Marlin, càng cao càng tốt)"><line class="grid" x1="52" y1="268.0" x2="750" y2="268.0"/><text class="tick" x="44" y="272.0" text-anchor="end">0</text><line class="grid" x1="52" y1="218.4" x2="750" y2="218.4"/><text class="tick" x="44" y="222.4" text-anchor="end">0.28</text><line class="grid" x1="52" y1="168.8" x2="750" y2="168.8"/><text class="tick" x="44" y="172.8" text-anchor="end">0.56</text><line class="grid" x1="52" y1="119.2" x2="750" y2="119.2"/><text class="tick" x="44" y="123.2" text-anchor="end">0.84</text><line class="grid" x1="52" y1="69.6" x2="750" y2="69.6"/><text class="tick" x="44" y="73.6" text-anchor="end">1.12</text><line class="grid" x1="52" y1="20.0" x2="750" y2="20.0"/><text class="tick" x="44" y="24.0" text-anchor="end">1.4</text><path class="s1" d="M66.9 268 V105.5 a4 4 0 0 1 4 -4 H96.9 a4 4 0 0 1 4 4 V268 Z"><title>1 - W4A16: 0.94</title></path><text class="val" x="83.9" y="96.5" text-anchor="middle">0.94</text><path class="s2" d="M102.9 268 V109.0 a4 4 0 0 1 4 -4 H132.9 a4 4 0 0 1 4 4 V268 Z"><title>1 - W4A8 rotated: 0.92</title></path><text class="val" x="119.9" y="100.0" text-anchor="middle">0.92</text><line class="marker" x1="61.9" y1="90.9" x2="141.9" y2="90.9"><title>1 - Marlin: 1</title></line><text class="lab" x="101.9" y="286" text-anchor="middle">1</text><path class="s1" d="M166.6 268 V105.5 a4 4 0 0 1 4 -4 H196.6 a4 4 0 0 1 4 4 V268 Z"><title>16 - W4A16: 0.94</title></path><text class="val" x="183.6" y="96.5" text-anchor="middle">0.94</text><path class="s2" d="M202.6 268 V107.3 a4 4 0 0 1 4 -4 H232.6 a4 4 0 0 1 4 4 V268 Z"><title>16 - W4A8 rotated: 0.93</title></path><text class="val" x="219.6" y="98.3" text-anchor="middle">0.93</text><line class="marker" x1="161.6" y1="90.9" x2="241.6" y2="90.9"><title>16 - Marlin: 1</title></line><text class="lab" x="201.6" y="286" text-anchor="middle">16</text><path class="s1" d="M266.3 268 V114.3 a4 4 0 0 1 4 -4 H296.3 a4 4 0 0 1 4 4 V268 Z"><title>32 - W4A16: 0.89</title></path><text class="val" x="283.3" y="105.3" text-anchor="middle">0.89</text><path class="s2" d="M302.3 268 V100.2 a4 4 0 0 1 4 -4 H332.3 a4 4 0 0 1 4 4 V268 Z"><title>32 - W4A8 rotated: 0.97</title></path><text class="val" x="319.3" y="91.2" text-anchor="middle">0.97</text><line class="marker" x1="261.3" y1="90.9" x2="341.3" y2="90.9"><title>32 - Marlin: 1</title></line><text class="lab" x="301.3" y="286" text-anchor="middle">32</text><path class="s1" d="M366.0 268 V123.2 a4 4 0 0 1 4 -4 H396.0 a4 4 0 0 1 4 4 V268 Z"><title>64 - W4A16: 0.84</title></path><text class="val" x="383.0" y="114.2" text-anchor="middle">0.84</text><path class="s2" d="M402.0 268 V98.4 a4 4 0 0 1 4 -4 H432.0 a4 4 0 0 1 4 4 V268 Z"><title>64 - W4A8 rotated: 0.98</title></path><text class="val" x="419.0" y="89.4" text-anchor="middle">0.98</text><line class="marker" x1="361.0" y1="90.9" x2="441.0" y2="90.9"><title>64 - Marlin: 1</title></line><text class="lab" x="401.0" y="286" text-anchor="middle">64</text><path class="s1" d="M465.7 268 V130.3 a4 4 0 0 1 4 -4 H495.7 a4 4 0 0 1 4 4 V268 Z"><title>128 - W4A16: 0.80</title></path><text class="val" x="482.7" y="121.3" text-anchor="middle">0.80</text><path class="s2" d="M501.7 268 V93.1 a4 4 0 0 1 4 -4 H531.7 a4 4 0 0 1 4 4 V268 Z"><title>128 - W4A8 rotated: 1.01</title></path><text class="val" x="518.7" y="84.1" text-anchor="middle">1.01</text><line class="marker" x1="460.7" y1="90.9" x2="540.7" y2="90.9"><title>128 - Marlin: 1</title></line><text class="lab" x="500.7" y="286" text-anchor="middle">128</text><path class="s1" d="M565.4 268 V119.7 a4 4 0 0 1 4 -4 H595.4 a4 4 0 0 1 4 4 V268 Z"><title>192 - W4A16: 0.86</title></path><text class="val" x="582.4" y="110.7" text-anchor="middle">0.86</text><path class="s2" d="M601.4 268 V75.4 a4 4 0 0 1 4 -4 H631.4 a4 4 0 0 1 4 4 V268 Z"><title>192 - W4A8 rotated: 1.11</title></path><text class="val" x="618.4" y="66.4" text-anchor="middle">1.11</text><line class="marker" x1="560.4" y1="90.9" x2="640.4" y2="90.9"><title>192 - Marlin: 1</title></line><text class="lab" x="600.4" y="286" text-anchor="middle">192</text><path class="s1" d="M665.1 268 V121.4 a4 4 0 0 1 4 -4 H695.1 a4 4 0 0 1 4 4 V268 Z"><title>256 - W4A16: 0.85</title></path><text class="val" x="682.1" y="112.4" text-anchor="middle">0.85</text><path class="s2" d="M701.1 268 V66.5 a4 4 0 0 1 4 -4 H731.1 a4 4 0 0 1 4 4 V268 Z"><title>256 - W4A8 rotated: 1.16</title></path><text class="val" x="718.1" y="57.5" text-anchor="middle">1.16</text><line class="marker" x1="660.1" y1="90.9" x2="740.1" y2="90.9"><title>256 - Marlin: 1</title></line><text class="lab" x="700.1" y="286" text-anchor="middle">256</text></svg><figcaption>Qwen2.5-1.5B, cùng weight INT4, RTX 4050 Laptop, chạy xen kẽ. W4A16 là đường số học chính xác; W4A8 dùng activation INT8 (có quay Hadamard, mặc định).</figcaption><details class='tv'><summary>Xem dạng bảng</summary><table><thead><tr><th></th><th>W4A16</th><th>W4A8 rotated</th><th>Marlin</th></tr></thead><tbody><tr><th>1</th><td>0.94</td><td>0.92</td><td>1</td></tr><tr><th>16</th><td>0.94</td><td>0.93</td><td>1</td></tr><tr><th>32</th><td>0.89</td><td>0.97</td><td>1</td></tr><tr><th>64</th><td>0.84</td><td>0.98</td><td>1</td></tr><tr><th>128</th><td>0.80</td><td>1.01</td><td>1</td></tr><tr><th>192</th><td>0.86</td><td>1.11</td><td>1</td></tr><tr><th>256</th><td>0.85</td><td>1.16</td><td>1</td></tr></tbody></table></details></figure>
+<table>
+<thead>
+<tr>
+<th>request đồng thời</th>
+<th style="text-align: right;">1</th>
+<th style="text-align: right;">16</th>
+<th style="text-align: right;">32</th>
+<th style="text-align: right;">64</th>
+<th style="text-align: right;">128</th>
+<th style="text-align: right;">192</th>
+<th style="text-align: right;">256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>W4A16 (số học chính xác như Marlin)</td>
+<td style="text-align: right;">0,94</td>
+<td style="text-align: right;">0,94</td>
+<td style="text-align: right;">0,89</td>
+<td style="text-align: right;">0,84</td>
+<td style="text-align: right;">0,80</td>
+<td style="text-align: right;">0,86</td>
+<td style="text-align: right;">0,85</td>
+</tr>
+<tr>
+<td>W4A8, quay Hadamard (mặc định)</td>
+<td style="text-align: right;">0,92</td>
+<td style="text-align: right;">0,93</td>
+<td style="text-align: right;">0,97</td>
+<td style="text-align: right;">0,98</td>
+<td style="text-align: right;">1,01</td>
+<td style="text-align: right;">1,11</td>
+<td style="text-align: right;">1,16</td>
+</tr>
+<tr>
+<td>W4A8, không quay</td>
+<td style="text-align: right;">0,95</td>
+<td style="text-align: right;">0,96</td>
+<td style="text-align: right;">0,99</td>
+<td style="text-align: right;">0,99</td>
+<td style="text-align: right;">1,04</td>
+<td style="text-align: right;">1,13</td>
+<td style="text-align: right;">1,18</td>
+</tr>
+</tbody>
+</table>
+<p>Đọc cho trung thực: W4A8 nhanh hơn Marlin từ khoảng 128 request đồng thời (và từ 64 hàng ở mức một GEMM), dưới đó nó chậm hơn 2 đến 8 %, vì đến 64 hàng nó dùng chính các kernel W4A16 như trước. Nó cũng không cùng phép tính: checkpoint của Marlin là W4A16, đường này lượng tử hóa activation xuống INT8. <a href="09-hadamard-rotation.html">Bài tiếp theo</a> nói về cái giá chất lượng của việc đó, và phép quay biến cái giá thành lợi như thế nào.</p>
+<h2 id="ba-cai-bay-khi-o">Ba cái bẫy khi đo<a class="headerlink" href="#ba-cai-bay-khi-o" title="Permanent link">#</a></h2>
+<ul>
+<li><strong>Flush L2 bằng cách đọc, không phải ghi.</strong> Bản quét của tôi flush bằng <code>zero_()</code>; các dòng bẩn được ghi lại trong lúc kernel được đo làm <em>mọi</em> thời gian tăng 30 đến 50 us, và điều đó đổi cả schedule thắng. Cùng lỗi đó đã thổi phồng các số MoE đầu tiên.</li>
+<li><strong>vLLM đổi dtype mặc định của torch khi nạp model.</strong> Planner tạo tensor thử ngẫu nhiên bằng <code>torch.rand</code>, vốn là f16 trong vLLM và f32 ở mọi nơi khác; kernel đọc buffer f16 như f32 và báo địa chỉ không hợp lệ <em>chỉ trong vLLM</em>. <code>compute-sanitizer python script.py</code> trên bước nạp engine tìm ra nó trong vài phút sau nhiều ngày nhìn mãi; cách sửa là truyền <code>dtype=</code> ở mọi nơi.</li>
+<li><strong>So throughput trong vLLM thực chất là so KV cache.</strong> Mọi buffer phụ mà một op cấp phát đều làm KV cache nhỏ đi, vLLM preempt, và tỉ lệ lệch tới 30 %. <a href="10-moe-grouped-gemm.html">Bài về MoE</a> có trường hợp tệ nhất.</li>
+</ul></article>
+</main>
+<footer><div class="wrap">QuantForge là mã nguồn mở theo Apache License 2.0 với LLVM Exceptions. Mọi số đo: một GPU RTX 4050 Laptop (sm_89, 6 GB).</div></footer>
+</body>
+</html>
