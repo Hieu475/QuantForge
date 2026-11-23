@@ -38,8 +38,11 @@ def save_w4a8(model: nn.Module, out_dir, tokenizer=None) -> Path:
         tokenizer.save_pretrained(out)
     cfg_path = out / "config.json"
     cfg = json.loads(cfg_path.read_text())
+    rot = {m.rotate for m in model.modules() if isinstance(m, W4A8Linear)}
+    if len(rot) != 1:
+        raise ValueError("the W4A8 layers must all be rotated or all be unrotated")
     cfg["quantization_config"] = {"quant_method": "quantforge_w4a8", "group_size": 128, "format_version": FORMAT_VERSION,
-                                  "layout": "pack_k8"}
+                                  "layout": "pack_k8", "rotated": rot.pop()}
     cfg["torch_dtype"] = cfg["dtype"] = "float16"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
     return out

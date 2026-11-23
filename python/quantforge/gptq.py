@@ -97,6 +97,15 @@ def gptq_quantize_weight(W: torch.Tensor, H: torch.Tensor, group_size: int = 128
 
 
 @torch.no_grad()
+def rotate_hessian(H: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """Hessian of the inputs after the block-Hadamard rotation x -> x B (B block diagonal, blocks of `block`, symmetric orthonormal): B^T H B."""
+    from .w4a8_op import hadamard_matrix
+
+    n = H.shape[0] // block
+    Hm = hadamard_matrix(block, H.device)
+    return torch.einsum("pi,apbq,qj->aibj", Hm, H.float().reshape(n, block, n, block), Hm).reshape(H.shape)
+
+
 def gptq_quantize_weight_w4a8(W: torch.Tensor, H: torch.Tensor, group_size: int = 128, blocksize: int = 128, damp: float = 0.01):
     """GPTQ for the W4A8 format (``quant.w4a8_quantize``): the weight is divided by its per-channel scale (taken from the original
     weight, as round-to-nearest does) so that it lives in int8 steps, and every group of `group_size` columns gets an integer scale
@@ -187,7 +196,7 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
 def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: int = 128,
                         damp: float = 0.01, act_order: bool = False, blocksize: int = 128, clip: bool = False,
                         fuse: bool = True, device="cuda", verbose: bool = True, rtn: tuple = (),
-                        token_clip: float = 10.0, fmt: str = "int4") -> dict:
+                        token_clip: float = 10.0, fmt: str = "int4", rotate: bool = False) -> dict:
     """GPTQ-quantise every Linear inside the decoder layers of `model` (fp16, e.g. loaded on the CPU) to
     INT4 and replace them with :class:`QuantLinear`. ``calib_ids`` is ``[nsamples, seqlen]`` token ids
     (see :func:`calibration_ids`); the ``lm_head`` / embeddings are left alone (use
@@ -204,8 +213,12 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
     with plain round-to-nearest instead of GPTQ (see the note on massive-activation layers in the blog / README).
     ``fmt="w4a8"`` produces :class:`W4A8Linear` layers (INT4 weights with integer group scale and zero point, see ``gptq_quantize_weight_w4a8``;
     layers whose sizes are not multiples of 128 stay dense; ``act_order`` / ``clip`` are not available there).
+    ``rotate`` (``fmt="w4a8"`` only): quantise in the block-Hadamard basis (`w4a8_op.rotate_weight`; the layer's Hessian is rotated with it), the layers then rotate their
+    input (``W4A8Linear.rotate``) and the checkpoint is marked rotated.
     Returns ``{"quantized": n, "seconds": s, "fused_qkv": n, "fused_mlp": n, "act_order": n}``."""
     t0 = time.time()
+    if rotate and fmt != "w4a8":
+        raise ValueError("rotate is available for fmt='w4a8' only")
     model.config.use_cache = False
     layers = _find_layers(model)
     # everything outside the decoder layers (embeddings, rotary, final norm, head) runs on the GPU; the layers
@@ -275,12 +288,21 @@ def quantize_model_gptq(model: nn.Module, calib_ids: torch.Tensor, group_size: i
             if fmt == "w4a8":
                 if m.in_features % 128 or m.out_features % 128:
                     continue                                    # stays dense (the kernel needs multiples of 128)
+                from .w4a8_op import rotate_weight
+
                 if f"{li}.{n}" in rtn_set:
-                    ql = W4A8Linear.from_linear(m, device)
+                    if rotate:
+                        packed, gs, zp, sw = quant.w4a8_quantize(rotate_weight(m.weight.data.to(device)))
+                        ql = W4A8Linear(packed, gs, zp, sw, None if m.bias is None else m.bias.data.to(device, torch.float16))
+                    else:
+                        ql = W4A8Linear.from_linear(m, device)
                 else:
-                    packed, gs, zp, sw = gptq_quantize_weight_w4a8(m.weight.data.to(device), hess[n], group_size, blocksize, damp)
+                    W = m.weight.data.to(device)
+                    packed, gs, zp, sw = (gptq_quantize_weight_w4a8(rotate_weight(W), rotate_hessian(hess[n]), group_size, blocksize, damp) if rotate
+                                          else gptq_quantize_weight_w4a8(W, hess[n], group_size, blocksize, damp))
                     bias = None if m.bias is None else m.bias.data.to(device, torch.float16)
                     ql = W4A8Linear(packed, gs, zp, sw, bias)
+                ql.rotate = rotate
                 parent = layer.get_submodule(n.rsplit(".", 1)[0]) if "." in n else layer
                 setattr(parent, n.rsplit(".", 1)[-1], ql)
                 stats["quantized"] += 1

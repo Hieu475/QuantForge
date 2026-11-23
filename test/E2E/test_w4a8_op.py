@@ -237,3 +237,19 @@ def test_hybrid_with_rotation_matches_rotating_outside_the_op():
         a = torch.ops.quantforge.w4a8_hybrid(x, *args, True)
         b = torch.ops.quantforge.w4a8_hybrid(w4a8_op.rotate(x), *args, False)
         assert torch.equal(a, b), M
+
+
+def test_rotated_hessian_and_weight_keep_the_layer_output():
+    """B^T H B with B the block-Hadamard matrix (dense reference), and (x B)(W B)^T == x W^T: the rotation changes the basis, not the layer."""
+    _require_gpu()
+    from quantforge import gptq, w4a8_op
+
+    K = 384
+    g = torch.Generator(device="cuda").manual_seed(3)
+    A = torch.randn(K, K, device="cuda", generator=g)
+    H = A @ A.t() / K
+    B = torch.block_diag(*([w4a8_op.hadamard_matrix(128, "cuda")] * (K // 128)))
+    assert torch.allclose(gptq.rotate_hessian(H), B.t() @ H @ B, atol=1e-4)
+    W = torch.randn(256, K, device="cuda", generator=g)
+    x = torch.randn(10, K, device="cuda", generator=g)
+    assert torch.allclose((x @ B) @ w4a8_op.rotate_weight(W).t(), x @ W.t(), atol=1e-3)

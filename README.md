@@ -33,7 +33,7 @@ python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', qua
 | you have | use | why / what to expect (RTX 4050 laptop, vs vLLM's Marlin) |
 |---|---|---|
 | a 4-bit GPTQ / AWQ checkpoint, small batches (chat, 1-16 requests) | `quantization="quantforge"` | same numerics as Marlin (asymmetric zero points kept, which Marlin cannot load); 0.93-1.0x at 1-16 requests |
-| the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.04-1.18x of Marlin from 128 requests, 1.07-1.14x prefill; 0.95-0.99x below; perplexity +0.6 to +3 (see "Online W4A8") |
+| the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.04-1.18x of Marlin from 128 requests, 1.07-1.14x prefill; 0.95-0.99x below; perplexity +0.4 (GPTQ checkpoint, rotated) to +1.5 online (see "Online W4A8") |
 | a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.93-0.96x of Marlin MoE in decode, 0.88x in prefill (one model measured) |
 | no LLVM / `nvcc` on the serving machine | `quantforge-pack install` a kernel pack | see "Kernel packs"; `quantforge-doctor` checks it |
 
@@ -46,16 +46,18 @@ Quality through vLLM itself (`benchmarks/vllm_ppl.py`, Qwen2.5-1.5B-Instruct, wi
 | fp16 | 11.932 |
 | GPTQ-Int4 through Marlin | 13.636 |
 | the same checkpoint through `quantforge` (W4A16) | 13.637 |
-| fp16 weights quantised online to W4A8 (`quantforge_w4a8`, round-to-nearest weights, INT8 activations) | 13.991 |
+| fp16 weights quantised online to W4A8, no rotation (`quantforge_w4a8_plain`: round-to-nearest weights, INT8 activations) | 13.949 |
+| the same with the Hadamard rotation (`quantforge_w4a8`, the default) | **13.395** |
 
 With this repository's own GPTQ (128 windows of wikitext-2 *train* for calibration, so the test split is in-domain and these numbers are flattering in absolute terms; the public checkpoint above was calibrated on other data):
 
 | same calibration, same model | perplexity |
 |---|--:|
 | GPTQ W4A16 through `quantforge` (asymmetric: Marlin refuses to load it) | 12.605 |
-| GPTQ W4A8 checkpoint (`benchmarks/make_w4a8_checkpoint.py`, INT8 activations, integer group scales) | 12.851 |
+| GPTQ W4A8 checkpoint (`benchmarks/make_w4a8_checkpoint.py`, INT8 activations, integer group scales) | 12.864 |
+| the same GPTQ in the rotated basis (`make_w4a8_checkpoint.py --rotate`) | **12.331** |
 
-So the exact path reproduces Marlin to the third decimal, and what the faster W4A8 path costs is **+0.25 perplexity (1.9 %) with GPTQ weights** (+0.92 over fp16 against +0.67 for W4A16); online round-to-nearest weights cost more (13.991 against the public GPTQ's 13.636).
+So the exact path reproduces Marlin to the third decimal. Without the rotation the faster W4A8 path costs +0.26 perplexity with GPTQ weights; **with the block-Hadamard rotation (below) W4A8 is more accurate than W4A16 GPTQ**: 12.331 against 12.605 (+0.40 over fp16 against +0.67), and 13.395 against 13.949 for online round-to-nearest weights. Before the rotation: +0.92 over fp16 against +0.67 for W4A16; online round-to-nearest weights cost more (13.991 against the public GPTQ's 13.636).
 
 The honest summary: exact-numerics W4A16 is on par with Marlin up to 16 rows and 0.75-0.94x above; the faster-than-Marlin numbers need the W4A8 path.
 
@@ -67,7 +69,8 @@ interleaved runs; details, other models and every negative result in the section
 | concurrent requests | 1 | 16 | 32 | 64 | 128 | 192 | 256 |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.94 | 0.94 | 0.89 | 0.84 | 0.80 | 0.86 | 0.85 |
-| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.95 | 0.96 | 0.99 | 0.99 | **1.04** | **1.13** | **1.18** |
+| `quantforge_w4a8` (INT4 weights, INT8 activations, Hadamard-rotated) / Marlin | 0.92 | 0.93 | 0.97 | 0.98 | **1.01** | **1.11** | **1.16** |
+| `quantforge_w4a8_plain` (the same without the rotation) / Marlin | 0.95 | 0.96 | 0.99 | 0.99 | **1.04** | **1.13** | **1.18** |
 
 The W4A8 row is the dense-GEMM answer to "faster than Marlin": at the level of one layer (`benchmarks/compare_marlin_ops.py`: the ops the plugin calls, CUDA-graph replay, cold weights, interleaved rounds)
 the W4A8 op against Marlin's GEMM is
@@ -627,6 +630,27 @@ Other models (same engine, GPTQ 4-bit; tokens/s summed over the requests, two ru
 K-folding changes nothing for the 3B model (71 tokens/s with and without it): its narrow layers (2048 outputs) did not gain enough to be folded. **Memory:** a first run of the 3B model failed to start
 on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
 22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).
+
+### Hadamard rotation of W4A8 (new in 0.5.0)
+
+INT8 per-token activation quantisation is hurt by outlier channels, and 4-bit weights by outlier weights. Both are fixed in the same way as in QuaRot / SpinQuant: multiply the input by an orthonormal matrix
+`B` (block diagonal, one 128 x 128 Walsh-Hadamard block per group of 128 inputs) and the weight by the same, `(x B)(W B)^T = x W^T`, so the layer is unchanged in exact arithmetic but both operands are flatter when they are quantised.
+Here `W B` is computed once when the weights are quantised (online at load, or in GPTQ with the Hessian rotated to `B^T H B`), and the activation side costs one pass over the activations: inside the INT8
+quantisation kernel above 64 rows (`quantize_rows_rot`: the rotated row waits in shared memory for its scale, bit-identical to rotating and then quantising), as a small kernel below. 2-4 % of the decode step at 1-64 requests, 1-2 % above.
+
+Wikitext-2 perplexity (`benchmarks/vllm_ppl.py`, the kernels vLLM really runs; fake-quantisation of the same experiment: `research/rotation_ppl.py`):
+
+| model | fp16 | W4A8, no rotation | W4A8 rotated |
+|---|--:|--:|--:|
+| Qwen2.5-1.5B, online round-to-nearest | 11.932 | 13.949 | **13.395** |
+| Qwen2.5-0.5B, online round-to-nearest | 18.10 | 23.148 | **21.195** |
+| Qwen2.5-1.5B, GPTQ checkpoint | 11.932 | 12.864 | **12.331** |
+
+What the simulation says and a rotation of 128 does not: the damage done by the INT8 activations (+0.42 / +0.63 on the two models) all but disappears (+0.01 / +0.04 on top of the rotated W4 weights); the effect on the 4-bit weights themselves
+depends on the block size without a clear rule (1.5B, W4 only: no rotation 13.512; blocks of 16 / 32 / 64 / 128 / 256: 13.550 / 13.710 / 13.184 / 13.600 / 13.540), so the block was fixed at 128, the group size of the kernels, rather than tuned on this model.
+`quantization="quantforge_w4a8"` rotates by default; `quantforge_w4a8_plain` is the old method (a different name because vLLM's compile cache is keyed by it, a switch that changes the graph must not be an environment variable);
+a rotated checkpoint says `"rotated": true` in its `quantization_config`. Not applicable to the GPTQ / AWQ W4A16 checkpoints of other people (their weights are not in the rotated basis).
+Measured on two Qwen2.5 sizes only; speed at 128 requests and below is 3-4 % under the unrotated W4A8 (the table above).
 
 ### Mixture-of-experts models (`quantization="quantforge"`)
 

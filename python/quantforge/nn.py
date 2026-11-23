@@ -419,6 +419,7 @@ class W4A8Linear(INT8W8A8Linear):
         self.register_buffer("w_scale", w_scale)                   # f32 [out]
         self.register_buffer("bias", bias)
         self.backend = "quantforge"
+        self.rotate = False        # True: the weight was quantised after a block-Hadamard rotation (w4a8_op.rotate_weight); the forward rotates its input the same way
         self.use_compiled = self.out_features % self._TILE_N == 0 and self.in_features % self._TILE_K == 0
         self.register_buffer("_w_scale32", w_scale.float().contiguous(), persistent=False)
         self.register_buffer("_bias32", (bias if bias is not None else torch.zeros(self.out_features, device=packed.device)).float().contiguous(),
@@ -446,7 +447,9 @@ class W4A8Linear(INT8W8A8Linear):
                               for m, n in zip(layers, sizes)])
         else:
             bias = None
-        return cls(cat("weight"), cat("group_scale"), cat("group_zero"), cat("w_scale"), bias)
+        out = cls(cat("weight"), cat("group_scale"), cat("group_zero"), cat("w_scale"), bias)
+        out.rotate = layers[0].rotate
+        return out
 
     def _build_kernel(self, Mp: int, K: int):
         from .e2e import W4A8GemmDq
@@ -460,6 +463,10 @@ class W4A8Linear(INT8W8A8Linear):
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
         dt = torch.float16 if x.dtype == torch.float32 else x.dtype
+        if self.rotate:
+            from .w4a8_op import _rotate_impl
+
+            x2 = _rotate_impl(x2.to(torch.float16).contiguous())
         if self.use_compiled and x2.shape[0] > 16 and x2.is_cuda:
             return self._compiled_forward(x2, dt).reshape(*shape[:-1], self.out_features)
         y = x2.to(torch.float16) @ self.dequantized_weight().t()

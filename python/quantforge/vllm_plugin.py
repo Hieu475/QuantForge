@@ -284,7 +284,7 @@ if HAVE_VLLM:
         def __init__(self, checkpoint: bool = False, rotate: bool = False) -> None:
             super().__init__()
             self.checkpoint = checkpoint          # True: the checkpoint holds W4A8 tensors (w4a8_checkpoint.save_w4a8); False: online quantisation
-            self.rotate = rotate and not checkpoint    # block-Hadamard rotation of weights (at load) and activations (per call); part of the method, not an environment switch:
+            self.rotate = rotate    # block-Hadamard rotation of weights (at load) and activations (per call); part of the method, not an environment switch:
                                                        # vLLM's compile cache is keyed by the quantisation NAME, a graph that differs by an env var would be reused for the other setting
 
         def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size, output_size, params_dtype,
@@ -322,6 +322,7 @@ if HAVE_VLLM:
             from . import kfold, quant, w4a8_op
 
             if self.checkpoint:
+                layer.qf_rot = self.rotate                      # the checkpoint's weights are already in the rotated basis (config.json "rotated"): only the activations are rotated
                 packed, gs, zp, sw = (layer.weight.data, layer.group_scale.data, layer.group_zero.data, layer.w_scale.data)
                 for name in ("weight", "group_scale", "group_zero", "w_scale"):
                     delattr(layer, name)
@@ -375,9 +376,10 @@ if HAVE_VLLM:
 
         ROTATE = True                                  # online quantisation rotates (`quantforge_w4a8_plain` does not)
 
-        def __init__(self, checkpoint: bool = False) -> None:
+        def __init__(self, checkpoint: bool = False, rotated: bool = False) -> None:
             super().__init__()
             self.checkpoint = checkpoint
+            self.rotated = rotated                     # checkpoint: its weights were quantised after the rotation (config.json: "rotated": true)
 
         @classmethod
         def get_name(cls):
@@ -397,10 +399,10 @@ if HAVE_VLLM:
 
         @classmethod
         def from_config(cls, config):
-            return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8")
+            return cls(checkpoint=str(config.get("quant_method", "")).lower() == "quantforge_w4a8", rotated=bool(config.get("rotated", False)))
 
         def get_quant_method(self, layer, prefix):
-            return QuantForgeW4A8Method(self.checkpoint, self.ROTATE) if isinstance(layer, LinearBase) else None
+            return QuantForgeW4A8Method(self.checkpoint, self.rotated if self.checkpoint else self.ROTATE) if isinstance(layer, LinearBase) else None
 
     @register_quantization_config("quantforge_w4a8_plain")
     class QuantForgeW4A8PlainConfig(QuantForgeW4A8Config):
@@ -414,4 +416,4 @@ if HAVE_VLLM:
 
         @classmethod
         def from_config(cls, config):
-            return cls(checkpoint=False)
+            return cls(checkpoint=False, rotated=False)
