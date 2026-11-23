@@ -36,6 +36,16 @@ def load_config(model: str) -> dict:
     return json.loads(Path(hf_hub_download(model, "config.json")).read_text())
 
 
+def moe_dims(cfg: dict, tp: int = 1):
+    """``(experts, top_k, hidden, expert_intermediate)`` per tensor-parallel rank of a mixture-of-experts config, else None."""
+    cfg = cfg.get("text_config", cfg)
+    E = cfg.get("num_experts") or cfg.get("num_local_experts") or cfg.get("n_routed_experts")
+    if not E:
+        return None
+    I = cfg.get("moe_intermediate_size") or cfg.get("intermediate_size")
+    return int(E), int(cfg.get("num_experts_per_tok") or cfg.get("top_k") or 2), int(cfg["hidden_size"]), int(I) // tp
+
+
 def layer_shapes(cfg: dict, tp: int = 1) -> list[tuple[str, int, int, bool]]:
     """``(name, K, N, has_bias)`` of the four GEMMs of a decoder layer, per tensor-parallel rank (fused qkv and gate/up, as vLLM runs them)."""
     cfg = cfg.get("text_config", cfg)
@@ -43,14 +53,31 @@ def layer_shapes(cfg: dict, tp: int = 1) -> list[tuple[str, int, int, bool]]:
     nh = cfg["num_attention_heads"]
     nkv = cfg.get("num_key_value_heads", nh)
     hd = cfg.get("head_dim") or h // nh
-    inter = cfg["intermediate_size"]
+    moe = moe_dims(cfg, tp)
+    inter = cfg.get("shared_expert_intermediate_size") or cfg.get("intermediate_size") or (moe[3] * tp if moe else 0)
     mt = cfg.get("model_type", "")
     qkv_bias = bool(cfg.get("attention_bias", mt.startswith("qwen2")))
     out = [("qkv", h, (nh + 2 * nkv) * hd // tp, qkv_bias),
-           ("o", nh * hd // tp, h, False),
-           ("gate_up", h, 2 * inter // tp, bool(cfg.get("mlp_bias", False))),
-           ("down", inter // tp, h, bool(cfg.get("mlp_bias", False)))]
+           ("o", nh * hd // tp, h, False)]
+    # a mixture-of-experts layer's experts run through the grouped kernels (`sweep_moe`); a dense MLP stays only when the model has one next to it
+    # (shared experts, dense layers of another width)
+    if moe is None or cfg.get("shared_expert_intermediate_size") or (cfg.get("intermediate_size") and cfg["intermediate_size"] != moe[3] * tp):
+        out += [("gate_up", h, 2 * inter // tp, bool(cfg.get("mlp_bias", False))),
+                ("down", inter // tp, h, bool(cfg.get("mlp_bias", False)))]
     return out
+
+
+def sweep_moe(dims, group: int = 128, log=print) -> None:
+    """The grouped kernels of a mixture-of-experts layer for every token bucket (`moe.prepare`)."""
+    from . import moe
+
+    E, k, H, I = dims
+    if H % group or I % group or I % 128 or H % 128:
+        log(f"  moe E={E} H={H} I={I}: sizes are not multiples of 128 / the group size, no grouped kernel")
+        return
+    t0 = time.time()
+    moe.prepare(E, H, I, k, group)
+    log(f"  moe     E={E:4d} top-{k} H={H:6d} I={I:6d}: {time.time() - t0:5.1f} s")
 
 
 def sweep_layers(shapes, group: int = 128, rows=ROWS, log=print) -> None:
@@ -141,6 +168,8 @@ def cmd_record(a) -> None:
     from . import torch_ops  # noqa: F401
 
     sweep_layers([tuple(x) for x in json.loads(a.shapes)], a.group, log=lambda s: print(s, flush=True))
+    for d in json.loads(a.moe):
+        sweep_moe(tuple(d), a.group, log=lambda s: print(s, flush=True))
     if a.w4a8:
         sweep_w4a8([tuple(x) for x in json.loads(a.shapes)], log=lambda s: print(s, flush=True))
 
@@ -156,10 +185,15 @@ def cmd_build(a) -> None:
 
     models = []
     shapes = []
+    moes = []
     for m in a.model:
         cfg = load_config(m)
         for tp in a.tp:
             sh = layer_shapes(cfg, tp)
+            md = moe_dims(cfg, tp)
+            if md and list(md) not in moes:
+                moes.append(list(md))
+                print(f"{m} (tp={tp}): mixture of experts E={md[0]} top-{md[1]} H={md[2]} I={md[3]}", flush=True)
             print(f"{m} (tp={tp}): " + ", ".join(f"{n} {K}x{N}" for n, K, N, _ in sh), flush=True)
             shapes += sh
         models.append(m)
@@ -173,8 +207,11 @@ def cmd_build(a) -> None:
     # this process, so a recording made here would miss them: pass 2 runs in a fresh process with every plan cached and records everything.
     print("pass 1: plans", flush=True)
     sweep_layers(uniq, a.group, log=lambda s: print(s, flush=True))
+    for d in moes:
+        sweep_moe(tuple(d), a.group, log=lambda s: print(s, flush=True))
     print("pass 2: recording kernels", flush=True)
-    r = subprocess.run([sys.executable, "-m", "quantforge.pack", "_record", "--out", str(out), "--group", str(a.group), "--shapes", json.dumps(uniq)] + (["--w4a8"] if a.w4a8 else []))
+    r = subprocess.run([sys.executable, "-m", "quantforge.pack", "_record", "--out", str(out), "--group", str(a.group), "--shapes", json.dumps(uniq),
+                        "--moe", json.dumps(moes)] + (["--w4a8"] if a.w4a8 else []))
     if r.returncode:
         raise SystemExit(r.returncode)
     n = _pack_plans_from_cache(out, uniq, a.group)
@@ -205,6 +242,12 @@ def cmd_check(a) -> None:
         f"    for tp in {a.tp!r}:\n"
         "        shapes += pack.layer_shapes(pack.load_config(m), tp)\n"
         f"pack.sweep_layers(shapes, {a.group}, rows=tuple(range(1, {a.max_rows + 1})) + pack.ROWS)\n"
+        f"for m in {a.model!r}:\n"
+        f"    for tp in {a.tp!r}:\n"
+        "        d = pack.moe_dims(pack.load_config(m), tp)\n"
+        "        if d:\n"
+        "            try: pack.sweep_moe(d, " + str(a.group) + ")\n"
+        "            except Exception as e: torch_ops.PACK_MISSES.append(('moe', d, type(e).__name__, str(e)[:80]))\n"
         f"if {a.w4a8!r}:\n"
         "    from quantforge import w4a8_op\n"
         f"    pack.sweep_w4a8(shapes, rows=tuple(range(1, {a.max_rows + 1})) + pack.ROWS)\n"
@@ -339,6 +382,7 @@ def main(argv=None) -> None:
     rc.add_argument("--out", required=True)
     rc.add_argument("--group", type=int, default=128)
     rc.add_argument("--shapes", required=True)
+    rc.add_argument("--moe", default="[]")
     rc.add_argument("--w4a8", action="store_true")
     e = sub.add_parser("ext", help="build the C++ torch runtime for this torch into the pack")
     e.add_argument("--out", required=True)

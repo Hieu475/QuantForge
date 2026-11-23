@@ -78,7 +78,7 @@ import threading  # noqa: E402
 
 import torch  # noqa: E402
 
-_T_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+_T_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)         # larger batches run in chunks of 256 tokens: bounds the f32 gate/up buffer (a KV-cache-sized cost in vLLM)
 MAX_TOKENS = _T_BUCKETS[-1]            # larger batches run in chunks of this many tokens
 _kernels: dict = {}
 _lock = threading.RLock()
@@ -95,9 +95,17 @@ def _problems(tokens: int, top_k: int, E: int, mcap: int) -> int:
     return -(-(tokens * top_k + E * (mcap - 1)) // mcap)
 
 
+# Grouped decode schedule (16 rows per expert block): a sweep over block-tile-n 32..128, warp-tile-n 8..32, K tile 64..256, 1..3 stages and look-ahead at
+# 8 and 57 active experts of a 2048 x 2048 and a 1024 x 2048 layer (RTX 4050, cold weights) put the 128-column block with a single stage and a look-ahead of
+# one tile first: 12-16 % ahead of the dense decode rule, which was tuned for ONE small GEMM (narrow blocks to fill the SMs) while here the experts fill them.
+_GROUPED_DECODE = "decode=true block-tile-n=128 warp-tile-n=16 block-tile-k=64 smem-stages=1 prefetch-distance=1"
+
+
 def _opts(mcap: int, K: int, N: int) -> str:
     from . import torch_ops as t
 
+    if mcap == 16 and K % 64 == 0 and N % 128 == 0 and K >= 256:
+        return _GROUPED_DECODE
     return t.default_opts(mcap, K, N)
 
 

@@ -215,9 +215,6 @@ if HAVE_VLLM:
                 act = str(getattr(layer, "activation", "silu")).lower()
                 if "silu" not in act:
                     raise NotImplementedError(f"quantforge MoE: activation {act!r} is not supported (SwiGLU only)")
-                if os.environ.get("QF_DEBUG_MOE"):
-                    print("QF_MOE", tuple(x.shape), x.dtype, tuple(topk_ids.shape), topk_ids.dtype, int(topk_ids.min()), int(topk_ids.max()),
-                          tuple(topk_weights.shape), topk_weights.dtype, flush=True)
                 xh = x if x.dtype == torch.float16 else x.half()
                 y = qmoe.moe_ffn_impl(xh, topk_ids, topk_weights, *layer.qf_moe, layer.group_size)
                 return y if x.dtype == torch.float16 else y.to(x.dtype)

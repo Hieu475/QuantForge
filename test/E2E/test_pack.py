@@ -133,3 +133,28 @@ def test_w4a8_op_falls_back_when_its_kernel_is_unavailable(tmp_path, monkeypatch
             ref = x.float() @ ref_w.float().t()
             assert (y.float() - ref).abs().max() < 0.03 * ref.abs().max(), (M, compact)
     assert w4a8_op.FALLBACKS >= before + 3
+
+
+def test_moe_grouped_kernels_are_served_from_a_pack_without_the_toolchain(tmp_path, monkeypatch):
+    """`moe.prepare` records the grouped kernels of a mixture-of-experts layer; with the JIT off the same op runs from the pack."""
+    _require_gpu()
+    from quantforge import moe
+    from test_moe_grouped import _moe_weights
+
+    E, H, I, k, G = 4, 256, 256, 2, 64
+    w = _moe_weights(E, H, I, G, 3)
+    monkeypatch.setenv("QUANTFORGE_PACK_RECORD", str(tmp_path))
+    moe.prepare(E, H, I, k, G, max_tokens=8)
+    assert len(list((tmp_path / "kernels").glob("*.so"))) >= 4
+    monkeypatch.delenv("QUANTFORGE_PACK_RECORD")
+    monkeypatch.setenv("QUANTFORGE_NO_JIT", "1")
+    monkeypatch.setenv("QUANTFORGE_PACK", str(tmp_path))
+    monkeypatch.setenv("QUANTFORGE_KERNEL_CACHE", str(tmp_path / "no-cache"))
+    moe._kernels.clear()
+    g = torch.Generator(device="cuda").manual_seed(4)
+    x = (torch.randn(3, H, device="cuda", generator=g) * 0.5).half()
+    tw, ids = torch.topk(torch.softmax(torch.randn(3, E, device="cuda", generator=g), -1), k, dim=-1)
+    got = moe.moe_ffn_impl(x, ids, tw.float(), *w, G)
+    ref = moe.moe_ffn_reference(x, ids, tw.float(), *w, G)
+    assert (got.float() - ref.float()).abs().max().item() < 2e-2 * ref.float().abs().max().item() + 2e-3
+    moe._kernels.clear()
