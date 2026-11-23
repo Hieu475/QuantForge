@@ -334,15 +334,21 @@ if HAVE_VLLM:
                 parts = [quant.w4a8_quantize(w[r:r + 2048].float()) for r in range(0, N, 2048)]       # bounded float temporaries
                 packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
             param = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)      # noqa: E731
+            _keep_view = lambda t: torch.nn.Parameter(t, requires_grad=False)              # noqa: E731 - a view into a padded buffer must stay one (`.contiguous()` would copy it away)
             if os.environ.get("QUANTFORGE_W4A8_DECODE", "compact") == "compact":
                 # one copy of the nibbles: the decode reads the W4A8 layout itself (slower, a quarter of fp16's memory)
                 e = kfold.no_fold(w.device)
                 if not self.checkpoint:
                     del layer.weight
-                layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), param(e[1]), param(e[2])
+                # the INT8 kernel (> 16 rows) reads the integer scales / zero points as [K/128, N] (8 adjacent output channels = one vector load: 3-5 % faster
+                # than 8 bytes 32 apart): a second, small copy (3 % of the weights) rides in the slots that stay empty in this layout
+                layer.qf_packed, layer.qf_scale, layer.qf_zero = param(e[0]), _keep_view(quant.kmajor_scales(gs)), _keep_view(quant.kmajor_scales(zp))
                 layer.qf_packed_f, layer.qf_scale_f, layer.qf_zero_f = param(e[0]), param(e[1]), param(e[2])
                 layer.qf_group = 128
                 layer.qf8_scale_nk = param((gs.float() * sw.float()[:, None]).half())
+                from . import int8_plan
+
+                int8_plan.preplan(K, N)               # the schedules of the INT8 kernel for this shape, measured now (looked up, never measured, at run time)
             else:
                 p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())
                 _install(layer, p16, s16, z16, None, 128, () if self.checkpoint else ("weight",))

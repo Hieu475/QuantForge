@@ -320,3 +320,13 @@ def w4a8_dequantize(packed: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor, sw
     nib = unpack_k8(packed).int()
     rep = lambda t: t.int().repeat_interleave(group, 1)      # noqa: E731
     return (nib - rep(zp)) * rep(gs) * sw[:, None]
+
+
+def kmajor_scales(t: torch.Tensor) -> torch.Tensor:
+    """int8 ``[N, K/128]`` (the checkpoint layout) -> ``[K/128, N]`` for the INT8 kernel, as a view of a buffer that has ONE EXTRA ROW of zeros: the kernel's look-ahead
+    loads of the next K tile read the scale / zero point of the group after the last one (``e2e.W4A8GemmDq(kmajor=True)``); in the K-major layout that is a whole row past the end
+    of the tensor, which must be mapped memory."""
+    n, g = t.shape
+    buf = torch.zeros(g + 1, n, dtype=t.dtype, device=t.device)
+    buf[:g] = t.t()
+    return buf[:g]

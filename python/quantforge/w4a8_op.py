@@ -40,8 +40,16 @@ def _bucket(m: int) -> int:
     return -(-m // 4096) * 4096
 
 
-def _int8_opts(Mp: int, K: int, N: int) -> str:
-    """Schedule of the INT8 kernel for Mp (96 .. 256: multiples of 32) rows. The 128 x 128 block with 64 x 64 warp tiles of the large-batch default leaves most of the GPU idle
+def _int8_opts(Mp: int, K: int, N: int, kmajor: bool = False) -> str:
+    """The schedule the INT8 kernel runs for Mp rows: the one `int8_plan` measured for this shape when there is one (autotune cache or kernel pack; the plans are
+    measured with the K-major scale layout, which is what the compact layer keeps), else the rule."""
+    from . import int8_plan
+
+    return (int8_plan.lookup(Mp, K, N) if kmajor else None) or _rule_opts(Mp, K, N)
+
+
+def _rule_opts(Mp: int, K: int, N: int) -> str:
+    """Rule-based schedule of the INT8 kernel for Mp (96 .. 256: multiples of 32) rows. The 128 x 128 block with 64 x 64 warp tiles of the large-batch default leaves most of the GPU idle
     or half-used below ~512 rows; measured with cold weights (us, default -> chosen): 8960 x 1536 at 128 rows 183 -> 108 (32 x 128 blocks), at 256 rows 186 -> 139
     (64 x 64 blocks); 1536 x 17920 at 128 rows 165 -> 138, at 256 rows 266 -> 243; the rows between (96 .. 224) have no 128-row padding any more (1536 x 17920 at 192: 190)."""
     from .e2e import W4A8_GEMM_OPTS
@@ -71,13 +79,13 @@ def _int8_opts(Mp: int, K: int, N: int) -> str:
     return o(32, 128, 32, 32)
 
 
-def _kernel(Mp: int, K: int, N: int, has_bias: bool):
-    key = (Mp, K, N, has_bias)
+def _kernel(Mp: int, K: int, N: int, has_bias: bool, kmajor: bool = False):
+    key = (Mp, K, N, has_bias, kmajor)
     k = _KERNELS.get(key)
     if k is None:
         from .e2e import W4A8GemmDq
 
-        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias, pipeline_opts=_int8_opts(Mp, K, N))
+        k = _KERNELS[key] = W4A8GemmDq.build(Mp, K, N, bias=has_bias, pipeline_opts=_int8_opts(Mp, K, N, kmajor), kmajor=kmajor)
     return k
 
 
@@ -182,8 +190,10 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
         y = kfold.linear(x2, packed16, scale16, zero16, (packed_f, scale_f, zero_f), group, bias, None)
         return y.reshape(*lead, N)
     Mp = _bucket(M)
+    kmajor = packed16.numel() == 0 and scale16.numel() > 0          # compact layer: gs / zp also kept as int8 [K/128, N] (scale16 / zero16 carry them)
+    gk, zk = (scale16, zero16) if kmajor else (gs, zp)
     try:
-        k = _kernel(Mp, K, N, bias is not None)
+        k = _kernel(Mp, K, N, bias is not None, kmajor)
     except KernelUnavailable:
         return _fallback(x2, p8, gs, zp, sw, bias, packed16, scale16, zero16, packed_f, scale_f, zero_f, group).reshape(*lead, N)
     xq, s_x = _quantize_tokens(x2)
@@ -191,7 +201,7 @@ def _impl(x: torch.Tensor, p8: torch.Tensor, gs: torch.Tensor, zp: torch.Tensor,
         xq = torch.nn.functional.pad(xq, (0, 0, 0, Mp - M))
         s_x = torch.nn.functional.pad(s_x, (0, Mp - M))
     y = torch.empty(Mp, N, device=x.device, dtype=torch.float16)
-    k.launch(xq, p8, gs, zp, s_x.contiguous(), sw, None if bias is None else bias.float().contiguous(), y)
+    k.launch(xq, p8, gk, zk, s_x.contiguous(), sw, None if bias is None else bias.float().contiguous(), y)
     return (y[:M] if Mp != M else y).reshape(*lead, N)
 
 

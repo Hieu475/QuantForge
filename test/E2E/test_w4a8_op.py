@@ -124,3 +124,41 @@ def test_compact_decode_reads_only_its_own_rows(rows):
     y = torch.ops.quantforge.w4a8_hybrid(buf[:rows], packed, gs, zp, sw, b, *dec, 128, snk)
     ref = x.float() @ quant.w4a8_dequantize(packed, gs, zp, sw).t() + b.float()
     assert torch.isfinite(y).all() and (y.float() - ref).norm() / ref.norm() < 0.01
+
+
+def test_int8_kernel_with_k_major_scales_matches_the_n_major_one():
+    """The compact layer keeps the integer scales / zero points as [K/128, N] too (scale16 / zero16 slots): same result as the [N, K/128] kernel."""
+    _require_gpu()
+    from quantforge import quant, w4a8_op
+
+    K, N, M = 512, 256, 96
+    g = torch.Generator(device="cuda").manual_seed(11)
+    w = torch.randn(N, K, device="cuda", generator=g) * 0.03
+    p8, gs, zp, sw = quant.w4a8_quantize(w)
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16, generator=g)
+    e = torch.empty(0, device="cuda", dtype=torch.float16)
+    scale_nk = (gs.float() * sw[:, None]).half()
+    n_major = w4a8_op._impl(x, p8, gs, zp, sw, None, e, e, e, e, e, e, 128, scale_nk)
+    k_major = w4a8_op._impl(x, p8, gs, zp, sw, None, e, quant.kmajor_scales(gs), quant.kmajor_scales(zp), e, e, e, 128, scale_nk)
+    assert any(key[-1] for key in w4a8_op._KERNELS if isinstance(key[-1], bool) and len(key) == 5)
+    assert torch.equal(n_major, k_major)
+    ref = x.float() @ quant.w4a8_dequantize(p8, gs, zp, sw).float().t()
+    assert (k_major.float() - ref).abs().max() < 0.05 * ref.abs().max()
+
+
+def test_int8_plan_candidates_are_valid_and_plans_are_looked_up(tmp_path, monkeypatch):
+    """The INT8 planner times schedules that divide the shape, keeps the winner in the autotune cache and `_int8_opts` then returns it (K-major layer only)."""
+    _require_gpu()
+    from quantforge import autotune, int8_plan, w4a8_op
+
+    monkeypatch.setenv("QUANTFORGE_TUNE_CACHE", str(tmp_path / "tune.json"))
+    autotune._CACHE = None if hasattr(autotune, "_CACHE") else None
+    K, N = 512, 256
+    for rows in int8_plan.ROWS:
+        for o in int8_plan.candidates(rows, K, N):
+            assert f"block-tile-m={rows}" not in o or rows % int(o.split("block-tile-m=")[1].split()[0]) == 0
+    rule = w4a8_op._rule_opts(64, K, N)
+    choice = int8_plan.plan_int8(64, K, N, rule)
+    assert choice is None or choice in int8_plan.candidates(64, K, N)
+    assert w4a8_op._int8_opts(64, K, N, kmajor=False) == rule             # the n-major layer keeps the rule
+    assert w4a8_op._int8_opts(64, K, N, kmajor=True) == (choice or rule)

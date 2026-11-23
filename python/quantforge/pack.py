@@ -125,10 +125,14 @@ def sweep_w4a8(shapes, rows=ROWS, log=print, modes=("dual", "compact")) -> None:
         parts = [quant.w4a8_quantize((torch.randn(min(2048, N - r), K, device=dev, generator=g) * 0.03)) for r in range(0, N, 2048)]
         packed, gs, zp, sw = (torch.cat([p[i] for p in parts]) for i in range(4))
         b = (torch.rand(N, device=dev, generator=g) - 0.5).half() if bias else None
+        if "compact" in modes:
+            from . import int8_plan
+
+            int8_plan.preplan(K, N)
         for mode in modes:
             if mode == "compact":
                 e = kfold.no_fold(dev)
-                p16, s16, z16, pf, sf, zf = e[0], e[1], e[2], e[0], e[1], e[2]
+                p16, s16, z16, pf, sf, zf = e[0], quant.kmajor_scales(gs), quant.kmajor_scales(zp), e[0], e[1], e[2]      # K-major integer scales, as the plugin keeps them
                 scale_nk = (gs.float() * sw.float()[:, None]).half()
             else:
                 p16, s16, z16 = w4a8_op.from_w4a8(packed, gs, zp, sw.float())

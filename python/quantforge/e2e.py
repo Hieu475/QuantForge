@@ -779,10 +779,13 @@ class W4A8GemmDq:
 
     @classmethod
     def build(cls, M: int, K: int, N: int, bias: bool = True, workdir=None, chip: str = "sm_80",
-              pipeline_opts: str = W4A8_GEMM_OPTS) -> "W4A8GemmDq":
+              pipeline_opts: str = W4A8_GEMM_OPTS, kmajor: bool = False) -> "W4A8GemmDq":
+        """`kmajor=True`: ``gs`` / ``zp`` are int8 ``[K/128, N]`` (the weight's own layout stays ``[N, K/2]``): the scale and zero point of the
+        8 output channels a thread dequantises are then 8 adjacent bytes (one vector load) instead of 8 bytes 32 apart."""
         G = W4A8_GROUP
         if K % G:
             raise ValueError(f"K={K} must be a multiple of {G}")
+        sz, ix = (f"{K // G}x{N}", "%kg, %n") if kmajor else (f"{N}x{K // G}", "%n, %kg")
         b_arg = f"%bias: tensor<{N}xf32> {{quantforge.int8_bias}}, " if bias else ""
         b_in = ", %bias" if bias else ""
         b_ty = f", tensor<{N}xf32>" if bias else ""
@@ -794,8 +797,8 @@ class W4A8GemmDq:
 #mm = affine_map<(m, n) -> (m)>
 #mn = affine_map<(m, n) -> (n)>
 #nk = affine_map<(n, k) -> (n, k)>
-func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs: tensor<{N}x{K // G}xi8>,
-                      %zp: tensor<{N}x{K // G}xi8>, %sx: tensor<{M}xf32> {{quantforge.int8_row_scale}}, %sw: tensor<{N}xf32> {{quantforge.int8_col_scale}},
+func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs: tensor<{sz}xi8>,
+                      %zp: tensor<{sz}xi8>, %sx: tensor<{M}xf32> {{quantforge.int8_row_scale}}, %sw: tensor<{N}xf32> {{quantforge.int8_col_scale}},
                       {b_arg}%y: tensor<{M}x{N}xf16> {{quantforge.int8_out}}) -> tensor<{M}x{N}xf16> {{
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -820,8 +823,8 @@ func.func @{cls.NAME}(%a: tensor<{M}x{K}xi8>, %bp: tensor<{N}x{K // 2}xi8>, %gs:
       %kf = arith.muli %k16d, %i16 : index
       %kg = arith.divui %kf, %cg : index
       %p = tensor.extract %bp[%n, %kb] : tensor<{N}x{K // 2}xi8>
-      %s = tensor.extract %gs[%n, %kg] : tensor<{N}x{K // G}xi8>
-      %z = tensor.extract %zp[%n, %kg] : tensor<{N}x{K // G}xi8>
+      %s = tensor.extract %gs[{ix}] : tensor<{sz}xi8>
+      %z = tensor.extract %zp[{ix}] : tensor<{sz}xi8>
       %k4d = arith.divui %k, %i4 : index
       %hi4 = arith.remui %k4d, %i2 : index
       %odd = arith.cmpi ne, %hi4, %c0 : index
