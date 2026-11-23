@@ -601,8 +601,10 @@ RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache
 | QuantForge | 195 tok/s | 799 | 1525 | 1778 |
 | ratio | **0.94** | **0.94** | **0.94** | 0.66 |
 
-The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). At 32 requests the experts touched per layer rise and our
-weight streaming (148 GB/s on a 164 GB/s read ceiling measured with `torch.sum`) is not enough against Marlin's overlap; the schedule sweeps of the grouped kernel found nothing past that plateau. Only this one model was run end to end;
+The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). Where the 32-request gap comes from (nsys with CUDA-graph node tracing, 48 steps,
+both runs 98 % GPU-busy, so it is kernel time and not launch overhead): the GEMMs take 597 ms against 408 ms for Marlin's MoE + dense kernels. At 32 requests the router touches ~20 of the 64 experts per layer (measured in place), and a block grid that small streams
+the weights at ~127 GB/s (gate/up GEMM) where Marlin manages ~150; with all 64 experts active the same kernel reaches 148 GB/s on a ceiling of 164 GB/s (torch's `sum` over the same memory). Sweeping the grouped decode schedule (block 32..256 columns, warp tile, K tile 32..256, 1..3 stages, look-ahead 0..2, padding, sinking) found a plateau,
+so what is missing is overlap / more bytes in flight at few active experts, which needs a different kernel structure (B fragments straight from global memory), not another tile choice. Only this one model was run end to end;
 `pack build` records the grouped kernels of any MoE config (Mixtral, Qwen-MoE, Qwen3-MoE shapes compile, they were not run). Shared experts (Qwen-MoE) go through the dense layers and were not tested.
 
 ### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
