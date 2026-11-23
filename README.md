@@ -14,8 +14,8 @@ to a single PTX kernel that reads the **packed** weights from HBM, dequantizes
 them while staging tiles into shared memory, and feeds Tensor Cores
 (`mma.sync.m16n8k16` + `ldmatrix`), with `cp.async` + double buffering.
 
-> **Status: alpha (v0.4).** Beyond the compiler this repository ships what is needed to *use* the kernels: a **vLLM plugin** (`quantization="quantforge"` for 4-bit GPTQ / AWQ
-> checkpoints, `quantization="quantforge_w4a8"` for INT4 weights with INT8 activations), PyTorch integration (`quantize_model`, GPTQ, `torch.ops.quantforge.*`,
+> **Status: alpha (v0.5).** Beyond the compiler this repository ships what is needed to *use* the kernels: a **vLLM plugin** (`quantization="quantforge"` for 4-bit GPTQ / AWQ
+> checkpoints, **including mixture-of-experts models**, `quantization="quantforge_w4a8"` for INT4 weights with INT8 activations), PyTorch integration (`quantize_model`, GPTQ, `torch.ops.quantforge.*`,
 > `save_gptq` to write a standard GPTQ checkpoint), and **kernel packs**, ready-made kernels that run without LLVM or `nvcc`. NVIDIA sm_80+, Linux, measured on one
 > RTX 4050 laptop GPU only. See [Limitations](#limitations).
 
@@ -166,7 +166,7 @@ The weak regime is 32-64 concurrent requests, where the 32- and 64-row GEMMs are
 A shape the pack does not hold is not an error:
 the op warns once and serves it with a dense torch path (dequantise + cuBLAS: correct, several times slower), so a model never fails to load because of a missing kernel; `quantforge.torch_ops.DENSE_FALLBACKS` counts those calls.
 `QUANTFORGE_PACK` takes several directories; `~/.cache/quantforge/pack` and the package's own `kernel_pack` are always searched. Limits: the tile rules and plans were measured on one RTX 4050 (a pack built on another GPU
-carries that GPU's plans; the plans of another GPU model are not used without the compiler), the extension is tied to the torch / CUDA / Python it was built for (otherwise it is built on first use if `nvcc` exists, else the slower Python op runs).
+carries that GPU's plans; the plans of another GPU model are not used without the compiler), the C++ extension is tied to the torch major.minor / CUDA / Python it was built for (`ext/torchX.Y-cuZ.W-abi1-pyNNN/`): a pack can carry several (`scripts/build_ext_matrix.sh` builds a matrix of torch 2.8-2.15 and Python 3.10-3.13 from throwaway venvs; the release ships them), and `quantforge-pack install --build-ext` / `quantforge-pack ext` builds the missing one (`--cuda-home` picks the toolkit), otherwise it is built on first use if `nvcc` exists, else the slower, equally correct Python op runs (measured on torch 2.15, 36 instead of 21 us per call). The kernels themselves are PTX and do not depend on torch: a pack built with torch 2.11 runs under torch 2.15 once the extension exists.
 
 ### Docker (no toolchain on the host)
 
@@ -583,6 +583,28 @@ K-folding changes nothing for the 3B model (71 tokens/s with and without it): it
 on the 6 GB card (vLLM reported -0.32 GiB for the KV cache): the op allocated an f32 accumulator for all the rows of a call, and vLLM's profiling pass sends 8192 tokens, i.e. 720 MB for the
 22016-wide gate/up layer. The op now processes long inputs in chunks of 2048 rows written straight into the f16 result (temporary memory bounded, KV cache +0.1 GiB against Marlin's +0.24).
 
+### Mixture-of-experts models (`quantization="quantforge"`)
+
+A MoE layer is many small GEMMs with the same shape and different weights. The compiler gets one more feature for it (`ExpertBatchPass.cpp`, pipeline options
+`expert-problems` / `expert-roles`): the ordinary dense kernel is launched with `grid.z` = a list of *row-block problems*, takes the expert of each from a device `int32` array
+(`meta[z]`; a negative entry is padding and the block returns at once) and advances its weight / scale / zero-point pointers by that expert's slab, its activation / output
+pointers by the problem's slab. Rows are sorted by expert and padded to the row tile, so every row block belongs to one expert; everything has static shapes and no host
+synchronisation (CUDA graphs capture it). `quantforge.moe` wraps it: four small CUDA kernels (`runtime/moe_kernels.cu`: routing, gather, cast, combine) around two grouped GEMMs (gate/up with the fused
+SwiGLU epilogue, then down); `QuantForgeMoEMethod` in the vLLM plugin takes vLLM's own MoE weight loader and router and replaces only the expert computation (vLLM 0.25.1 and 0.34.0, 4-bit GPTQ / AWQ, silu-gated experts, no expert parallelism).
+
+Measured on OLMoE-1B-7B GPTQ (64 experts, top-8, 3.7 GiB; the checkpoint quantises the router too, which vLLM cannot load, so the router was dequantised to fp16 in a local copy used by both sides),
+RTX 4050 laptop, vLLM 0.34, CUDA graphs, pure decode step time with the KV cache not limiting:
+
+| concurrent requests | 1 | 8 | 16 | 32 |
+|---|--:|--:|--:|--:|
+| Marlin MoE (vLLM) | 207 tok/s | 848 | 1629 | 2712 |
+| QuantForge | 195 tok/s | 799 | 1525 | 1778 |
+| ratio | **0.94** | **0.94** | **0.94** | 0.66 |
+
+The generated text is identical to the one of vLLM's Marlin MoE on four prompts (40 tokens each; first-token log-probabilities within 0.001). At 32 requests the experts touched per layer rise and our
+weight streaming (148 GB/s on a 164 GB/s read ceiling measured with `torch.sum`) is not enough against Marlin's overlap; the schedule sweeps of the grouped kernel found nothing past that plateau. Only this one model was run end to end;
+`pack build` records the grouped kernels of any MoE config (Mixtral, Qwen-MoE, Qwen3-MoE shapes compile, they were not run). Shared experts (Qwen-MoE) go through the dense layers and were not tested.
+
 ### Online W4A8 in vLLM (`quantization="quantforge_w4a8"`, experimental)
 
 An ordinary fp16 / bf16 checkpoint (no GPTQ needed) is quantised to W4A8 (round-to-nearest, `quant.w4a8_quantize`) while vLLM loads it: `LLM("Qwen/Qwen2.5-0.5B-Instruct", quantization="quantforge_w4a8", dtype="float16")`.
@@ -676,7 +698,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
   that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores) is what beats Marlin at high concurrency, at W4A8 quality.
-* Not supported: MoE layers (the experts of Mixtral / Qwen-MoE are not routed through the linear-layer hook), AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
+* MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.66 of Marlin at 32 concurrent requests. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
 * Schedules by rows: M ≤ 16 one 16-row decode tile, ≤ 32 / ≤ 64 skinny 32 / 64-row tiles, larger M 64 / 128-row

@@ -31,4 +31,4 @@ about 0.92-0.94 of Marlin from 1 to 16 concurrent requests, 0.85-0.9 at 32-256; 
 reaches 1.06x of Marlin at 192-256 concurrent requests. Details, methodology and the negative results are in the repository README and CHANGELOG:
 <https://github.com/Hieu475/QuantForge>, notes at <https://hieu475.github.io/>.
 
-Alpha software: tested on Linux, Python 3.12, torch 2.11 (CUDA 12.8) and vLLM 0.25 / 0.34. No MoE layers, no act-order checkpoint writing, no AMD / Apple GPUs.
+Alpha software: tested on Linux, Python 3.12, torch 2.11 (CUDA 12.8) and 2.15, vLLM 0.25 / 0.34. Mixture-of-experts: 4-bit silu-gated experts, run end to end on one model (OLMoE) only. No act-order checkpoint writing, no AMD / Apple GPUs.
