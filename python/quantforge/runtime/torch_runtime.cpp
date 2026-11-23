@@ -27,6 +27,8 @@ namespace py = pybind11;
 at::Tensor kfold_reduce_cuda(const at::Tensor &acc, int64_t M, int64_t S, int64_t N,
                              const c10::optional<at::Tensor> &bias); // kfold_reduce.cu
 
+at::Tensor pad_rows_cuda(const at::Tensor &x, int64_t Mp); // act_quant.cu (one kernel: the rows, then zeros)
+
 namespace {
 
 struct Kernel {
@@ -63,8 +65,11 @@ constexpr int64_t kScratchMaxRows = 64;
 
 at::Tensor padded_activations(const at::Tensor &x2, int64_t Mp) {
   const int64_t M = x2.size(0), K = x2.size(1);
-  if (Mp > kScratchMaxRows)
+  if (Mp > kScratchMaxRows) {
+    if (x2.scalar_type() == at::kHalf && K % 8 == 0 && reinterpret_cast<uintptr_t>(x2.data_ptr()) % 16 == 0)
+      return pad_rows_cuda(x2, Mp);        // one kernel: the rows, then zeros
     return at::constant_pad_nd(x2, {0, 0, 0, Mp - M});
+  }
   ScratchKey key{x2.device().index(),
                  c10::cuda::getCurrentCUDAStream(x2.device().index()).stream(), Mp, K};
   at::Tensor buf;

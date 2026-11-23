@@ -64,7 +64,30 @@ __global__ void quantize_rows_kernel(const __half *__restrict__ x, int M, int K,
     sx[r] = s;
 }
 
+// x[M, K] f16 -> [Mp, K] f16: the rows of x, then zeros (one kernel instead of at::constant_pad_nd's allocate + fill + copy).
+__global__ void pad_rows_kernel(const int4 *__restrict__ x, int M, int64_t vecPerRow, int4 *__restrict__ out) {
+  const int r = blockIdx.x;
+  const int4 zero = make_int4(0, 0, 0, 0);
+  for (int64_t c = threadIdx.x; c < vecPerRow; c += blockDim.x)
+    out[static_cast<int64_t>(r) * vecPerRow + c] = r < M ? x[static_cast<int64_t>(r) * vecPerRow + c] : zero;
+}
+
 } // namespace
+
+at::Tensor pad_rows_cuda(const at::Tensor &x, int64_t Mp) {
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2 && x.size(1) * x.element_size() % 16 == 0 && x.data_ptr() != nullptr &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "pad_rows: x must be a contiguous, 16-byte aligned CUDA [M, K] tensor with 16-byte rows");
+  const int64_t M = x.size(0), K = x.size(1);
+  TORCH_CHECK(Mp >= M, "pad_rows: Mp must be at least M");
+  c10::cuda::CUDAGuard guard(x.device());
+  at::Tensor out = at::empty({Mp, K}, x.options());
+  if (Mp > 0)
+    pad_rows_kernel<<<static_cast<unsigned>(Mp), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const int4 *>(x.data_ptr()), static_cast<int>(M), K * x.element_size() / 16, reinterpret_cast<int4 *>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
 
 std::tuple<at::Tensor, at::Tensor> quantize_rows_cuda(const at::Tensor &x, int64_t Mp) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kHalf && x.dim() == 2 && x.size(1) % 16 == 0,
