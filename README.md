@@ -33,7 +33,7 @@ python -c "from vllm import LLM; LLM('Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4', qua
 | you have | use | why / what to expect (RTX 4050 laptop, vs vLLM's Marlin) |
 |---|---|---|
 | a 4-bit GPTQ / AWQ checkpoint, small batches (chat, 1-16 requests) | `quantization="quantforge"` | same numerics as Marlin (asymmetric zero points kept, which Marlin cannot load); 0.93-1.0x at 1-16 requests |
-| the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.01-1.13x of Marlin from 128 requests, 1.07-1.14x prefill; 0.94-0.98x below; perplexity +0.6 to +3 (see "Online W4A8") |
+| the same, many concurrent requests or long prompts, and W4A8 quality is acceptable | `quantization="quantforge_w4a8"` (online from the fp16 model, or a checkpoint from `benchmarks/make_w4a8_checkpoint.py`) | INT8 activations on the INT8 tensor cores: 1.04-1.18x of Marlin from 128 requests, 1.07-1.14x prefill; 0.95-0.99x below; perplexity +0.6 to +3 (see "Online W4A8") |
 | a mixture-of-experts GPTQ model (OLMoE, Qwen-MoE, Mixtral shapes) | `quantization="quantforge"` | grouped kernels, no host synchronisation: 0.94x of Marlin MoE at 1-16 requests, 0.66x at 32 (one model measured) |
 | no LLVM / `nvcc` on the serving machine | `quantforge-pack install` a kernel pack | see "Kernel packs"; `quantforge-doctor` checks it |
 
@@ -67,7 +67,7 @@ interleaved runs; details, other models and every negative result in the section
 | concurrent requests | 1 | 16 | 32 | 64 | 128 | 192 | 256 |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | `quantforge` (W4A16, GPTQ checkpoint) / Marlin | 0.93 | 0.93 | 0.91 | 0.85 | 0.81 | 0.88 | 0.87 |
-| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.94 | 0.96 | 0.97 | 0.98 | **1.01** | **1.08** | **1.13** |
+| `quantforge_w4a8` (INT4 weights, INT8 activations) / Marlin | 0.95 | 0.96 | 0.99 | 0.99 | **1.04** | **1.13** | **1.18** |
 
 The W4A8 row is the dense-GEMM answer to "faster than Marlin": at the level of one layer (`benchmarks/compare_marlin_ops.py`: the ops the plugin calls, CUDA-graph replay, cold weights, interleaved rounds)
 the W4A8 op against Marlin's GEMM is
@@ -746,7 +746,7 @@ are handled, models whose `in_features` is not a multiple of 128 are rejected.
   above was measured at the start of the work; the tile planners, 32-row buckets and split-K added later raised the end-to-end ratios, see "Headline results" and the CHANGELOG): there the GEMM is
   compute bound and the compiler's mma loop reaches ~29 of the 44 TFLOP/s the hardware peaks at (Marlin ~37). The gap is not DRAM, tile choice or dequantisation
   arithmetic (ablated); a hand-written CUDA prototype that keeps B in registers like Marlin reaches 33-36 TFLOP/s when balanced (`PIPELINE.md`), closing it needs
-  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.01 / 1.08 / 1.13x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows it is 0.82-0.97x of Marlin.
+  that layout (a change of the weight format), which is not done. The W4A8 path (INT8 tensor cores, measured schedules) is what beats Marlin from ~64 rows of GEMM and from 128 concurrent requests end to end (1.04 / 1.13 / 1.18x at 128 / 192 / 256), at W4A8 quality; at 1-32 rows it is 0.82-0.97x of Marlin.
 * MoE: 4-bit silu-gated experts only, one model run end to end (see "Mixture-of-experts models"), 0.66 of Marlin at 32 concurrent requests. Not supported: expert parallelism, AMD / Apple GPUs, GPUs older than sm_80, tensor-parallel
   runs were not tested on more than one GPU, act-order layers cannot be written by `save_gptq`. Only one GPU model was measured; the planners measure per GPU, a pack built on
   one GPU carries its decisions (other GPU models fall back to the rule-based schedules without a compiler).
