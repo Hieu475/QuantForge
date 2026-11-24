@@ -16,7 +16,7 @@ config.name = "QuantForge"
 config.test_format = lit.formats.ShTest()
 config.suffixes = [".mlir"]
 config.test_source_root = os.path.dirname(__file__)
-config.excludes = ["E2E", "CMakeLists.txt"]
+config.excludes = ["E2E", "CMakeLists.txt", "Inputs"]
 
 
 def _site(name):
